@@ -1,0 +1,30 @@
+# --- secrets ---
+.env
+*.env
+
+# --- python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+build/
+dist/
+.venv/
+venv/
+
+# --- runtime data (trajectory/checkpoint/memory) ---
+data/*
+!data/.gitkeep
+
+# --- demo workspace repos (real OSS clones) ---
+workspace/*/
+!workspace/.gitkeep
+
+# --- editor / os ---
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
