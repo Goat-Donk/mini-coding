@@ -4,11 +4,13 @@
 后半段用 typer 的 CliRunner 真跑 CLI：CLI 曾漏接权限引擎（只有 Streamlit 接了），
 导致「危险命令拦截」在 CLI 路径上不生效 —— 这里把这个接线锁住。
 """
+import re
 import threading
 
 from typer.testing import CliRunner
 
 from agent.llm import LLMResult, MockLLM, ToolCall
+from agent.memory import MemoryManager
 from agent.permissions import Decision, PermissionsEngine
 from app.cli import EventPrinter, app
 
@@ -302,3 +304,142 @@ def test_cli_wires_both_governance_layers(tmp_path, monkeypatch):
     assert result.exit_code == 0
     assert captured.get("permissions") is not None, "CLI 必须接权限引擎"
     assert captured.get("hooks") is not None, "CLI 必须接 hooks"
+
+
+# ---------- ask_user 接线（CLI 是"人"唯一的入口） ----------
+
+def test_cli_registers_ask_user(tmp_path, monkeypatch):
+    """CLI 必须注册 ask_user —— 它不在 `ToolRegistry.default()` 里，只能按入口接。
+
+    （不进 default 的理由：eval/runner 用 default()，headless 里没人能回答。
+    见 tests/test_tools.py::test_default_registry_excludes_ask_user。）
+    """
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    monkeypatch.setattr(
+        "app.cli._build_llm", lambda mock: MockLLM.script(LLMResult(content="完成"))
+    )
+    captured: dict = {}
+    real_engine = __import__("agent.loop", fromlist=["QueryEngine"]).QueryEngine
+
+    class RecordingEngine(real_engine):
+        def __init__(self, *args, **kwargs):
+            captured["registry"] = args[1]
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr("app.cli.QueryEngine", RecordingEngine)
+    assert runner.invoke(app, ["随便一个任务", "--mock"]).exit_code == 0
+    assert "ask_user" in captured["registry"].names()
+
+
+def test_ask_user_pauses_cli_with_executable_hint(tmp_path, monkeypatch):
+    """停在提问处时：打印问题本身（不是"最终结论"）+ 一条**可执行**的续答指引。
+
+    指引可执行这条是 M7 的教训：当时的拒绝文案让用户「--clear-taint 复位后重试」，
+    而 CLI 根本送不进人的回复 —— 一条走不通的指引比没有指引更糟。
+    """
+    llm = MockLLM.script(
+        LLMResult(
+            content=None,
+            tool_calls=[ToolCall(id="c1", name="ask_user", arguments={"question": "新函数叫什么名字？"})],
+        ),
+        LLMResult(content="不该走到这里"),
+    )
+    result = _invoke(tmp_path, monkeypatch, llm, extra_args=("--checkpoint-every", "5"))
+
+    assert result.exit_code == 0
+    assert "需要你补充信息" in result.output
+    assert "新函数叫什么名字？" in result.output
+    assert "最终结论" not in result.output, "提问不是结论，用结论文案会让人以为任务跑完了"
+    hints = [line for line in result.output.splitlines() if "--resume" in line]
+    assert hints and "--session-id" in hints[0], f"续答指引必须可直接粘贴执行：{hints}"
+    # checkpoint_every=5 而问题在第 1 步 —— 有检查点就证明 force 在生产路径上生效
+    assert list((tmp_path / "data" / "checkpoints").glob("*/step-*.json")), "问题没落盘 → resume 拿不回来"
+
+
+def test_half_trajectory_is_not_distilled_into_memory(tmp_path, monkeypatch):
+    """停在提问处的半程轨迹**不提炼**仓库约定；跑完的照常提炼。
+
+    两个方向都要断言。只测"半程不提炼"的话，把提炼整个关掉也能过 ——
+    而这里要的是**按终止原因分岔**，不是关掉一个功能。
+    半程轨迹里模型正在因为信息不足猜，把它猜的东西写成约定再自动注入后续所有
+    会话，是污染而不是学习。续跑那一轮会照常提炼（那时轨迹是完整的）。
+    """
+    calls: list = []
+
+    class SpyMemory(MemoryManager):
+        def extract_and_learn(self, events, *, taint=None):  # noqa: ANN001 - 继承签名
+            calls.append(taint)
+            return []
+
+    monkeypatch.setattr("app.cli.MemoryManager", SpyMemory)
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    monkeypatch.setattr(
+        "app.cli._build_llm",
+        lambda mock: MockLLM.script(
+            LLMResult(
+                content=None,
+                tool_calls=[ToolCall(id="c1", name="ask_user", arguments={"question": "用哪个名字？"})],
+            ),
+            LLMResult(content="不该走到这里"),
+        ),
+    )
+    # 不加 --mock：提炼只在真实模式下发生，加了 --mock 这条测试就永远看不到效果
+    paused = runner.invoke(app, ["加个工具函数", "--checkpoint-every", "5"])
+
+    assert paused.exit_code == 0
+    assert "await_user" in paused.output
+    assert "不做约定提炼" in paused.output
+    assert calls == [], "半程轨迹被提炼成仓库约定了"
+
+    # 对照组：正常跑完的会话仍然提炼 —— 证明闸门是按终止原因分的
+    monkeypatch.setattr(
+        "app.cli._build_llm", lambda mock: MockLLM.script(LLMResult(content="做完了"))
+    )
+    done = runner.invoke(app, ["另一个任务"])
+
+    assert done.exit_code == 0
+    assert len(calls) == 1, "跑完的会话反而没提炼 → 闸门关错了方向"
+
+
+def test_resume_after_ask_user_carries_question_then_answer(tmp_path, monkeypatch):
+    """完整动线：提问 → 暂停 → `--resume "回答"` → 问题仍在会话里、回答接在它后面。
+
+    这条是端到端的行为断言（走真 CLI + 真检查点）：只钉住"能 resume"是不够的，
+    要钉住 resume 出来的会话里**问题还看得见** —— 模型收到一条凭空出现的回答
+    是没法接话的。
+    """
+    first_llm = MockLLM.script(
+        LLMResult(
+            content=None,
+            tool_calls=[ToolCall(id="c1", name="ask_user", arguments={"question": "配置文件放哪？"})],
+        ),
+        LLMResult(content="不该走到这里"),
+    )
+    first = _invoke(tmp_path, monkeypatch, first_llm)
+    assert first.exit_code == 0
+
+    # 按**打印出来的那条指引**逐字复现参数顺序（选项在前、回答在后）——
+    # 指引可执行这件事必须由测试保证，不能靠"我记得 typer 支持这种顺序"。
+    hint = next(line for line in first.output.splitlines() if "--resume" in line)
+    sid = re.search(r"--session-id (\S+)", hint).group(1)
+
+    seen: list[tuple[str, str]] = []
+
+    def responder(messages, tools):  # noqa: ANN001 - MockLLM 回调签名
+        for msg in messages:
+            content = msg.get("content")
+            if isinstance(content, str):
+                seen.append((msg.get("role", "?"), content))
+        return LLMResult(content="放 .codeagent/ 下")
+
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    monkeypatch.setattr("app.cli._build_llm", lambda mock: MockLLM.script(responder))
+    second = runner.invoke(
+        app, ["--resume", "--session-id", sid, "放 .codeagent/ 下", "--mock"]
+    )
+
+    assert second.exit_code == 0
+    question_at = next(i for i, (_, t) in enumerate(seen) if "配置文件放哪？" in t)
+    answer_at = next(i for i, (role, t) in enumerate(seen) if role == "user" and "放 .codeagent/ 下" in t)
+    assert question_at < answer_at, "问题必须还在会话里，且排在回答之前"
+    assert seen[question_at][0] == "tool", "问题是以 ask_user 的工具结果形态留在会话里的"

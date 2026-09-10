@@ -175,10 +175,17 @@ class Session:
 
     # ---------- 检查点 ----------
 
-    def checkpoint(self, state: AgentState) -> None:
-        """每 checkpoint_every 步写一次检查点（幂等调用）。"""
+    def checkpoint(self, state: AgentState, *, force: bool = False) -> None:
+        """每 checkpoint_every 步写一次检查点（幂等调用）。
+
+        `force=True` 绕过节流，立刻落盘。**这不是优化，是正确性**：节流默认 5 步，
+        而 `ask_user` 可能发生在第 3 步 —— 那一刻进程就退出了，下一次 tick 永远
+        不会来，于是问题没进检查点，`--resume` 恢复出来的会话里**没有那个问题**，
+        用户对着一个不知道在问什么的会话回答。凡是「流程即将因非步数原因退出」的
+        场合都要 force（当前只有 await_user 一处）。
+        """
         self._ticks += 1
-        if self._ticks % self.checkpoint_every == 0:
+        if force or self._ticks % self.checkpoint_every == 0:
             self._write(state)
 
     def _write(self, state: AgentState) -> Path:

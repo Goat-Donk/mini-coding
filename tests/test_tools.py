@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel
 
+from agent.tools.ask import build_ask_tool
 from agent.tools.base import Tool, ToolContext, ToolRegistry, ToolResult
 from agent.tools.files import GlobTool
 
@@ -133,6 +134,46 @@ def test_registry_default_tools(tmp_path):
     assert set(registry.names()) == {"bash", "read", "write", "edit", "glob", "grep"}
     assert {t.name for t in registry.read_only()} == {"read", "glob", "grep"}
     assert {t.name for t in registry.writable()} == {"bash", "write", "edit"}
+
+
+def test_default_registry_excludes_ask_user(tmp_path):
+    """ask_user **不能**进 default() —— 这条钉住 eval 的完成率数字不被污染。
+
+    `eval/runner.py` 用的正是 `default()`，而 headless 评测里没有人能回答。
+    模型一旦提问，那一轮就终止、任务判为没修好 —— 完成率被一个"没人在那儿"的
+    机制拉低，而且是**静默的**（judge 只跑测试，只会说"没修好"）。
+    所以它和 SubagentTool 一样按入口注册。这条测试是防"顺手加进去"的闸门。
+    """
+    assert "ask_user" not in ToolRegistry.default(tmp_path).names()
+
+
+# ---------- ask_user（await_user 语义） ----------
+
+def test_ask_user_declares_await_user(tmp_path):
+    """工具只**声明**意图，不阻塞等人 —— 回合语义由 loop 决定（见 loop._awaiting_user）。"""
+    tool = build_ask_tool()
+    result = tool.run({"question": "用哪个名字？"}, make_ctx(tmp_path))
+    assert result.success
+    assert result.await_user is True
+    assert result.output == "用哪个名字？"
+    assert result.data == {"question": "用哪个名字？", "options": []}
+
+
+def test_ask_user_renders_options(tmp_path):
+    result = build_ask_tool().run(
+        {"question": "选哪个？", "options": ["A 方案", "B 方案"]}, make_ctx(tmp_path)
+    )
+    assert "A 方案 / B 方案" in result.output
+    assert result.data["options"] == ["A 方案", "B 方案"]
+
+
+def test_ask_user_is_not_read_only():
+    """**刻意保持可写**：只读工具进并发线程池，而"提问 = 本轮终止"是串行决策。
+
+    提问本身没有副作用，但它改控制流 —— 混进并发批里，"本轮到此为止"就没法表达。
+    """
+    assert build_ask_tool().is_read_only() is False
+    assert ToolResult.ok("x").await_user is False  # 默认值不改变既有工具的行为
 
 
 # ---------- M1-5 bash ----------

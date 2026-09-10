@@ -26,6 +26,7 @@ from agent.security import TAINT_HIGH, TAINT_NONE
 from agent.permissions import PermissionsEngine
 from agent.session import Session, latest_session, new_session_id
 from agent.state import user as user_message
+from agent.tools.ask import build_ask_tool
 from agent.tools.base import ToolRegistry
 from agent.tools.subagent import SubagentTool
 
@@ -133,6 +134,11 @@ def run(
     llm = _build_llm(mock)
     registry = ToolRegistry.default(workspace_root)
     registry.register(SubagentTool(llm, workspace_root))  # M4-2 research 子代理
+    # ask_user：**刻意不进 ToolRegistry.default()** —— eval/runner.py 用的正是
+    # default()，而 headless 评测里没有人能回答，模型一提问 eval 就提前终止：
+    # 完成率被一个"没人在那儿"的机制拉低，而且是静默的（judge 只跑测试）。
+    # 与 SubagentTool 一样按入口注册（构造点见 build_ask_tool）。
+    registry.register(build_ask_tool())
     # M6-3 MCP：显式配置才加载（第三方 server 不受沙箱约束，必须 opt-in）
     mcp_clients: list = []
     mcp_allowed: list[str] = []
@@ -244,18 +250,28 @@ def run(
     # M4-1 任务后提取：把轨迹里可复用的约定写回 learned.md（跨会话生效）
     # 受污染的会话写到 learned.pending.md（不自动注入，等人复核）—— 判据是
     # 会话标记，不是提炼出来的内容像不像被带偏（内容过滤会误伤正常条目）。
+    #
+    # 停在提问处的会话**不提炼**：那是一段半程轨迹，模型当时正因为信息不足在猜，
+    # 把它猜的东西提炼成"仓库约定"再自动注入后续所有会话，是污染而不是学习。
+    # 续跑那一轮会照常提炼（那时轨迹是完整的），所以什么都没丢。
     if not mock:
-        learned = memory.extract_and_learn(result.events, taint=result.taint)
-        if learned:
-            target = (
-                ".codeagent/rules/learned.pending.md（会话被标记为受污染，待人工复核）"
-                if result.taint == TAINT_HIGH
-                else ".codeagent/rules/learned.md"
-            )
+        if result.terminated_reason == "await_user":
             typer.secho(
-                f"已提炼 {len(learned)} 条仓库约定 → {target}",
-                fg=typer.colors.YELLOW if result.taint == TAINT_HIGH else typer.colors.GREEN,
+                "本轮停在提问处（半程轨迹），不做约定提炼 —— 续跑完成后照常提炼",
+                fg=typer.colors.BRIGHT_BLACK,
             )
+        else:
+            learned = memory.extract_and_learn(result.events, taint=result.taint)
+            if learned:
+                target = (
+                    ".codeagent/rules/learned.pending.md（会话被标记为受污染，待人工复核）"
+                    if result.taint == TAINT_HIGH
+                    else ".codeagent/rules/learned.md"
+                )
+                typer.secho(
+                    f"已提炼 {len(learned)} 条仓库约定 → {target}",
+                    fg=typer.colors.YELLOW if result.taint == TAINT_HIGH else typer.colors.GREEN,
+                )
     if result.taint != TAINT_NONE:
         typer.secho(
             f"本会话污染标记: {result.taint}"
@@ -264,11 +280,24 @@ def run(
             fg=typer.colors.YELLOW,
         )
 
-    typer.secho("最终结论:", fg=typer.colors.GREEN, bold=True)
-    if result.final_text:
-        typer.echo(result.final_text)
+    if result.terminated_reason == "await_user":
+        # 提问**不是结论**：用「最终结论」的样式打印它，人会以为任务跑完了，
+        # 而这个回合的意义恰恰是"还没完，等你一句话"。
+        typer.secho("需要你补充信息:", fg=typer.colors.MAGENTA, bold=True)
+        typer.echo(result.final_text or "（问题内容为空）")
+        # 指引必须**可执行**：M7 的教训是一条走不通的解除指引比没有指引更糟
+        # （文案让用户 --clear-taint 复位后重试，而 CLI 当时送不进人的回复）。
+        # --session-id 显式给出，免得依赖"最近会话"这个隐式顺序。
+        typer.secho(
+            f'回答后继续: python -m app.cli --resume --session-id {session.session_id} "你的回答"',
+            fg=typer.colors.CYAN,
+        )
     else:
-        typer.echo("（无结论）")
+        typer.secho("最终结论:", fg=typer.colors.GREEN, bold=True)
+        if result.final_text:
+            typer.echo(result.final_text)
+        else:
+            typer.echo("（无结论）")
 
     usage = result.usage
     ratio = usage.cache_hit_ratio

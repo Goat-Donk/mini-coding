@@ -5,6 +5,8 @@ import pytest
 
 from agent.llm import LLMResult, MockLLM, ToolCall, Usage
 from agent.loop import DEFAULT_SYSTEM_PROMPT, QueryEngine
+from agent.session import Session
+from agent.tools.ask import build_ask_tool
 from agent.tools.base import ToolRegistry
 
 
@@ -284,3 +286,142 @@ def test_tool_call_event_carries_exit_code(tmp_path):
     result = engine.run("跑个会失败的命令")
     call = [e for e in result.events if e["type"] == "tool_call"][0]
     assert call["exit_code"] == 3
+
+
+# ---------- await_user：澄清提问 + 暂停/续答（MiniCode awaitUser 语义移植） ----------
+
+def _ask_engine(tmp_path: Path, llm, **kwargs) -> QueryEngine:
+    """装好 ask_user 的引擎 —— 与两个入口的注册方式一致（不进 default()）。"""
+    engine = make_engine(tmp_path, llm, **kwargs)
+    engine.registry.register(build_ask_tool())
+    return engine
+
+
+def test_ask_user_ends_the_round(tmp_path):
+    """模型提问 → 本轮结束，terminated_reason=await_user，问题原文就是 final_text。"""
+    engine = _ask_engine(
+        tmp_path,
+        MockLLM.script(
+            MockLLM.tool("ask_user", {"question": "新函数叫什么名字？"}).responses[0],
+            LLMResult(content="不该走到这里"),  # 备用：暂停后模型不该再被调用
+        ),
+    )
+    result = engine.run("给项目加个工具函数")
+
+    assert result.terminated_reason == "await_user"
+    assert result.steps == 1, "提问后本轮就该结束，不该再往下走"
+    assert "新函数叫什么名字？" in result.final_text
+    kinds = [e["type"] for e in result.events]
+    assert "await_user" in kinds
+    assert kinds.count("llm_call") == 1, "暂停后模型不该被再调用一次"
+
+
+def test_ask_user_keeps_tool_call_pairing_intact(tmp_path):
+    """同批里排在 ask_user 后面的调用必须补上配对的 tool 结果。
+
+    **这条钉的是一个会让会话彻底报废的失败模式**：assistant 消息的 tool_calls
+    里有三个 id，只有前两个有对应的 tool 消息 —— OpenAI 兼容端点在**下一次**请求时
+    直接 400（tool_call_id 无对应结果），而报错现场看起来和 ask_user 毫无关系。
+    参考实现在这里直接 break，留下孤儿 id；我们不跟着抄。
+
+    用真检查点验，因为那份 messages 才是下一次请求真正发出去的东西。
+    """
+    (tmp_path / "a.txt").write_text("hello\n", encoding="utf-8")
+    session = Session(tmp_path, "s-pairing", checkpoint_every=5)
+    llm = MockLLM.script(
+        LLMResult(
+            content=None,
+            tool_calls=[
+                ToolCall(id="c1", name="bash", arguments={"command": "echo hi"}),
+                ToolCall(id="c2", name="ask_user", arguments={"question": "用哪个名字？"}),
+                ToolCall(id="c3", name="read", arguments={"path": "a.txt"}),
+            ],
+        ),
+        LLMResult(content="不该走到这里"),
+    )
+    engine = _ask_engine(tmp_path, llm, session=session)
+    result = engine.run("多调用一批")
+
+    assert result.terminated_reason == "await_user"
+    # checkpoint_every=5，第 1 步能读到检查点**正是 force 在起作用**（见下一条测试）
+    _, restored = Session.from_checkpoint(tmp_path, "s-pairing")
+    messages = restored.messages
+
+    asked = [m for m in messages if m.get("tool_call_id") == "c2"]
+    assert asked and "用哪个名字？" in asked[0]["content"]
+    skipped = [m for m in messages if m.get("tool_call_id") == "c3"]
+    assert skipped, "后面的调用被丢了 → 孤儿 tool_call_id，下一次请求会 400"
+    assert "跳过" in skipped[0]["content"]
+
+    # 不变量：assistant 声明过的每个 tool_call_id 都有且只有一条 tool 结果
+    declared: list[str] = []
+    for msg in messages:
+        if msg.get("role") == "assistant":
+            declared.extend(c["id"] for c in (msg.get("tool_calls") or []))
+    answered = [m["tool_call_id"] for m in messages if m.get("role") == "tool"]
+    assert sorted(declared) == sorted(answered) == ["c1", "c2", "c3"]
+
+
+def test_ask_user_persists_even_below_checkpoint_interval(tmp_path):
+    """`checkpoint_every=5` 时第 3 步问的问题也必须落盘（钉住 force）。
+
+    不加 force 的失败模式很隐蔽：默认 5 步节流，问题出现在第 3 步 → 本轮结束、
+    进程退出 → 下一次 tick 永远不会来 → 问题没进检查点。`--resume` 能恢复会话，
+    但恢复出来的那份 messages 里**没有问题**，用户对着一个不知道在问什么的会话
+    回答。功能"看起来能用"（resume 成功、模型也回话了），只有真按这个顺序跑才看得见。
+    """
+    session = Session(tmp_path, "s-force", checkpoint_every=5)
+    engine = _ask_engine(
+        tmp_path,
+        MockLLM.script(
+            MockLLM.tool("read", {"path": "a.txt"}).responses[0],   # 第 1 步
+            MockLLM.tool("glob", {"pattern": "*.txt"}).responses[0],  # 第 2 步
+            MockLLM.tool("ask_user", {"question": "要改哪个文件？"}).responses[0],  # 第 3 步
+            LLMResult(content="不该走到这里"),
+        ),
+        session=session,
+    )
+    (tmp_path / "a.txt").write_text("hello\n", encoding="utf-8")
+    result = engine.run("改点东西")
+
+    assert result.terminated_reason == "await_user"
+    assert result.steps == 3
+    checkpoints = session.list_checkpoints()
+    assert checkpoints, "第 3 步提问 + checkpoint_every=5，没有 force 就不会有检查点"
+    _, restored = Session.from_checkpoint(tmp_path, "s-force")
+    assert any("要改哪个文件？" in str(m.get("content")) for m in restored.messages)
+
+
+def test_denied_ask_user_does_not_pause(tmp_path):
+    """被门禁拦下的 ask_user **不算提问** —— 暂停与否由「执行结果」决定，不由工具名决定。
+
+    否则一个被拒绝的提问会把整轮静默终止掉，而模型收到的只是一条"权限拒绝"，
+    它会以为还能继续修（这正是它被训练成会做的事），人却看到进程停了。
+    """
+    from agent.permissions import Decision
+
+    class DenyAll:
+        def check(self, name, arguments, ctx):  # noqa: ANN001 - 引擎接口
+            return Decision.DENY
+
+        def describe(self, name, arguments):  # noqa: ANN001
+            return "全部拒绝（测试替身）"
+
+    captured: list[str] = []
+
+    def then_answer(messages, tools):  # noqa: ANN001 - MockLLM 回调签名
+        captured.extend(m["content"] for m in messages if m.get("role") == "tool")
+        return LLMResult(content="那就不问了")
+
+    engine = _ask_engine(
+        tmp_path,
+        MockLLM.script(
+            MockLLM.tool("ask_user", {"question": "能说说吗？"}).responses[0],
+            then_answer,
+        ),
+        permissions=DenyAll(),
+    )
+    result = engine.run("需要澄清的任务")
+
+    assert result.terminated_reason == "completed", "被拒的提问不该终止本轮"
+    assert any("权限拒绝" in text for text in captured), captured

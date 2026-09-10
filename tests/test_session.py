@@ -4,6 +4,7 @@ from pathlib import Path
 
 from agent.llm import MockLLM
 from agent.loop import QueryEngine
+from agent.state import AgentState
 from agent.session import Session, latest_session, state_dict
 from agent.tools.base import ToolRegistry
 
@@ -283,3 +284,23 @@ def test_state_dict_returns_state_subobject_for_new_format():
     payload = {"session_id": "s", "step": 0, "ts": 1.0, "state": dump_state(state)}
     assert state_dict(payload)["task"] == "新任务"
     assert "state" not in state_dict({"task": "扁平", "step": 0})
+
+
+def test_checkpoint_force_bypasses_interval(tmp_path):
+    """force=True 绕过节流立刻落盘（await_user 的正确性依赖它）。
+
+    节流本身是优化：`checkpoint_every=5` 时前 4 次调用不写盘。但「本轮结束、
+    进程马上退出」的场合等不到第 5 次 —— 问题发生在第 3 步就永远不落盘，
+    `--resume` 恢复出来的会话里没有问题。所以这里把 force 的语义单独钉住。
+    """
+    session = Session(tmp_path, "s-force", checkpoint_every=5)
+    state = AgentState(session_id="s-force", task="t", system_prompt="sys")
+    state.messages.append({"role": "user", "content": "问题在这"})
+
+    session.checkpoint(state)                       # 第 1 次：节流生效，不写
+    assert session.list_checkpoints() == []
+
+    session.checkpoint(state, force=True)           # 强制：立刻写
+    assert len(session.list_checkpoints()) == 1
+    _, restored = Session.from_checkpoint(tmp_path, "s-force")
+    assert restored.messages[-1]["content"] == "问题在这"

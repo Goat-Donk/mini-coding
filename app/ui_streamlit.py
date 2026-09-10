@@ -30,6 +30,7 @@ from agent.llm import BaseLLM, DeepSeekClient, MockLLM, LLMResult, ToolCall
 from agent.loop import QueryEngine
 from agent.permissions import PermissionsEngine
 from agent.session import Session, new_session_id, state_dict
+from agent.tools.ask import build_ask_tool
 from agent.tools.base import ToolRegistry
 from agent.tools.subagent import SubagentTool
 from app.replay import (
@@ -103,6 +104,10 @@ def run_task(
         llm = build_llm(mock)
         registry = ToolRegistry.default(workspace)
         registry.register(SubagentTool(llm, workspace))  # M4-2 research 子代理
+        # ask_user：与 CLI 共用同一处构造（见 build_ask_tool 的 docstring）。
+        # 同 SubagentTool 一样**不进 default()** —— eval/runner 用 default()，
+        # 而 headless 评测里没有人能回答。
+        registry.register(build_ask_tool())
         # 第三方工具（MCP）默认需显式授权：这里虽未加载 MCP，仍按注册表实际
         # 情况传入，避免以后接上 MCP 时权限层悄悄漏掉（同类漂移已经犯过一次）
         permissions = PermissionsEngine(
@@ -322,8 +327,16 @@ if st.session_state["done"]:
         st.error(st.session_state["error"])
     result = st.session_state["result"]
     if result is not None:
-        st.markdown("### ✅ 最终结论")
-        st.markdown(result.final_text or "（无结论）")
+        if result.terminated_reason == "await_user":
+            # 提问不是结论：标题必须换，否则人会以为任务跑完了
+            st.markdown("### ❓ 需要你补充信息")
+            st.markdown(result.final_text or "（问题内容为空）")
+            st.info("把回答填进上方任务框、再点开始（会作为新会话的输入）。"
+                    "要从**原会话**接着跑，用 CLI：\n"
+                    f'`python -m app.cli --resume --session-id {st.session_state.get("session_id") or "<sid>"} "你的回答"`')
+        else:
+            st.markdown("### ✅ 最终结论")
+            st.markdown(result.final_text or "（无结论）")
         usage = result.usage
         ratio = usage.cache_hit_ratio
         cache_line = f"，缓存命中 {ratio:.0%}" if ratio is not None else ""

@@ -32,7 +32,7 @@ class RunResult:
     steps: int
     usage: Usage
     events: list[dict]
-    terminated_reason: str   # "completed" | "max_steps" | "loop_detected" | "error"
+    terminated_reason: str   # "completed" | "max_steps" | "loop_detected" | "error" | "await_user"
     task: str
 
     @property
@@ -228,9 +228,13 @@ class QueryEngine:
                         task=task,
                     )
 
-                self._execute_tool_calls(result.tool_calls, state, ctx)
+                pending = self._execute_tool_calls(result.tool_calls, state, ctx)
                 if self.session is not None:
                     self.session.checkpoint(state)  # M3-4 每 N 步落盘检查点
+                if pending is not None:
+                    # ask_user：本轮结束，问题交给用户（注意是 `is not None` ——
+                    # 问题理论上可以是空串，用真值判断会把它当成"没提问"）
+                    return self._awaiting_user(state, task, pending)
         except Exception as exc:
             # 意外错误：不回吐，给用户一个明确的失败结论（不假装成功）
             state.terminated_reason = "error"
@@ -323,15 +327,19 @@ class QueryEngine:
 
     def _execute_tool_calls(
         self, calls: list[ToolCall], state: AgentState, ctx: ToolContext
-    ) -> None:
-        """执行一轮工具调用。全只读 → 并发（map 保序）；含可写 → 串行。"""
+    ) -> str | None:
+        """执行一轮工具调用。全只读 → 并发（map 保序）；含可写 → 串行。
+
+        返回「待用户回答的问题」：非 None 表示本轮因 `ask_user` 而暂停，调用方
+        应结束本轮（见 `_awaiting_user`）。
+        """
         all_read_only = all(
             self.registry.get(call.name).is_read_only() if call.name in self.registry else False
             for call in calls
         )
 
-        def invoke(call: ToolCall) -> tuple[str, str]:
-            """返回 (tool_call_id, output)。单条调用无论成败都封包成文本回喂模型。"""
+        def invoke(call: ToolCall) -> tuple[str, str, bool]:
+            """返回 (tool_call_id, output, await_user)。单条调用无论成败都封包成文本回喂模型。"""
             result = self._gate_and_run(call, state, ctx)
             state.record_event(
                 "tool_call",
@@ -342,25 +350,86 @@ class QueryEngine:
                 # bash 等工具的进程退出码：success 只表示"工具跑完了"，
                 # 退出码才反映命令本身成没成（CLI 用它把 ✓ 显示得更诚实）
                 exit_code=result.data.get("exit_code") if isinstance(result.data, dict) else None,
+                await_user=result.await_user,  # 轨迹里能看出"这轮为什么停了"
             )
-            return call.id, result.output
+            return call.id, result.output, result.await_user
 
         if all_read_only and len(calls) > 1:
             with ThreadPoolExecutor(max_workers=min(4, len(calls))) as executor:
                 # map() 保持输入顺序 → tool 结果消息顺序与 calls 一一对应（id 匹配）
                 results = list(executor.map(invoke, calls))
         else:
-            results = [invoke(call) for call in calls]
+            results = []
+            for idx, call in enumerate(calls):
+                outcome = invoke(call)
+                results.append(outcome)
+                if not outcome[2]:
+                    continue
+                # ask_user 命中：本轮到此为止，同批里排在它后面的调用**不再执行**。
+                #
+                # 但**必须给它们补上配对的失败结果**：assistant 那条消息的
+                # `tool_calls` 里已经有这些 id，少一条对应 `tool` 消息，OpenAI 兼容
+                # 端点会直接 400（"tool_call_id 无对应结果"）—— 会话就此再也跑不动，
+                # 而且报错发生在下一轮请求时，看起来和 ask_user 毫无关系。
+                # 参考实现在这里直接 break 走人，留下孤儿 id（见笔记 §「明确不吸收」）：
+                # 那是它自己的 bug，我们不跟着抄。
+                skipped = ToolResult.fail(
+                    "本轮因等待用户输入而跳过，请在用户回答后重新调用"
+                )
+                for later in calls[idx + 1:]:
+                    state.record_event(
+                        "tool_call",
+                        name=later.name,
+                        arguments=later.arguments,
+                        success=False,
+                        duration_ms=0,
+                        exit_code=None,
+                        await_user=False,
+                        skipped=True,  # 与"真的执行了但失败"区分开
+                    )
+                    results.append((later.id, skipped.output, False))
+                break
+
+        # compact_batch 的签名是 list[tuple[str, str]]，这里先拆掉第三元，不动它
+        pairs = [(cid, out) for cid, out, _ in results]
+        # 取问题原文要**赶在 compact_batch 之前**：万一问题被判定为超大结果落盘，
+        # output 会变成 `<persisted-output>` 预览，CLI 就得打印那个占位符给用户看。
+        pending = next((out for _, out, awaiting in results if awaiting), None)
 
         # M3-2：超大工具结果落盘（上下文替换为预览+路径，避免截断丢信息）
         store = self._store_for(state)
         if store is not None:
-            results = compact_batch(results, store)
+            pairs = compact_batch(pairs, store)
 
         # 消息追加：一条 assistant tool_calls + N 条 tool 结果（顺序与 calls 对应）
         state.messages.append(assistant_tool_calls(calls))
-        for tool_call_id, output in results:
+        for tool_call_id, output in pairs:
             state.messages.append(tool_result(tool_call_id, output))
+        return pending
+
+    def _awaiting_user(self, state: AgentState, task: str, question: str) -> RunResult:
+        """收尾本轮并交还控制权给用户（`ask_user` 的回合语义）。
+
+        **这里刻意不追加 "assistant 复述问题" 的消息**：问题原文已经是
+        `ask_user` 那条 tool 结果的内容了，模型在 resume 后看到的是
+        「assistant 调 ask_user(问题) → tool(问题) → user(回答)」，因果链完整。
+        再补一条 assistant 文本只是同一条信息出现第二次，白占 token 还破坏前缀缓存。
+        """
+        state.terminated_reason = "await_user"
+        state.record_event("await_user", question=question, step=state.step)
+        # force：本轮结束、进程马上退出，节流检查点（默认 5 步）永远等不到下一次
+        # tick —— 问题发生在第 3 步的话就根本不会落盘，`--resume` 只能恢复出一个
+        # 没有问题的会话，用户面对着空白回答。**这不是优化，是正确性**。
+        if self.session is not None and hasattr(self.session, "checkpoint"):
+            self.session.checkpoint(state, force=True)
+        return RunResult(
+            final_text=question,
+            steps=state.step,
+            usage=state.usage,
+            events=state.events,
+            terminated_reason="await_user",
+            task=task,
+        )
 
     def _sync_taint(self, state: AgentState) -> None:
         """把 state 的污染标记镜像进权限引擎。

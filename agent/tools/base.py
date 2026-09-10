@@ -25,10 +25,18 @@ class ToolResult:
     data: dict | None = None
     error: str | None = None
     duration_ms: int = 0
+    # 工具声明「本轮到此为止，等人回答」（目前只有 ask_user）。**是数据标志，不是
+    # 阻塞**：工具自己不等人，由 QueryEngine 决定回合语义 —— 于是 headless 通路
+    # 只要不注册这个工具，就完全不受影响，不需要在循环里写任何 if headless。
+    await_user: bool = False
 
     @staticmethod
-    def ok(output: str, data: dict | None = None) -> "ToolResult":
-        return ToolResult(success=True, output=output, data=data)
+    def ok(
+        output: str, data: dict | None = None, *, await_user: bool = False
+    ) -> "ToolResult":
+        return ToolResult(
+            success=True, output=output, data=data, await_user=await_user
+        )
 
     @staticmethod
     def fail(error: str, output: str | None = None) -> "ToolResult":
