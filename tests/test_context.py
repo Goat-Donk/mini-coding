@@ -1,10 +1,14 @@
 """M3 tests: agent/context.py（记账 + cache-aware 布局 + compact 流水线）。"""
 from agent.context import (
+    FAILURE_BUDGET,
     SNIP_BOUNDARY_MARKER,
     SUMMARY_MARKER,
+    TRUNCATE_BUDGETS,
+    TRUNCATED_MARK,
     ContextManager,
     ContextStats,
     build_compact_summary_prompt,
+    _PREFIX_LEN,
     _message_text,
 )
 from agent.llm import LLMResult, MockLLM, ToolCall, Usage
@@ -15,6 +19,7 @@ from agent.state import (
     tool_result,
     user,
 )
+from agent.tool_result import TAG_CLOSE, TAG_OPEN
 
 
 def make_state(messages=None, *, last_usage=None) -> AgentState:
@@ -278,3 +283,240 @@ def test_prepare_noop_when_under_snip_threshold():
     assert mgr.account(state).warning_level == "normal"
     assert mgr.prepare(state) == msgs
     assert state.usage_stale_reason is None
+
+
+# ---------- M8 第 0 级：工具输出分级截断 ----------
+
+READ_BUDGET = TRUNCATE_BUDGETS["read"]
+# 省略标记的前缀（不含字符数）：用来判"这条被缩过"，不关心具体省了多少
+MARK_PREFIX = TRUNCATED_MARK.split("{n}")[0]
+
+
+def read_rounds(n_rounds: int, *, chars: int, mid: str = "", tail: str = "") -> list[dict]:
+    """`[system, 任务]` + n 轮 `read` 调用，每条 tool 正文都是**定长 chars**。
+
+    mid 落在正文中部、tail 落在末尾 —— 用来区分"截掉了什么、留下了什么"。
+    用 `read` 是因为它的额度在 `TRUNCATE_BUDGETS` 里最小，最好构造超额。
+    """
+    pad = chars - len(mid) - len(tail)
+    assert pad >= 0, "chars 装不下 mid + tail"
+    content = "x" * (pad // 2) + mid + "x" * (pad - pad // 2) + tail
+    msgs = [system("sys"), user("任务")]
+    for i in range(n_rounds):
+        msgs.append(assistant_tool_calls(
+            [ToolCall(id=f"c{i}", name="read", arguments={"path": f"f{i}.py"})]
+        ))
+        msgs.append(tool_result(f"c{i}", content))
+    return msgs
+
+
+def pressure_manager(messages: list[dict], *, level: float, **kwargs) -> ContextManager:
+    """把 `token_budget` 定成"这批消息恰好占 level"。
+
+    写死一个 budget 数字的话，`TRUNCATE_BUDGETS` / `_CHAR_PER_TOKEN` 一变，测试
+    就会**悄悄落到别的分支上继续通过** —— 看起来还在测同一件事，其实没测。
+    """
+    total = make_manager(budget=1).estimate_messages(messages)
+    return make_manager(budget=int(total / level), **kwargs)
+
+
+def tool_copies(messages: list[dict]) -> list[str]:
+    return [m["content"] for m in messages if m.get("role") == "tool"]
+
+
+def test_truncation_only_runs_above_warning_line():
+    """**不变量**：利用率 < 0.70 时消息逐字节不变 —— 哪怕正文明显超额。
+
+    这条是分级截断里最贵的一条。截断会改中段某条消息 → 那条之后的**前缀缓存
+    全部失效**（DeepSeek 是前缀匹配）。低于线还动手的话，每个大工具结果在它被
+    snip 掉之前都会破坏一次缓存，收益却只有几个百分点的 utilization —— 净亏。
+    而且违反它**不会报任何错**：表现只是缓存命中率曲线不再上升、账单变贵。
+    所以这里断言的是"逐字节"，不是"长度差不多"。
+    """
+    msgs = read_rounds(10, chars=8_000)  # 8k 字符远超 read 的 4k 额度：能缩，但不该缩
+    before = [m["content"] for m in msgs]
+    before_tools = tool_copies(msgs)
+    state = make_state(msgs)
+    mgr = pressure_manager(msgs, level=0.60, keep_recent=4, min_keep=2)
+
+    prepared = mgr.prepare(state)
+
+    assert mgr.last_stats.utilization < mgr.snip_threshold
+    assert [m["content"] for m in prepared] == before      # 逐字节不变
+    assert not any(MARK_PREFIX in text for text in before_tools)  # 前提：正文里本来没有标记
+    assert state.usage_stale_reason is None                # 没动过，锚点仍然有效
+
+    # 对照组：同一批消息只要越过线就会被缩 —— 证明上面"没变"是因为线，不是因为坏了
+    tight_msgs = read_rounds(10, chars=8_000)
+    tight = pressure_manager(tight_msgs, level=0.80, keep_recent=4, min_keep=2)
+    tight.prepare(make_state(tight_msgs))
+    assert any(MARK_PREFIX in text for text in tool_copies(tight_msgs))
+
+
+def test_oversized_tool_output_is_truncated_in_place():
+    """越过 0.70 且缩完就够 → **只缩正文、不删消息**。
+
+    与 snip 的全部区别就在这条：消息不删 → `tool_call_id` 配对天然完整，
+    `_find_cut` 要处理的两类孤儿边界（assistant(tool_calls) 与其结果被切开）
+    在这里根本不存在。缩到线下就收手，不再白删一遍。
+    """
+    msgs = read_rounds(10, chars=8_000)
+    state = make_state(msgs)
+    mgr = pressure_manager(msgs, level=0.80, keep_recent=4, min_keep=2)
+    # 先钉住"这轮落在 warning 带" —— 不然下面测的是 compact 分支，断言会假通过
+    assert mgr.snip_threshold <= mgr.account(state).utilization < mgr.compact_threshold
+
+    prepared = mgr.prepare(state)
+
+    assert len(prepared) == len(msgs), "缩够了就不该删消息"
+    assert not any(m.get("content") == SNIP_BOUNDARY_MARKER for m in prepared)
+    # 配对完整：assistant 的 tool_calls 与 tool 结果一一对应，下一轮请求不会 400
+    assert [c["id"] for m in prepared for c in (m.get("tool_calls") or [])] == [
+        f"c{i}" for i in range(10)
+    ]
+    assert [m["tool_call_id"] for m in prepared if m["role"] == "tool"] == [
+        f"c{i}" for i in range(10)
+    ]
+    # 窗口 [min_keep, len - keep_recent) = 索引 2..17 → 8 条 tool 被缩，最近 2 轮不动
+    assert sum(1 for text in tool_copies(prepared) if MARK_PREFIX in text) == 8
+    assert mgr.account(state).utilization < mgr.snip_threshold   # 缩到线下
+    assert state.usage_stale_reason == "tool_output_truncated"
+
+
+def test_tail_conclusion_survives_truncation():
+    """留头 70% + **尾 30%**，不是只留头。
+
+    grep/pytest 这类输出的结论在**尾部**（失败摘要、`N passed` 总计行），
+    只留头等于把最该看的那几行丢掉。
+    """
+    mid, tail = "MIDDLE-gone-4c\n", "\n3 failed, 12 passed in 4.21s"
+    msgs = read_rounds(10, chars=8_000, mid=mid, tail=tail)
+    mgr = pressure_manager(msgs, level=0.80, keep_recent=4, min_keep=2)
+
+    mgr.prepare(make_state(msgs))
+
+    first = tool_copies(msgs)[0]
+    assert tail.strip() in first      # 结论还在
+    assert first.startswith("xxx")    # 头部也在
+    assert mid not in first           # 省掉的是中部
+
+
+def test_truncation_marker_says_how_much_was_omitted():
+    """标记要写明**省了多少字符**：只说"已省略"模型无法判断要不要重新取一次。"""
+    msgs = read_rounds(10, chars=8_000)
+    mgr = pressure_manager(msgs, level=0.80, keep_recent=4, min_keep=2)
+
+    mgr.prepare(make_state(msgs))
+
+    assert TRUNCATED_MARK.format(n=8_000 - READ_BUDGET) in tool_copies(msgs)[0]
+
+
+def test_persisted_placeholder_is_never_truncated():
+    """含 `<persisted-output>` 的是**路径指针**，缩掉就等于废掉落盘的全部意义。
+
+    `tool_result.py` 整个机制就是为了"别丢信息"：正文落盘、上下文里只留短预览 +
+    文件路径。把这条预览缩了，模型就再也拿不到那个路径了。
+    """
+    msgs = read_rounds(10, chars=8_000)
+    placeholder = (
+        f"{TAG_OPEN}\n完整输出已落盘：data/tool_results/s1/c0.txt\n"
+        f"预览：" + "y" * 20_000 + f"\n{TAG_CLOSE}"
+    )
+    msgs[3] = tool_result("c0", placeholder)
+    mgr = pressure_manager(msgs, level=0.80, keep_recent=4, min_keep=2)
+
+    mgr.prepare(make_state(msgs))
+
+    assert msgs[3]["content"] == placeholder       # 指针原样
+    assert MARK_PREFIX in msgs[5]["content"]       # 同窗口的别人被缩了 → 这轮真跑过
+
+
+def test_recent_window_and_prefix_are_protected():
+    """前缀（`_PREFIX_LEN`：system + 任务）与最近 `keep_recent` 条不碰。
+
+    模型正在用的结果不能动：它刚读到一半的内容下一轮就变了。比"变了"更糟的是
+    **悄悄变了** —— 模型会以为自己记错了，然后基于错误记忆继续做。
+    """
+    msgs = read_rounds(10, chars=8_000)
+    prefix = [dict(m) for m in msgs[:_PREFIX_LEN]]
+    recent = [m["content"] for m in msgs[-4:]]
+    mgr = pressure_manager(msgs, level=0.80, keep_recent=4, min_keep=2)
+
+    mgr.prepare(make_state(msgs))
+
+    assert msgs[:_PREFIX_LEN] == prefix
+    assert [m["content"] for m in msgs[-4:]] == recent
+    assert MARK_PREFIX in msgs[5]["content"], "窗口内也没动 → 这条测试在空转"
+
+
+def test_failure_result_keeps_a_larger_budget():
+    """失败原文的额度**统一放大**：它是模型自修复的唯一线索（「失败一律文本回喂」）。
+
+    判据只能是文案前缀 —— OpenAI 的消息格式里 tool 消息**没有 success 字段**，
+    成功与否只体现在文本上。所以这里既钉额度，也钉"前缀认得出失败"。
+    """
+    failure = "工具执行失败：pytest 退出码 1\n" + "e" * 18_000
+    success = "s" * 18_000
+    msgs = read_rounds(3, chars=18_000)
+    msgs[3] = tool_result("c0", failure)
+    msgs[5] = tool_result("c1", success)
+    mgr = pressure_manager(msgs, level=0.80, keep_recent=2, min_keep=2)
+
+    mgr.prepare(make_state(msgs))
+
+    assert TRUNCATED_MARK.format(n=len(failure) - FAILURE_BUDGET) in msgs[3]["content"]
+    assert TRUNCATED_MARK.format(n=len(success) - READ_BUDGET) in msgs[5]["content"]
+    assert READ_BUDGET < FAILURE_BUDGET  # 前提：失败额度确实更大，否则上面两条是同一件事
+
+
+def test_truncation_sets_stale_reason():
+    """内容变了 → 旧 provider 锚点度量的已不是当前上下文，必须置 stale。
+
+    不置的话就会**拿旧 usage 度量新上下文** —— `context.py` 模块 docstring 里
+    写过的那个经典错误：账越记越偏，而且偏得无声无息。
+    """
+    msgs = read_rounds(10, chars=8_000)
+    state = make_state(msgs)
+    mgr = pressure_manager(msgs, level=0.80, keep_recent=4, min_keep=2)
+
+    mgr.prepare(state)
+
+    assert state.usage_stale_reason == "tool_output_truncated"
+
+
+def test_truncation_is_idempotent():
+    """同一条只缩一次，判据是**标记字符串**而不是"长度变小了"。
+
+    按长度判断的话，内容恰好等于额度时会把同一条反复缩（每缩一次都在
+    `usage_stale_reason` 上再踩一脚）。这里直接调 `_truncate_oversized`
+    而不是走 `prepare`：幂等是这个单元自己的性质，绕一圈反而测不准。
+    """
+    msgs = read_rounds(10, chars=8_000)
+    state = make_state(msgs)
+    mgr = pressure_manager(msgs, level=0.80, keep_recent=4, min_keep=2)
+
+    assert mgr._truncate_oversized(state) > 0
+    snapshot = [m["content"] for m in msgs]
+    assert mgr._truncate_oversized(state) == 0            # 第二次一条都不动
+    assert [m["content"] for m in msgs] == snapshot
+
+
+def test_truncation_that_is_not_enough_still_falls_through_to_snip():
+    """缩了但还越线 → 继续走 snip。截断不是 snip 的替代，是流水线的第 0 级。
+
+    只缩不删的话这个上下文仍然超预算，必须让后面的级别接手；而且 `prepare`
+    返回前不能再假装"只缩短了文本" —— 更强的失效理由（消息位置变了）要覆盖掉它。
+    """
+    msgs = read_rounds(10, chars=8_000)
+    state = make_state(msgs)
+    mgr = pressure_manager(msgs, level=0.80, keep_recent=16, min_keep=2)
+    calls: list[int] = []
+    real = mgr._truncate_oversized
+    mgr._truncate_oversized = lambda s: (calls.append(1), real(s))[1]
+
+    prepared = mgr.prepare(state)
+
+    assert calls == [1], "第 0 级没跑"
+    assert prepared[2] == {"role": "user", "content": SNIP_BOUNDARY_MARKER}  # 第 1 级接手
+    assert state.usage_stale_reason == "snip_compact"      # 更强的理由覆盖截断
+    assert mgr.account(state).utilization < mgr.snip_threshold

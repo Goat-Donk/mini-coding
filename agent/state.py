@@ -80,7 +80,7 @@ class AgentState:
 
     # M3 上下文记账：最近一次 llm.chat 的 usage（provider 锚点）；compact 后置 stale
     last_usage: Optional[Usage] = None
-    usage_stale_reason: Optional[str] = None                 # "snip_compact" | "llm_compact"
+    usage_stale_reason: Optional[str] = None                 # "tool_output_truncated" | "snip_compact" | "llm_compact"
 
     # M7 会话级污染标记：粗粒度（一个会话一个级别），**不是逐值污点追踪**。
     # 只升不降 —— 模型自己无法下调，唯一复位者是人的动作（CLI --clear-taint）。

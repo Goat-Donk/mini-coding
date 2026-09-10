@@ -5,7 +5,8 @@ provider 真实用量 + 尾部估算），叠加我们独有的 cache-aware 布�
 - 稳定前缀（system + 记忆块 + 工具 schema）恒在最前不被 compact 破坏，
   最大化 DeepSeek 磁盘缓存命中。
 - 分级告警：normal(<50%) / warning(≥50%) / critical(≥85%) / blocked(≥95%)。
-- compact 流水线（M3-3）：确定性 snip（无 LLM）→ LLM 摘要（critical 才触发）。
+- compact 流水线（M3-3，M8 加第 0 级）：分级截断（只缩 tool 正文）→ 确定性 snip
+  （无 LLM，删中段）→ LLM 摘要（critical 才触发）。顺序即"代价从低到高"。
 
 记账锚点：
 - loop 每次 llm.chat 后把 `result.usage` 存入 `state.last_usage`（provider 侧
@@ -42,6 +43,56 @@ WARNING_LEVELS = (
 
 SNIP_BOUNDARY_MARKER = "[已裁剪的历史消息，见会话轨迹 JSONL]"
 SUMMARY_MARKER = "[历史对话已摘要，完整轨迹见会话 JSONL]"
+
+# ---------- 分级截断（compact 的第 0 级） ----------
+
+#: 截断标记。**下一轮见到它就知道这条已经缩过了** —— 幂等的判据是这个字符串，
+#: 不是"长度有没有变小"（后者在内容恰好等于额度时会把同一条反复缩）。
+TRUNCATED_MARK = "[... 省略 {n} 字符 ...]"
+
+#: 头尾比例：只留头部是错的。`grep`/`pytest` 这类输出的**结论在尾部**
+#: （失败摘要、`N passed` 总计行、`[exit code]`），只留头等于把最该看的丢掉。
+TRUNCATE_HEAD_RATIO = 0.7
+
+#: 单条 tool 结果的截断额度（字符），按**工具**分级。
+#: 依据是"这条输出还能不能重新取一次"：read/grep/glob 的探索型输出可以再调一次
+#: 工具拿到（而且往往只需要其中一段），额度给小；bash 的输出常含测试摘要，给中。
+TRUNCATE_BUDGETS = {
+    "read": 4_000,
+    "grep": 3_000,
+    "glob": 2_000,
+    "bash": 6_000,
+    "default": 4_000,
+}
+
+#: 失败结果的额度，**统一放大**。理由：失败原文是模型自修复的唯一线索
+#: （TECH_SPEC 的「失败一律文本回喂」原则），把它缩掉会让 agent 反复撞同一面墙。
+FAILURE_BUDGET = 16_000
+
+#: 判定"这条是不是失败结果"的文案前缀。
+#:
+#: 这里必须说清楚一件事：**OpenAI 的消息格式里 tool 消息没有 success 字段**，
+#: 成功与否只体现在文本上。所以判据只能是这些前缀 —— 它们全部由 gate 链
+#: （`ToolResult.fail` / `loop._gate_block`）产出，是一组封闭的、可枚举的文案。
+#:
+#: 判据刻意写**宽**（多认几种失败文案）：漏判的后果是"一条错误信息被按成功额度
+#: 截断"，而模型看不出自己看到的不是全部错误；误判的后果只是少省一点 token。
+#: 两个方向的代价不对等，所以往安全的那边偏。
+_FAILURE_PREFIXES = (
+    "工具执行失败",
+    "权限拒绝",
+    "未知工具",
+    "[hook 阻断]",
+    "本轮因等待用户输入而跳过",
+)
+
+#: 缩不得的占位文本（**路径指针**）。把它缩掉就毁了回读能力，等于废掉
+#: `tool_result.py` 落盘的全部意义 —— 它整个机制就是为了"别丢信息"。
+#: 只认这两种尖括号/方括号形式；不把 SNIP/SUMMARY 标记也算进来，是因为它们
+#: 出现在 user 角色消息上（本函数只看 tool 消息），且 `read` 一个源码文件时
+#: 正文里可能**合法地**含有那些字面量，按包含关系判断会误伤。
+SKIP_TRUNCATE_MARKERS = ("<persisted-output>", "[... 省略")
+
 
 # 稳定前缀长度：messages[0] 恒为 system、messages[1] 恒为首条 user（任务）。
 # compact 只删/改前缀之后的"中段"，永不触碰前缀（cache-aware 约定）。
@@ -174,21 +225,113 @@ class ContextManager:
     def prepare(self, state, tool_schemas: list[dict] | None = None) -> list[dict]:
         """M3 流水线入口：记账 → 分级 compact → 返回布局稳定的消息。
 
-        两级 compact（TECH_SPEC §6.3，"先确定性后 LLM"）：
-        - utilization ≥ 0.70（warning 带）→ 确定性 snip：中段删除 + boundary 标记，
-          成本≈0；
-        - utilization ≥ 0.85（critical/blocked）→ LLM 摘要 compact：中段压成摘要
-          消息（信息保真更高），LLM 失败退化为 snip。
+        三级 compact（"先缩内容、缩不够再删、删不够再摘要"）：
+        - utilization ≥ 0.70（warning 带）→ **第 0 级：分级截断**（只改 tool 消息的
+          正文，不删消息）；缩到线下就返回，这一级不进就是最便宜的一手；
+        - 仍 ≥ 0.70 → 确定性 snip：中段删除 + boundary 标记，成本≈0；
+        - ≥ 0.85（critical/blocked）→ LLM 摘要 compact：中段压成摘要消息
+          （信息保真更高），LLM 失败退化为 snip。
         cache-aware 约定：system + 任务恒在首位、compact 只动中段不碰前缀。
+
+        **第 0 级只在越过 0.70 时才跑**，这是刻意的、也是必须守住的：截断会改
+        中段某个 tool 消息 → 那条之后的**前缀缓存全部失效**（DeepSeek 是前缀匹配）。
+        每步都跑的话，每个大工具结果在它被 snip 掉之前至少破坏一次缓存，而收益
+        只是几个百分点的 utilization —— 净亏。**而这条规则一旦被违反，不会有任何
+        报错**：表现只是缓存命中率曲线不再上升。所以下面那条 `if` 是一条不变量，
+        不是优化开关。
         """
         self.last_stats = self.account(state)
+        if self.last_stats.utilization >= self.snip_threshold:
+            freed = self._truncate_oversized(state)
+            if freed:
+                self.last_stats = self.account(state)
+                if self.last_stats.utilization < self.snip_threshold:
+                    # 缩到线下 → 不删消息（保住 tool_call_id 配对与大部分内容）
+                    state.usage_stale_reason = "tool_output_truncated"
+                    return state.messages
+                # 缩了但不够 → 继续走 snip/摘要（截断结果保留，不白做）
         if self.last_stats.utilization >= self.compact_threshold:
             self._compact_with_summary(state, state.messages)
         elif self.last_stats.utilization >= self.snip_threshold:
             self._snip(state, state.messages)
         return state.messages
 
-    # ---------- 两级 compact ----------
+    # ---------- 第 0 级：分级截断 ----------
+
+    def _truncate_oversized(self, state) -> int:
+        """把中段超额的 tool 消息正文缩成 head 70% + tail 30%，返回释放的估算 token。
+
+        为什么改正文而不是删消息（与 snip 的区别，也是它更便宜的原因）：
+        - **消息不删** → `tool_call_id` 配对天然完整，`_find_cut` 要处理的两类
+          孤儿边界问题（assistant(tool_calls) 与它右侧的 tool 结果被切开）在这里
+          根本不存在；
+        - 保留头尾 → "这条命令跑没跑成、最后报了什么"仍在；
+        - 动作范围小 → 缓存失效的起点更靠后。
+
+        不碰两处：前缀（`_PREFIX_LEN`）与最近 `keep_recent` 条 —— 模型正在用的
+        结果不能动它，否则它刚读到一半的内容下一轮就变了（比截断更糟的是**悄悄变了**）。
+        """
+        messages = state.messages
+        end = len(messages) - self.keep_recent
+        start = max(_PREFIX_LEN, self.min_keep)
+        if end <= start:
+            return 0
+
+        names = self._tool_names(messages)
+        freed = 0
+        for idx in range(start, end):
+            message = messages[idx]
+            if message.get("role") != "tool":
+                continue
+            content = message.get("content")
+            if not isinstance(content, str) or not content:
+                continue
+            if any(marker in content for marker in SKIP_TRUNCATE_MARKERS):
+                continue
+            tool_name = names.get(message.get("tool_call_id"), "")
+            budget = self._truncate_budget(tool_name, content)
+            if len(content) <= budget:
+                continue
+            before = self.estimate_tokens(message)
+            message["content"] = self._head_tail(content, budget)
+            freed += before - self.estimate_tokens(message)
+        return freed
+
+    @staticmethod
+    def _tool_names(messages: list[dict]) -> dict[str, str]:
+        """`tool_call_id → 工具名`（从 assistant 消息的 tool_calls 反查）。
+
+        一次性建表而不是每条 tool 消息回扫一遍：回扫是 O(n²)，而 prepare 每步都跑。
+        """
+        names: dict[str, str] = {}
+        for message in messages:
+            for call in message.get("tool_calls") or []:
+                call_id = call.get("id")
+                fn = call.get("function") or {}
+                if call_id and fn.get("name"):
+                    names[call_id] = fn["name"]
+        return names
+
+    @staticmethod
+    def _truncate_budget(tool_name: str, content: str) -> int:
+        """按 [失败 | 工具类别] 取额度。失败优先 —— 见 `_FAILURE_PREFIXES` 的说明。"""
+        if content.startswith(_FAILURE_PREFIXES):
+            return FAILURE_BUDGET
+        return TRUNCATE_BUDGETS.get(tool_name, TRUNCATE_BUDGETS["default"])
+
+    @staticmethod
+    def _head_tail(text: str, budget: int) -> str:
+        """head 70% + 省略标记 + tail 30%。省略标记写明**省了多少字符** ——
+        只说"已省略"模型无法判断要不要重新取一次，说了数字它就能决定。"""
+        head = int(budget * TRUNCATE_HEAD_RATIO)
+        tail = budget - head
+        omitted = len(text) - budget
+        middle = TRUNCATED_MARK.format(n=omitted)
+        if tail <= 0:
+            return text[:head] + "\n" + middle + "\n"
+        return text[:head] + "\n" + middle + "\n" + text[-tail:]
+
+    # ---------- 第 1/2 级 compact ----------
 
     def _snip(self, state, messages: list[dict]) -> bool:
         """确定性裁剪：保留最近 keep_recent 条（轮次边界对齐），中段删除。"""
