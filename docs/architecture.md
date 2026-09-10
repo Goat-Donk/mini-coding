@@ -1,0 +1,324 @@
+# CodeAgent 架构详解
+
+> 逐层拆解 CodeAgent 的设计，并标注每一层对应 [Claude Code 源码](https://github.com/pengchengneo/Claude-Code) 的哪个机制。
+> 配套阅读：[`docs/TECH_SPEC.md`](TECH_SPEC.md)（签名级规格）· [`docs/reference/claude-code-notes.md`](reference/claude-code-notes.md)（调研笔记）
+
+## 0. 三条设计原则
+
+1. **运行时拥有循环，模型只输出动作。** 循环、步数上限、终止判定、权限、落盘全部在 `QueryEngine` 里；LLM 每轮只做一件事——返回 `content` 或 `tool_calls`。这与 Claude Code 的 `QueryEngine.ts`、offer-Master 的 `LoopAgentController` 同构：**agent 的可靠性来自运行时的确定性，而不是提示词的祈祷。**
+2. **核心手写，支撑层用成熟库。** 循环 / 工具协议 / 上下文治理 / 权限 / 检查点全部手写——这是「懂 agent 底层」的证据；HTTP 调用（openai SDK）、schema 校验（pydantic v2）、UI（streamlit）、CLI（typer）用成熟库，不重复造轮子。
+3. **不确定的地方要能恢复，而不是假设不会发生。** 空响应 → 重试；工具失败 → 错误回喂模型自修复；compact 的 LLM 摘要失败 → 退化为确定性裁剪；进程被杀 → 检查点续跑；agent 没修好 bug → 评估如实记 0 分。
+
+## 1. 分层与依赖方向
+
+依赖**单向向下**：入口层 → 核心层 → 治理层/工具层；评估层旁挂（驱动核心层，不被核心层依赖）。核心层不 import streamlit / typer，所以能被 eval runner 和测试直接复用。
+
+```mermaid
+flowchart TB
+    subgraph ENTRY["入口层 app/"]
+        CLI["cli.py<br/>typer CLI · --resume"]
+        UI["ui_streamlit.py<br/>实时事件 · 权限按钮 · 指标"]
+        RP["replay.py<br/>检查点回放（纯函数）"]
+    end
+
+    subgraph CORE["核心层 agent/"]
+        LOOP["loop.py · QueryEngine"]
+        LLM["llm.py"]
+        STATE["state.py"]
+        CTX["context.py"]
+        TR["tool_result.py"]
+        SESS["session.py"]
+    end
+
+    subgraph GOV["治理层 agent/"]
+        PERM["permissions.py"]
+        HOOK["hooks.py"]
+        MEM["memory.py"]
+    end
+
+    subgraph TOOLS["工具层 agent/tools/"]
+        BASE["base.py · Tool / ToolRegistry"]
+        BASH["bash.py"]
+        FILES["files.py"]
+        SUB["subagent.py"]
+    end
+
+    subgraph EVAL["评估层 eval/"]
+        GT["golden_tasks.py"]
+        RUN["runner.py"]
+    end
+
+    CLI --> LOOP
+    UI --> LOOP
+    RP --> SESS
+    LOOP --> LLM
+    LOOP --> STATE
+    LOOP --> CTX
+    LOOP --> SESS
+    LOOP --> PERM
+    LOOP --> HOOK
+    LOOP --> BASE
+    CTX --> TR
+    STATE --> LLM
+    BASE --> BASH
+    BASE --> FILES
+    BASE --> SUB
+    SUB -. 复用 QueryEngine .-> LOOP
+    RUN --> GT
+    RUN --> LOOP
+```
+
+## 2. 一轮任务的生命周期
+
+```mermaid
+sequenceDiagram
+    participant U as 用户
+    participant Q as QueryEngine
+    participant C as ContextManager
+    participant L as DeepSeek
+    participant G as 门禁链
+    participant S as Session
+
+    U->>Q: run(task)
+    Q->>Q: 组 system prompt（记忆块 + 工具 schema）
+    loop 每步（上限 max_steps=25）
+        Q->>C: prepare(state)
+        C->>C: provider-usage-first 记账 → 分级 compact
+        C-->>Q: 布局稳定的 messages
+        Q->>L: chat(messages, tools)
+        L-->>Q: content / tool_calls + usage
+        Q->>Q: usage 累加，重置 stale 标记
+        alt 无 tool_calls
+            Q->>Q: 空响应？→ continuation prompt 重试（≤2 次）
+            Q-->>U: RunResult(completed)
+        else 有 tool_calls
+            Q->>Q: 循环检测（连续 N 次相同签名 → loop_detected）
+            Q->>G: 执行（只读并发 / 写工具串行）
+            G-->>Q: ToolResult 文本（失败也回喂）
+            Q->>S: checkpoint(state) 每 5 步原子落盘
+        end
+    end
+    Q-->>U: RunResult(max_steps)
+```
+
+终止判定有四条出口，都会写进 `RunResult.terminated_reason`（轨迹和报告里可审计）：
+
+| terminated_reason | 触发条件 | 语义 |
+|---|---|---|
+| `completed` | 模型不再调工具（且内容非空，或空响应重试用尽） | 正常完成 |
+| `max_steps` | 达到 `max_steps`（默认 25） | 坍缩防护：硬上限 |
+| `loop_detected` | 最近 4 步工具签名集合完全一致 | 坍缩防护：原地打转 |
+| `error` | 循环内抛异常 | 明确失败，**不假装成功** |
+
+## 3. 核心层
+
+### 3.1 QueryEngine（`agent/loop.py`，299 行）
+
+**只读工具并发，写工具串行** —— 直接照搬 Claude Code `query.ts` 的语义，也是与串行参考实现的主要差异：
+
+```mermaid
+flowchart LR
+    A["模型返回 tool_calls"] --> B{"全部只读 且 >1 个?"}
+    B -->|是| C["ThreadPoolExecutor(max_workers=min(4,N))<br/>executor.map 保持输入顺序"]
+    B -->|否| D["串行 for 循环"]
+    C --> E["_gate_and_run（门禁链）"]
+    D --> E
+    E --> F["① PreToolUse hooks（可阻断）"]
+    F --> G["② PermissionsEngine.check → allow/deny/ask"]
+    G --> H["③ tool.run()"]
+    H --> I["④ PostToolUse hooks（非阻断）"]
+    I --> J["compact_batch：超大结果落盘"]
+    J --> K["assistant(tool_calls) + N 条 tool 结果<br/>顺序与 id 严格一一对应"]
+```
+
+关键约束：`executor.map` 而非 `as_completed`——**顺序必须与 `tool_calls` 一致**，因为 OpenAI 协议要求每条 `tool` 消息的 `tool_call_id` 与 assistant 的 `tool_calls` 对应，乱序会导致下一轮请求 400。
+
+`_gate_and_run` 是统一门禁：**未知工具**（把可用工具名回喂，让模型自己改）、**hook 阻断**、**权限拒绝**都返回 `ToolResult.fail(...)`——工具层面没有「抛异常中断整个任务」，所有失败都是**文本回喂给模型自修复**。
+
+### 3.2 LLM 抽象（`agent/llm.py`）
+
+`BaseLLM` 两个实现，**接口完全一致**，所以循环、子代理、评估层共用一套代码：
+
+- `DeepSeekClient`：走 openai SDK（DeepSeek 兼容 OpenAI 协议），`chat()` 返回 `LLMResult(content, tool_calls, usage)`，`complete()` 给 compact 摘要用。
+- `MockLLM`：`script(*responses)` 脚本化响应序列 / `text("...")` 固定响应 / `tool_then_text(...)`。**测试与无 key 演示都靠它**——156 个测试全部离线，不打网络。
+
+`Usage` 里单独保留 `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`——这是 DeepSeek 磁盘缓存的**实测**字段，整个缓存命中率指标和成本估算都建立在它之上（不是估算出来的）。
+
+### 3.3 状态与消息契约（`agent/state.py`）
+
+**OpenAI Chat Completion 格式的 dict 是 loop 与 LLM 之间的唯一契约**，`state.py` 用四个构造器保证格式 100% 合法：`system()` / `user()` / `assistant_text()` / `assistant_tool_calls()` / `tool_result()`。
+
+`AgentState` 是「数据面」，也是检查点落盘的对象：`messages` / `step` / `usage` / `events` / `terminated_reason` / `memory_blocks`，加上 M3 的两个记账字段 `last_usage`（provider 锚点）与 `usage_stale_reason`。
+
+`record_event(type, **data)` 是唯一的埋点通道：事件进内存列表，**同时**经 `emitter` 回调写给 `Session`（JSONL + UI 实时流）。一处埋点，轨迹、控制台、评估三处消费。
+
+### 3.4 上下文治理（`agent/context.py`，项目最核心的差异化）
+
+**provider-usage-first 记账**（吸收自 MiniCode）：不去猜上下文有多大，而是**信任 provider 的实测值**——取最近一次 `llm.chat` 的 `usage.total_tokens` 作锚点，只对锚点之后的新增消息（尾部）做估算，`total = provider_total + 尾部估算`。compact 之后旧锚点失效，打上 `usage_stale_reason`，改为全量估算——**避免用旧 usage 度量新上下文**这个经典错误。
+
+**两级 compact，先确定性后 LLM**（成本递增，收益递减）：
+
+```mermaid
+flowchart TD
+    A["每步 llm.chat 前：context.prepare(state)"] --> B["account(state)<br/>provider 锚点 + 尾部估算"]
+    B --> C{"utilization 分级"}
+    C -->|"normal（低于 0.70）"| D["原样返回<br/>前缀不动 → 磁盘缓存继续命中"]
+    C -->|"warning（0.70 起）"| E["_snip：确定性中段裁剪<br/>保留最近 12 条 · 轮次边界对齐<br/>插入 snip boundary 标记 · 成本≈0"]
+    C -->|"critical（0.85 起）"| F["_compact_with_summary<br/>中段 → LLM 摘要成一条消息"]
+    F --> G{"摘要有效?"}
+    G -->|"是"| H["插入 context summary 标记"]
+    G -->|"异常 / 空"| E
+    E --> I["usage_stale_reason = snip_compact"]
+    H --> J["usage_stale_reason = llm_compact"]
+    I --> K["返回 messages"]
+    J --> K
+    D --> K
+```
+
+**cache-aware 布局**（本项目独有，参考项目没有缓存概念）：`_PREFIX_LEN = 2`——**system + 首条 user 任务恒定在前两位**，compact 只动中段，绝不触碰前缀。DeepSeek 的磁盘缓存按前缀匹配，前缀稳定 → 命中率随会话推进持续上升，直接省钱。控制台把这条曲线画出来，并按公开定价（命中 ¥0.5/M vs 未命中 ¥2/M）实时估算省了多少钱。
+
+裁掉的中间消息**并没有丢**：完整内容仍在 `data/sessions/{sid}.jsonl` 里，snip/summary 标记都指向轨迹——所以检查点回放看到的是 compact 前的完整对话。
+
+### 3.5 工具结果落盘（`agent/tool_result.py`）
+
+纯截断会**丢信息**（模型再也看不到那部分内容）。改成落盘 + 预览：单条超阈值的结果写到 `data/tool-results/{session}/{id}.txt`，上下文里替换为「预览 + 完整路径」，模型（或用户）需要时能随时读回全文。`compact_batch` 还做**批次预算**——单条都没超，但一轮总量超限时按「最大优先」落盘。
+
+### 3.6 会话、检查点、恢复（`agent/session.py`）
+
+三个落盘职责，互不干扰：
+
+| 产物 | 路径 | 写入时机 | 用途 |
+|---|---|---|---|
+| JSONL 轨迹 | `data/sessions/{sid}.jsonl` | 每个事件（append-only） | 完整审计；compact 裁掉的中段仍在此 |
+| 检查点 | `data/checkpoints/{sid}/step-{N}.json` | 每 5 步（`.tmp` → `replace` 原子写） | resume / 回放 |
+| 工具结果原文 | `data/tool-results/{sid}/{id}.txt` | 超大结果产生时 | 上下文只留预览 + 路径 |
+
+```mermaid
+sequenceDiagram
+    participant U as 用户
+    participant C as CLI
+    participant Q as QueryEngine
+    participant S as Session
+    U->>C: python -m app.cli "长任务"
+    C->>Q: run(task)
+    Q->>S: checkpoint(state) 每 5 步
+    S->>S: 原子写 step-5.json（messages + usage + events）
+    U--xC: Ctrl+C / kill -9
+    Note over S: 进程死了，但 step-5.json 完整（原子写保证）
+    U->>C: python -m app.cli --resume
+    C->>S: latest_session(workspace) → from_checkpoint()
+    S-->>Q: AgentState（step=5）
+    Q->>Q: run_from(state) 从第 6 步继续
+```
+
+**续跑不重置 step 计数**——恢复的 `state.step` 继续推进，所以续跑产生的检查点不会覆盖恢复前的同名文件，轨迹里也没有歧义。
+
+## 4. 治理层
+
+| 模块 | 机制 | 对应的 Claude Code 设计 |
+|---|---|---|
+| `permissions.py` | 三类请求（path / command / edit）× 六级决策（`allow_once` / `allow_turn` / `allow_always` / `deny_once` / `deny_always` / `ask`）+ 危险命令黑名单 + 路径沙箱 | `permission.ts` 的最小权限原则；决策粒度吸收自 MiniCode |
+| `hooks.py` | `PreToolUse` / `PostToolUse` 两个事件；内置 **block-at-submit** 示例 | Hooks：阻断型钩子是**确定性约束**，CLAUDE.md 只是建议 |
+| `memory.py` | 分层指令文件（`CODEAGENT.md` < `MINI.md` < `CLAUDE.md` < `.codeagent/rules/*.md`）+ `@include` 递归 + sha256 去重 + 预算（单文件 8K / 总 20K）+ 任务后提取写回 | CLAUDE.md 机制 + Dream consolidation（简化为提取 + 去重） |
+
+**block-at-submit 是本项目最直观的 hook 演示**：`require_tests_before_commit` 包住 `Bash(git commit)`，检查 `data/tests_pass.marker` 是否存在——不存在就**阻断提交**并把「先去跑 pytest」回喂给模型，逼它进入「测试 → 修复 → 再提交」的循环。这是「用确定性代码约束 agent 行为」，比在提示词里写一百遍「记得跑测试」都管用。
+
+**记忆的闭环**：`.codeagent/rules/learned.md` 是唯一可写的记忆文件。任务结束后 `extract_conventions` 从轨迹里提炼 `- ` 条目 → `consolidate`（归一化 / 子串包含合并 / hash 去重）→ `save_learned` 写回 → **下次 `discover` 自动包含**。约定因此跨会话生效，而且**排最后 = 优先级最高**（离当前工作区最近的知识最该被信任）。
+
+`@include` 的安全边界值得单说：只接受相对路径，显式拒绝绝对路径、`..` 段（含 `sub/../x` 这种伪装）、沙箱逃逸；循环 include 做 seen 集合检测；文件缺失给占位注释而不是报错——**记忆文件坏了不该让整个任务崩掉**。
+
+## 5. 工具层（`agent/tools/`）
+
+统一协议（用 pydantic v2 对齐 Claude Code 的 zod `inputSchema`）：
+
+```python
+class Tool:
+    name: str
+    description: str
+    Input: type[BaseModel]           # → 自动生成 JSON Schema 给模型
+    def execute(self, args, ctx) -> ToolResult: ...
+    def is_read_only(self) -> bool:  # 决定能否并发
+```
+
+| 工具 | 关键设计 |
+|---|---|
+| `bash` | subprocess + 超时 + 平台适配（Windows）+ 危险命令过滤；**唯一能触达任意 shell 能力的工具，也是权限最严的** |
+| `read` / `write` | 行号前缀输出、按需读片段；写入前路径沙箱校验 |
+| `edit` | **唯一匹配**语义（匹配到 0 处或 >1 处都失败并回喂原因）+ 返回 diff；失败信息足够模型自己修正 |
+| `glob` / `grep` | 结果截断 + 明确提示「还有更多」（照搬 CC 的 `TRUNCATED_MESSAGE`——**截断必须可感知**，否则模型以为看全了） |
+| `subagent` | research 子代理（下节） |
+
+### research 子代理（`agent/tools/subagent.py`）
+
+上下文经济学：一个复杂探索需要输入 X、过程累积 Y、产出结论 Z。跑 N 个，主上下文会累积 `(X+Y+Z)×N`；子代理把 `(X+Y)×N` 外包，主上下文只收 Z。
+
+- **独立上下文**：子代理有全新的 `AgentState` + 专用 system prompt，与主循环的 messages / usage / compact 完全隔离；
+- **受限只读**：只给 `glob` / `grep` / `read`（白名单），`_restricted_registry` **永不包含 subagent 自身** → 从结构上禁止无限递归；
+- **复用循环**：内部直接跑同一个 `QueryEngine`，不复制一份循环代码；
+- **失败如实**：超步或异常返回 `ToolResult.fail("[子代理 max_steps，N 步] …")`，**不假装成功**——主模型能据此决定自己上手。
+
+## 6. 评估层（`eval/`）
+
+评估集**不是编的**，是从 [tinydb](https://github.com/msiemens/tinydb) 的真实 git history 里挖的：
+
+```mermaid
+flowchart LR
+    A["discover_fix_commits<br/>subject 含 fix 关键字<br/>且同时改源码 + tests"] --> B["build_task"]
+    B --> C["task_text = 该提交的 subject + body<br/>（真实 bug 报告）"]
+    B --> D["base_sha = 父提交<br/>（bug 存在状态）"]
+    B --> E["hidden_tests = 该提交的 tests/<br/>（agent 全程看不到）"]
+    D --> F["materialize<br/>git worktree add --detach<br/>隔离工作区"]
+    F --> G["QueryEngine 跑 task_text"]
+    G --> H["judge：hidden_tests 覆盖写回<br/>→ pytest 判定"]
+    H --> I["报告：完成率 / token / 耗时 / 成本 / 缓存命中率"]
+    I --> J["remove_worktree 清理"]
+```
+
+这个设计绕开了 SWE-bench 类任务的两个经典陷阱：
+
+1. **测试泄漏** —— 判定用的测试如果 agent 能读到，就等于开卷考试。这里隐藏测试只在 judge 阶段写回，agent 跑的 base 工作区里没有它。
+2. **任务描述失真** —— 把 fix 提交改写成谜语式任务描述，会让任务变得不可解。这里直接用提交的 subject + body，是**真实的、当时开发者自己写的** bug 报告。
+
+`git worktree add --detach` 让每个任务有独立工作区且不污染主仓库；成本按 DeepSeek 公开定价用**实测 usage** 估算；agent 异常或 judge 异常**如实写进报告的 `error` 字段**——一个坏掉的 run 绝不会显示成 pass。
+
+## 7. 落盘产物地图
+
+| 路径 | 写入者 | 内容 | 谁读它 |
+|---|---|---|---|
+| `data/sessions/{sid}.jsonl` | `Session.emit` | 每事件一行 | 回放、审计 |
+| `data/checkpoints/{sid}/step-N.json` | `Session._write` | state 快照（原子写） | `--resume`、控制台回放 |
+| `data/tool-results/{sid}/{id}.txt` | `ToolResultStore` | 超大工具结果原文 | 模型按路径读回 |
+| `data/tests_pass.marker` | `mark_tests_pass()` | 测试通过标记 | block-at-submit hook |
+| `.codeagent/rules/learned.md` | `save_learned` | 任务中提炼的约定 | 下次会话的 `discover` |
+| `data/eval/report-*.json` | `eval.runner` | 回归报告 | 人 / CI |
+
+`data/` 与 `workspace/` 全部 gitignore——**产物是运行出来的，不进仓库**。
+
+## 8. 与 Claude Code 的逐层映射
+
+| Claude Code 机制 | CodeAgent 实现 | 差异 |
+|---|---|---|
+| `query.ts` 循环 + 只读并发 | `agent/loop.py` | 照搬语义；Python 用 `ThreadPoolExecutor.map` 保序 |
+| Tool 接口（zod `inputSchema`） | `agent/tools/base.py` | 用 pydantic v2 自动生成 schema；参数扁平化避免 `$defs` |
+| `needsPermissions` 工具自声明 | `Tool.is_read_only()` + 权限引擎 | 权限规则外置成引擎，工具只声明只读性 |
+| 结果截断 + `TRUNCATED_MESSAGE` | `files.py` 的 glob/grep/read | 一致；额外做超大结果**落盘**而非纯截断 |
+| `getContext()` 拼装上下文 | `agent/context.py` | 换成 cache-aware 布局 + 两级 compact（可为 DeepSeek 缓存省钱） |
+| CLAUDE.md 机制 | `agent/memory.py` + 仓库根 `CLAUDE.md` | 一致；额外做提取写回（自进化） |
+| SubAgent 只回结论 | `agent/tools/subagent.py` | 单 research 子代理，只读白名单，无递归 |
+| block-at-submit hooks | `agent/hooks.py` | 一致（git commit 检查测试标记） |
+| `/resume` + JSONL 轨迹 | `agent/session.py` | 做到 **step 级**检查点，可任务中途续跑 |
+| （无） | `eval/` | Claude Code 没有内置评估；本项目加了轨迹驱动评估 |
+| CONTEXT_COLLAPSE 等五种压缩 | `context.py` 两级 compact | 只做 snip + LLM 摘要（复杂度/收益比最优） |
+
+## 9. 关键决策与权衡
+
+| 决策 | 备选 | 为什么这么选 |
+|---|---|---|
+| 核心循环手写 | LangGraph / Agent SDK | 循环是 agent 的「操作系统」；套框架能跑通，但讲不清步数上限、终止判定、并发语义是怎么实现的 |
+| 只读工具并发 | 全部串行 | 探索阶段（read/grep/glob）互相独立，并发直接省墙钟时间；写操作必须保序 |
+| token 记账以 provider usage 为准 | 纯本地估算 | 估算必然有偏差，而 provider 每轮都返回实测值；只在锚点之后的尾部用估算 |
+| 两级 compact | 只用 LLM 摘要 | LLM 摘要又慢又贵还可能失败；0.70 用零成本的确定性裁剪就够，0.85 才值得上 LLM |
+| 超大结果落盘而非截断 | 直接截断 | 截断是**永久丢信息**；落盘 + 路径让信息随时可取，成本只是一次文件写 |
+| 隐藏测试 | 用现成测试判定 | 现成测试在 agent 的工作区里 = 开卷；hidden tests 只在 judge 时写回 |
+| 失败一律文本回喂 | 抛异常终止 | 模型自修复能力很强，把错误原文给它往往比运行时硬编码处理更有效 |
+| 不做向量 RAG | 加检索层 | Claude Code 自己就是 grep/glob/read 检索——**代码检索用精确匹配比向量更准**，且省掉一整层依赖 |

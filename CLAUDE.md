@@ -50,6 +50,7 @@ streamlit run app/ui_streamlit.py            # 控制台（M2 起）
 
 ## 参考与来源
 
+- **架构详解（逐层对应 CC 源码 + mermaid 图）** → `docs/architecture.md`
 - CC 源码笔记 → `docs/reference/claude-code-notes.md`（含用户飞书文档《CC》要点）
 - offer-Master 笔记 → `docs/reference/offer-master-notes.md`
 - MiniCode 笔记 → `docs/reference/minicode-notes.md`（长会话上下文治理：落盘/记账/compact/分层记忆/权限粒度）
