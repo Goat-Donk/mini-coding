@@ -23,11 +23,13 @@ from agent.loop import QueryEngine
 from agent.mcp import MCPError, load_mcp_servers
 from agent.memory import MemoryManager
 from agent.security import TAINT_HIGH, TAINT_NONE
+from agent.skills import discover_skills
 from agent.permissions import PermissionsEngine
 from agent.session import Session, latest_session, new_session_id
 from agent.state import user as user_message
 from agent.tools.ask import build_ask_tool
 from agent.tools.base import ToolRegistry
+from agent.tools.skills import build_skill_tools
 from agent.tools.subagent import SubagentTool
 
 app = typer.Typer(no_args_is_help=True)
@@ -139,6 +141,12 @@ def run(
     # 完成率被一个"没人在那儿"的机制拉低，而且是静默的（judge 只跑测试）。
     # 与 SubagentTool 一样按入口注册（构造点见 build_ask_tool）。
     registry.register(build_ask_tool())
+    # skills 渐进披露：索引进 system prompt（只 name+简介），正文由 load_skill 按需取。
+    # 发现结果**只扫一次**，同时喂给工具与引擎 —— 两边各扫一次会让"索引里有的名字
+    # load 不到"这种不一致有地方发生。无 skill 时不注册工具（不白送 schema 占 token）。
+    skills = discover_skills(workspace_root)
+    for skill_tool in build_skill_tools(skills):
+        registry.register(skill_tool)
     # M6-3 MCP：显式配置才加载（第三方 server 不受沙箱约束，必须 opt-in）
     mcp_clients: list = []
     mcp_allowed: list[str] = []
@@ -183,6 +191,17 @@ def run(
 
     printer = EventPrinter()
     typer.secho(f"工作目录: {workspace_root}", fg=typer.colors.BRIGHT_BLACK)
+    if skills.skills:
+        # 把「有哪些 skill、有没有被遮蔽」打出来：人改了自己那份却没生效时，
+        # 这行是唯一能一眼看出问题的东西（详见 skills.SkillDiscovery 的说明）
+        shadow_note = (
+            f"，{len(skills.shadowed)} 个同名被遮蔽（{skills.shadowed[0][0]}）"
+            if skills.shadowed else ""
+        )
+        typer.secho(
+            f"skills: {len(skills.skills)} 个（索引进提示词，正文按需加载）{shadow_note}",
+            fg=typer.colors.BRIGHT_BLACK,
+        )
     typer.secho("---", fg=typer.colors.BRIGHT_BLACK)
 
     try:
@@ -195,7 +214,7 @@ def run(
             engine = QueryEngine(
                 llm, registry, workspace_root=workspace_root, context=context,
                 session=session, memory_blocks=memory_blocks, on_event=printer,
-                permissions=permissions, hooks=hooks,
+                permissions=permissions, hooks=hooks, skills=skills,
             )
             typer.secho(
                 f"恢复会话 {sid}（step {restored.step}）→ 续跑", fg=typer.colors.CYAN, bold=True
@@ -227,7 +246,7 @@ def run(
             engine = QueryEngine(
                 llm, registry, workspace_root=workspace_root, context=context,
                 session=session, memory_blocks=memory_blocks, on_event=printer,
-                permissions=permissions, hooks=hooks,
+                permissions=permissions, hooks=hooks, skills=skills,
             )
             typer.secho(f"会话: {session.session_id}", fg=typer.colors.CYAN, bold=True)
             typer.secho(f"任务: {task}", fg=typer.colors.CYAN, bold=True)

@@ -73,7 +73,9 @@ DEFAULT_SYSTEM_PROMPT = """\
 - 不要假装完成：必须用测试/命令实际验证，验证失败要报告。
 - 不要无意义重复同一操作；若连续多次得到相同失败，停下来向用户说明。
 
-{repo_memory_block}"""
+{repo_memory_block}
+
+{skills_block}"""
 
 
 def _platform_hint() -> str:
@@ -105,6 +107,7 @@ class QueryEngine:
         hooks: HookEngine | None = None,               # M2 hooks 引擎
         tool_result_store: ToolResultStore | None = None,  # M3 超大结果落盘
         memory_blocks: list[str] | None = None,    # M4 注入
+        skills: object | None = None,              # skills 发现结果（agent.skills.SkillDiscovery）
         context: object | None = None,             # M3 接 ContextManager
         session: object | None = None,             # M3 接 session（轨迹/检查点）
         on_event: Callable[[dict], None] | None = None,  # 实时事件回调（CLI 流式输出）
@@ -122,6 +125,7 @@ class QueryEngine:
         # tool_result_store 之外的情况才用它，避免同引擎跑多会话时串目录
         self._stores: dict[str, ToolResultStore] = {}
         self.memory_blocks = list(memory_blocks or [])
+        self.skills = skills
         self.context = context
         self.session = session
         self.on_event = on_event
@@ -156,6 +160,16 @@ class QueryEngine:
     def _run_loop(self, state: AgentState, task: str, cwd: Path | None) -> RunResult:
         """共享主循环：think → 调工具 → 看结果 → ... → 完成。"""
         state.emitter = self._make_emitter()
+        if self.skills is not None:
+            # 记「本次运行带着哪些 skill」进轨迹。放在这里而不是入口，是因为
+            # 入口有 3 处（CLI 新建 / CLI resume / 控制台），一处漏了就不一致；
+            # 且 `record_discovery` 自己会判断索引是否真在这份 system prompt 里
+            # （resume 用的是会话当初那份，可能没有）—— 不给真空的会话记假事件。
+            from agent.skills import record_discovery, render_skills_block
+
+            record_discovery(
+                state, self.skills, render_skills_block(self.skills)
+            )
 
         ctx = ToolContext(
             workspace_root=self.workspace_root,
@@ -274,15 +288,23 @@ class QueryEngine:
         return on_event if on_event is not None else session_emit
 
     def _render_system_prompt(self, memory_block: str) -> str:
-        """注入运行期槽位（工作目录 / 平台 / 记忆块）。
+        """注入运行期槽位（工作目录 / 平台 / 记忆块 / skills 索引）。
 
         用逐个 replace 而不是 str.format：自定义 system_prompt 里可能含其它花括号
         （JSON 示例、代码片段），format 会直接抛 KeyError。
+
+        **skills 索引只在这里渲染一次**，结果随 `state.system_prompt` 进检查点。
+        绝不能每轮重新发现：system 是 `messages[0]`，落在 `_PREFIX_LEN` 保护区里
+        —— 它每轮变一次，等于整条前缀缓存**永久失效**（DeepSeek 的缓存是前缀匹配，
+        改第 0 条 = 后面全部重算）。
         """
+        from agent.skills import render_skills_block
+
         slots = {
             "workspace_root": str(self.workspace_root),
             "platform": _platform_hint(),
             "repo_memory_block": memory_block,
+            "skills_block": render_skills_block(self.skills) if self.skills else "",
         }
         prompt = self.system_prompt
         for name, value in slots.items():

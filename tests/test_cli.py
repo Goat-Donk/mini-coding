@@ -12,6 +12,7 @@ from typer.testing import CliRunner
 from agent.llm import LLMResult, MockLLM, ToolCall
 from agent.memory import MemoryManager
 from agent.permissions import Decision, PermissionsEngine
+from agent.skills import discover_skills
 from app.cli import EventPrinter, app
 
 
@@ -443,3 +444,40 @@ def test_resume_after_ask_user_carries_question_then_answer(tmp_path, monkeypatc
     answer_at = next(i for i, (role, t) in enumerate(seen) if role == "user" and "放 .codeagent/ 下" in t)
     assert question_at < answer_at, "问题必须还在会话里，且排在回答之前"
     assert seen[question_at][0] == "tool", "问题是以 ask_user 的工具结果形态留在会话里的"
+
+
+def test_cli_skills_reach_the_system_prompt(tmp_path, monkeypatch):
+    """一条链全钉住：发现 → 注册 load_skill → 传进引擎 → 索引进 system prompt。
+
+    **终点断言用 system prompt 本身**，因为接线断在任何一环，最终表现都是
+    "提示词里没有 skills 索引"，而中间每一环单看都是好的。索引里只该有
+    名字和简介 —— 正文漏进去不会报错，只会让省 token 这件事悄悄失效。
+    """
+    skill_dir = tmp_path / ".codeagent" / "skills" / "release"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\ndescription: 发布三步走\n---\n\n正文独有内容-zz9\n", encoding="utf-8"
+    )
+    # 把 home 钉到临时目录：生产代码读**真实的** `~/.claude/skills`（本机就有 3 个），
+    # 不钉住的话这条断言会随跑测试那台机器上装了什么而变 —— 那种测试等于没测。
+    monkeypatch.setattr(
+        "app.cli.discover_skills",
+        lambda ws: discover_skills(ws, home=tmp_path / "home"),
+    )
+
+    seen_system: list[str] = []
+    captured: dict = {}
+
+    def responder(messages, tools):  # noqa: ANN001 - MockLLM 回调签名
+        seen_system.extend(m["content"] for m in messages if m.get("role") == "system")
+        captured["tools"] = [t["function"]["name"] for t in tools]
+        return LLMResult(content="完成")
+
+    result = _invoke(tmp_path, monkeypatch, MockLLM.script(responder))
+
+    assert result.exit_code == 0
+    assert "skills: 1 个" in result.output
+    assert "load_skill" in captured["tools"], "发现了 skill 却没注册加载工具"
+    system = seen_system[-1]
+    assert "release" in system and "发布三步走" in system   # 索引进了提示词
+    assert "正文独有内容-zz9" not in system                  # 正文没进

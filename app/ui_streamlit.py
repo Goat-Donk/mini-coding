@@ -30,8 +30,10 @@ from agent.llm import BaseLLM, DeepSeekClient, MockLLM, LLMResult, ToolCall
 from agent.loop import QueryEngine
 from agent.permissions import PermissionsEngine
 from agent.session import Session, new_session_id, state_dict
+from agent.skills import discover_skills
 from agent.tools.ask import build_ask_tool
 from agent.tools.base import ToolRegistry
+from agent.tools.skills import build_skill_tools
 from agent.tools.subagent import SubagentTool
 from app.replay import (
     list_checkpoint_sessions,
@@ -108,6 +110,10 @@ def run_task(
         # 同 SubagentTool 一样**不进 default()** —— eval/runner 用 default()，
         # 而 headless 评测里没有人能回答。
         registry.register(build_ask_tool())
+        # skills：与 CLI 共用同一套发现与构造（索引进提示词，正文按需 load_skill）
+        skills = discover_skills(workspace)
+        for skill_tool in build_skill_tools(skills):
+            registry.register(skill_tool)
         # 第三方工具（MCP）默认需显式授权：这里虽未加载 MCP，仍按注册表实际
         # 情况传入，避免以后接上 MCP 时权限层悄悄漏掉（同类漂移已经犯过一次）
         permissions = PermissionsEngine(
@@ -126,6 +132,7 @@ def run_task(
             permissions=permissions,
             hooks=hooks,
             session=session,
+            skills=skills,
         )
         result = engine.run(task)
         events_q.put({"type": "__done__", "result": result, "session_id": session.session_id})
