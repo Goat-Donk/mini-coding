@@ -85,6 +85,7 @@ class QueryEngine:
         self.system_prompt = system_prompt or DEFAULT_SYSTEM_PROMPT
 
     def run(self, task: str, *, cwd: Path | None = None) -> RunResult:
+        """新建会话状态并跑任务。有 session 时用其 session_id（轨迹/检查点归属）。"""
         if self.memory_blocks:
             memory_block = "\n".join(f"- {block}" for block in self.memory_blocks)
         else:
@@ -95,12 +96,26 @@ class QueryEngine:
         else:
             sys_prompt = self.system_prompt
 
+        # 有 session 时用其 session_id（轨迹/检查点归属）；_EmitProxy 之类
+        # 只实现 emit 的轻量替身没有 session_id，兜底 "m1"
+        session_id = getattr(self.session, "session_id", "m1")
         state = AgentState(
-            session_id="m1",
+            session_id=session_id,
             task=task,
             system_prompt=sys_prompt,
             messages=[system(sys_prompt), user(task)],
         )
+        return self._run_loop(state, task, cwd)
+
+    def run_from(self, state: AgentState, *, cwd: Path | None = None) -> RunResult:
+        """从检查点恢复的 state 继续执行（Session.resume 配合用）。
+
+        step 计数不重置：续跑继续推进步数，新检查点不会覆盖恢复前的同名文件。
+        """
+        return self._run_loop(state, state.task, cwd)
+
+    def _run_loop(self, state: AgentState, task: str, cwd: Path | None) -> RunResult:
+        """共享主循环：think → 调工具 → 看结果 → ... → 完成。"""
         if self.session is not None:
             state.emitter = getattr(self.session, "emit", None)
 
@@ -176,6 +191,8 @@ class QueryEngine:
                     )
 
                 self._execute_tool_calls(result.tool_calls, state, ctx)
+                if self.session is not None:
+                    self.session.checkpoint(state)  # M3-4 每 N 步落盘检查点
         except Exception as exc:
             # 意外错误：不回吐，给用户一个明确的失败结论（不假装成功）
             state.terminated_reason = "error"
