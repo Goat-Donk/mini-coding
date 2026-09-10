@@ -181,6 +181,7 @@ def test_checkpoint_round_trips_every_state_field(tmp_path):
         "memory_blocks": ["记忆块 A"],
         "last_usage": Usage(prompt_tokens=3, completion_tokens=4),
         "usage_stale_reason": "snip_compact",
+        "taint": "high",
     }
     all_fields = {f.name for f in dataclasses.fields(AgentState)}
     assert set(values) | {"emitter"} == all_fields, (

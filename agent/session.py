@@ -24,6 +24,7 @@ from dataclasses import asdict, is_dataclass
 from pathlib import Path
 
 from agent.llm import Usage
+from agent.security import TAINT_MEDIUM, TAINT_NONE, higher
 from agent.state import AgentState
 
 # 不落盘的字段：运行时对象（回调、句柄），不是状态。**这份名单应该保持短**——
@@ -95,6 +96,27 @@ def state_dict(payload: dict) -> dict:
     return {k: payload[k] for k in _LEGACY_FLAT_KEYS if k in payload}
 
 
+def derive_taint(events: list[dict]) -> str | None:
+    """从轨迹事件重算污染级别。**没有相关事件时返回 None**（区别于"算出 none"）。
+
+    为什么要有这个函数：`taint` 是**派生值**，落盘的那份只是缓存。如果只信检查点
+    里那个字段，一块损坏/被改写的检查点就能把标记悄悄抹掉（或者把项目永久锁死）。
+    按事件重放则两者都能收敛：`security_finding` 抬高、`taint_cleared` 复位。
+
+    「没有相关事件 → None」这个区分是必要的：老检查点（M7 之前）根本没有这些
+    事件，此时必须回退到落盘值，而不能因为"重放没算出东西"就把标记当 none。
+    """
+    if not any(e.get("type") in ("security_finding", "taint_cleared") for e in events):
+        return None
+    level = TAINT_NONE
+    for event in events:
+        if event.get("type") == "security_finding":
+            level = higher(level, str(event.get("level") or TAINT_MEDIUM))
+        elif event.get("type") == "taint_cleared":
+            level = TAINT_NONE          # 人的复位动作在事件流里同样有效
+    return level
+
+
 def load_state(payload: dict, session_id: str) -> AgentState:
     """检查点 payload → AgentState（兼容旧的扁平格式）。"""
     raw = dict(state_dict(payload))
@@ -102,6 +124,13 @@ def load_state(payload: dict, session_id: str) -> AgentState:
         if name in raw and raw[name] is not None:
             raw[name] = decode(raw[name])  # type: ignore[operator]
     raw.pop("session_id", None)  # 用调用方给的那个（payload 里的可能是旧值）
+
+    # 污染标记：事件重放优先于落盘字段。重放算得出结果就以它为准 —— 它同时
+    # 包含了「抬升」与「人的复位」，所以 `--clear-taint` 之后 resume 不会被
+    # 旧事件重新抬回去；重放算不出（M7 之前的检查点）才用落盘值。
+    derived = derive_taint(raw.get("events") or [])
+    if derived is not None:
+        raw["taint"] = derived
     return AgentState(session_id=session_id, **raw)
 
 

@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from agent.llm import ToolCall, Usage
+from agent.security import TAINT_NONE, higher
 
 
 # ---------- 消息构造器（OpenAI 格式） ----------
@@ -81,8 +82,32 @@ class AgentState:
     last_usage: Optional[Usage] = None
     usage_stale_reason: Optional[str] = None                 # "snip_compact" | "llm_compact"
 
+    # M7 会话级污染标记：粗粒度（一个会话一个级别），**不是逐值污点追踪**。
+    # 只升不降 —— 模型自己无法下调，唯一复位者是人的动作（CLI --clear-taint）。
+    taint: str = TAINT_NONE
+
     # M3 接入 session 后设为回调；None 时事件只进内存列表
     emitter: Optional[Callable[[dict], None]] = None
+
+    def raise_taint(self, level: str) -> str:
+        """把污染级别抬到 `level`（取 max，**只升不降**）。返回抬升后的级别。
+
+        不提供「降低」的同名接口是刻意的：如果有一个 `set_taint`，那么任何
+        一段拿到 state 的代码（包括工具、hook、将来某个插件）都能把标记抹掉，
+        于是这个标记就退化成一个"建议"。降级只有一条路 —— `clear_taint()`，
+        而它只由 CLI 的人类操作调用。
+        """
+        self.taint = higher(self.taint, level)
+        return self.taint
+
+    def clear_taint(self, reason: str = "human") -> None:
+        """复位污染标记。**只应由人的动作调用**（CLI `--clear-taint`）。
+
+        恢复一个被误判的会话靠它，而不是靠模型自己辩解 —— 这正是「标记不由
+        被标记者清除」的意思。
+        """
+        self.taint = TAINT_NONE
+        self.record_event("taint_cleared", reason=reason)
 
     def record_event(self, type: str, **data) -> None:
         """记录轨迹事件：{ts, type, step, ...}。设了 emitter 则同时回调（写 JSONL）。"""

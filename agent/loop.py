@@ -20,6 +20,7 @@ from typing import Callable
 from agent.hooks import HookEngine
 from agent.llm import BaseLLM, ToolCall, Usage
 from agent.permissions import Decision, PermissionsEngine
+from agent.security import TAINT_NONE
 from agent.state import AgentState, assistant_tool_calls, system, tool_result, user
 from agent.tool_result import ToolResultStore, compact_batch
 from agent.tools.base import ToolContext, ToolRegistry, ToolResult
@@ -33,6 +34,18 @@ class RunResult:
     events: list[dict]
     terminated_reason: str   # "completed" | "max_steps" | "loop_detected" | "error"
     task: str
+
+    @property
+    def taint(self) -> str:
+        """本会话的污染级别。**派生自事件**，不是另一个要维护的字段。
+
+        和 resume 时重算走的是同一个函数（`session.derive_taint`），所以
+        「跑完的会话」与「resume 出来的同一会话」必然给出一样的答案 —— 而
+        如果是各存一份，迟早会出现"轨迹说 high、返回值说 none"这种没人能解释的差异。
+        """
+        from agent.session import derive_taint
+
+        return derive_taint(self.events) or TAINT_NONE
 
 
 DEFAULT_SYSTEM_PROMPT = """\
@@ -317,6 +330,17 @@ class QueryEngine:
         for tool_call_id, output in results:
             state.messages.append(tool_result(tool_call_id, output))
 
+    def _sync_taint(self, state: AgentState) -> None:
+        """把 state 的污染标记镜像进权限引擎。
+
+        单向、幂等：`state.taint` 是权威（只升不降，只有人的动作能复位），
+        引擎只是照着设值。放在每次门禁判定的开头而不是「run_post 之后」，
+        是为了让「谁在什么时候抬的标记」不影响结果 —— 无论标记来自检测 hook、
+        来自 resume 出来的检查点，还是来自 `--clear-taint`，下一步判定都看得到。
+        """
+        if self.permissions is not None and hasattr(self.permissions, "note_taint"):
+            self.permissions.note_taint(state.taint)
+
     def _gate_block(
         self, state: AgentState, call: ToolCall, source: str, message: str, **extra
     ) -> ToolResult:
@@ -355,6 +379,9 @@ class QueryEngine:
 
         # 2) 权限：deny 拒绝；ask 无确认交互时安全默认拒绝（M2-3 起控制台接入）
         if self.permissions is not None:
+            # 先同步污染标记，再判定：标记的权威在 state（只升不降），引擎只是
+            # 照它设值。放在判定**之前**，才能保证「上一步抬的标记、这一步就生效」。
+            self._sync_taint(state)
             decision = self.permissions.check(call.name, call.arguments, ctx)
             if decision is Decision.DENY:
                 return self._gate_block(
@@ -368,7 +395,7 @@ class QueryEngine:
                 # 拒绝必须带**出处与解除方式**：只说"没权限"会让 agent 反复重试
                 # 同一个调用、让用户不知道该改哪个文件。
                 hint = (
-                    self.permissions.denial_hint(call.name)
+                    self.permissions.denial_hint(call.name, call.arguments)
                     if hasattr(self.permissions, "denial_hint")
                     else None
                 )

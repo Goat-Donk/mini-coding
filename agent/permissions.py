@@ -17,10 +17,12 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import re
 from enum import Enum
 from pathlib import Path
 from typing import Callable, Iterable
 
+from agent.security import TAINT_HIGH, TAINT_NONE
 from agent.tools.bash import BashTool
 from agent.tools.base import ToolContext
 
@@ -54,6 +56,66 @@ _RULE_TO_DECISION = {
     "deny_once": Decision.DENY,
     "deny_always": Decision.DENY,
 }
+
+
+# ---------- 污染天花板覆盖的动作类别 ----------
+# **只覆盖三类**，一类的都不多。判据是「一旦发生就收不回来」：
+#   - 网络外发：数据出去了就出去了，事后撤销没有意义
+#   - 读取凭据：key 进了模型上下文，就只能靠轮换补救
+#   - 写入记忆文件：内容会被**后续每个会话**自动注入，是跨会话的持久化
+# 反过来，`write` 一个普通源码文件、跑 `ls`、`git status` 都不在里面 ——
+# 它们可撤销、可由人复核，收紧它们只会让工具变成路障（CLI 里没有确认交互）。
+#
+# 这三条都是**词法**判据，能被改名绕过（`curl` 换成 python 脚本、
+# `.env` 换成 `config.txt`）。如实写在 README 的「已知未修复的绕过路径」里。
+EGRESS_COMMAND = re.compile(
+    r"(^|[\s;&|(])(curl|wget|Invoke-WebRequest|iwr|Invoke-RestMethod|irm"
+    r"|nc|netcat|ncat|scp|sftp|rsync|telnet|ftp|ssh)\b"
+    r"|requests\.(get|post|put|patch)|urllib\.request|httpx\.|socket\.socket",
+    re.IGNORECASE,
+)
+CREDENTIAL_PATH = re.compile(
+    r"(^|[\\/])(\.env(\.[\w.-]+)?|\.npmrc|\.netrc|\.git-credentials"
+    r"|id_rsa|id_dsa|id_ed25519|credentials(\.json)?|\.aws|\.ssh|\.kube"
+    r"|\.docker[\\/]config\.json|\.pypirc|\.pgpass)$",
+    re.IGNORECASE,
+)
+MEMORY_PATH = re.compile(
+    r"(^|[\\/])(CLAUDE\.md|CODEAGENT\.md|MINI\.md|AGENTS\.md|learned(\.[\w-]+)*\.md)$"
+    r"|(^|[\\/])\.codeagent[\\/]rules",
+    re.IGNORECASE,
+)
+
+
+def _irreversible_kind(tool_name: str, arguments: dict) -> str | None:
+    """这次调用属于哪一类「不可逆动作」？不属于则 None。
+
+    纯函数（不读引擎状态），所以 `check()` 与 `denial_hint()` 可以各自独立
+    算一遍而不担心并发下互相串味。
+    """
+    raw = str(
+        arguments.get("command")
+        or arguments.get("path")
+        or arguments.get("pattern")
+        or ""
+    )
+    if not raw:
+        return None
+    if tool_name == "bash":
+        if EGRESS_COMMAND.search(raw):
+            return "网络外发"
+        if MEMORY_PATH.search(raw):
+            return "写入记忆文件"
+        # bash 读凭据：`cat .env` / `type .env` / `Get-Content .env`
+        if re.search(r"(^|[\s;&|(])(cat|type|head|tail|less|more|Get-Content|gc)\b",
+                     raw, re.IGNORECASE) and CREDENTIAL_PATH.search(raw):
+            return "读取凭据文件"
+        return None
+    if tool_name == "read" and CREDENTIAL_PATH.search(raw):
+        return "读取凭据文件"
+    if tool_name in ("write", "edit") and MEMORY_PATH.search(raw):
+        return "写入记忆文件"
+    return None
 
 
 def _rule_decision(value: str) -> Decision:
@@ -91,6 +153,9 @@ class PermissionsEngine:
         }
         self._turn: dict[str, Decision] = {}    # 本回合记忆
         self._always: dict[str, Decision] = {}  # 常驻记忆
+        # 会话级污染级别（由 loop 从 AgentState.taint 同步过来）。
+        # 引擎自己不改它 —— 标记的权威在状态里，只有人的动作能让它降下来。
+        self._taint: str = TAINT_NONE
         if rules:
             self.load_rules(rules)
         if rules_path:
@@ -125,6 +190,21 @@ class PermissionsEngine:
 
     def check(self, tool_name: str, arguments: dict, ctx: ToolContext) -> Decision:
         """判定一次工具调用：allow / deny / ask（ask 且有 confirm 时直接内联确认）。"""
+        return self._decide(tool_name, arguments, ctx)
+
+    def _decide(self, tool_name: str, arguments: dict, ctx: ToolContext) -> Decision:
+        """决策链本体：硬 deny → 记忆 → 规则 → **后置天花板** → 人工确认。
+
+        天花板摆在哪里是这里最要紧的一件事，两个方向都不能错：
+
+        - **必须在记忆之后**。写成规则链里的一条（`_rule_check` 的一个分支）是
+          无效的：第 2、3 步的 `_always`/`_turn` 会在它之前 return，于是用户
+          只要开过一次 `allow_always`，任何基于规则的收紧就永久失效 —— 而
+          「记得越久越省事」正是用户去开它的原因，两个方向正好相反。
+        - **必须在人工确认之前**。confirm 回调是一个真实的人当场作出的决定，
+          自动机制不该反过来推翻它（否则人点了「允许」系统仍按拒绝处理，
+          确认框就成了摆设）。
+        """
         kind, target = self._classify(tool_name, arguments)
 
         # 1) 路径越界 → 硬 deny（read/write/edit 解析真实路径）
@@ -133,18 +213,18 @@ class PermissionsEngine:
         ) is None:
             return Decision.DENY
 
-        # 2) 常驻记忆
+        # 2) 常驻记忆 / 3) 本回合记忆 / 4) 规则判定
         if target in self._always:
-            return self._always[target]
+            decision = self._always[target]
+        elif target in self._turn:
+            decision = self._turn[target]
+        else:
+            decision = self._rule_check(tool_name, kind, arguments, ctx)
 
-        # 3) 本回合记忆
-        if target in self._turn:
-            return self._turn[target]
+        # 5) 后置天花板：只降不升
+        decision = self._apply_taint_ceiling(tool_name, arguments, decision)
 
-        # 4) 规则判定
-        decision = self._rule_check(tool_name, kind, arguments, ctx)
-
-        # 5) ask → 回调确认
+        # 6) ask → 回调确认（人的决定在最后）
         if decision is Decision.ASK and self.confirm is not None:
             return self._confirm_and_record(tool_name, arguments, kind, target)
         return decision
@@ -155,7 +235,12 @@ class PermissionsEngine:
         return self._confirm_and_record(tool_name, arguments, kind, target)
 
     def describe(self, tool_name: str, arguments: dict) -> str:
-        """构造确认问题文本（供 confirm 回调/UI 展示）。"""
+        """构造确认问题文本（供 confirm 回调/UI 展示）。
+
+        污染天花板触发的确认会**额外写明原因**。这很重要：控制台里用户看到的
+        是一个弹窗，如果它和普通弹窗长得一样，用户只会觉得"怎么又问一遍"，
+        然后条件反射地点允许 —— 一个不说理由的确认框，训练出的是不看理由的人。
+        """
         kind, target = self._classify(tool_name, arguments)
         if kind == "command":
             what = f"执行命令: {target[:120]}"
@@ -168,24 +253,76 @@ class PermissionsEngine:
             )
         else:
             what = f"调用工具: {tool_name}"
-        return (
+        question = (
             f"是否允许 {what}？"
             "(allow_once/allow_turn/allow_always/deny_once/deny_always)"
         )
+        if self._taint == TAINT_HIGH:
+            label = _irreversible_kind(tool_name, arguments)
+            if label is not None:
+                question += (
+                    f"\n[污染标记 high] 本会话的工具输出里命中过可疑文本模式，"
+                    f"因此「{label}」这类不可逆动作会重新征询一次 —— "
+                    f"即使之前选过 allow_always。"
+                )
+        return question
 
-    def denial_hint(self, tool_name: str) -> str | None:
+    def denial_hint(self, tool_name: str, arguments: dict | None = None) -> str | None:
         """被拒时给用户的**解除指引**（带出处，不是一句"没权限"）。
 
         拒绝而不说怎么解，等于把一个安全机制变成路障：用户既不知道是谁拦的，
-        也不知道该改哪个文件。第三方工具是当前唯一需要外部配置才能放行的类别，
-        所以这里直接写出配置项和写法。
+        也不知道该改哪个文件。所以每类拒绝都带出处，并且**写出解除它的具体动作**。
+
+        这里重算「是哪一类不可逆动作被收紧」，而不是读 `check()` 留下的某个字段：
+        `_gate_and_run` 的只读批次会用线程池并发跑，任何"上一次判定"式的共享状态
+        都可能把 A 调用的理由安到 B 调用头上。重算是纯函数，没有这个窗口。
         """
         if tool_name in self._external:
             return (
                 f"{tool_name} 来自第三方（MCP）server，不受 workspace 沙箱约束，"
                 f'需在 mcp.json 里显式授权：给对应 server 加 "allow": ["{tool_name}"]'
             )
+        if self._taint == TAINT_HIGH:
+            label = _irreversible_kind(tool_name, arguments or {})
+            if label is not None:
+                return (
+                    f"本会话的污染标记为 high（工具输出里命中过可疑文本模式，"
+                    f"见轨迹里同步骤的 security_finding 事件），因此「{label}」"
+                    f"这类动作被收紧。确认那些输出没有在驱使你做这件事之后，"
+                    f"用 --clear-taint 复位标记再重试。"
+                )
         return None
+
+    # ---------- 污染标记（会话级，粗粒度） ----------
+
+    def note_taint(self, level: str) -> None:
+        """同步本会话的污染级别。
+
+        **这是一个镜像，不是权威**：权威在 `AgentState.taint`（只升不降，
+        只有人的动作能复位）。引擎照着状态设值，而不是自己累加 —— 否则
+        resume 出来的会话、`--clear-taint` 之后的会话，两边就会不一致。
+        """
+        self._taint = level
+
+    @property
+    def taint(self) -> str:
+        return self._taint
+
+    def _apply_taint_ceiling(
+        self, tool_name: str, arguments: dict, decision: Decision
+    ) -> Decision:
+        """后置天花板：high 污染下，把三类**不可逆**动作从 ALLOW 降到 ASK。
+
+        只降不升（`DENY` 不动、`ASK` 不动），只覆盖三类动作，见
+        `_irreversible_kind` 的说明 —— 收紧范围刻意压到最小，理由见
+        `agent/security.py` 里关于误报成本不对称的那段：多收紧一类动作，
+        就是多一类"本该能做的事突然做不了、而 CLI 里没有确认交互可用来纠正"。
+        """
+        if decision is not Decision.ALLOW or self._taint != TAINT_HIGH:
+            return decision
+        if _irreversible_kind(tool_name, arguments) is None:
+            return decision
+        return Decision.ASK
 
     # ---------- 内部 ----------
 

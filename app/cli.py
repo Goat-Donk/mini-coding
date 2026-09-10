@@ -22,6 +22,7 @@ from agent.llm import BaseLLM, DeepSeekClient, LLMResult, MockLLM, ToolCall
 from agent.loop import QueryEngine
 from agent.mcp import MCPError, load_mcp_servers
 from agent.memory import MemoryManager
+from agent.security import TAINT_HIGH, TAINT_NONE
 from agent.permissions import PermissionsEngine
 from agent.session import Session, latest_session, new_session_id
 from agent.tools.base import ToolRegistry
@@ -111,6 +112,10 @@ def run(
     mcp: Path | None = typer.Option(
         None, "--mcp", help="MCP 配置文件路径（如 .codeagent/mcp.json），加载后注册远端工具"
     ),
+    clear_taint: bool = typer.Option(
+        False, "--clear-taint",
+        help="复位本会话的污染标记（**人的动作**；误报被收紧时用它解锁）",
+    ),
 ):
     """在 workspace 内执行一个任务（或从检查点续跑）。"""
     if not resume and not task.strip():
@@ -186,6 +191,16 @@ def run(
             typer.secho(
                 f"恢复会话 {sid}（step {restored.step}）→ 续跑", fg=typer.colors.CYAN, bold=True
             )
+            if restored.taint != TAINT_NONE:
+                typer.secho(
+                    f"污染标记: {restored.taint}（由轨迹里的 security_finding 重算）",
+                    fg=typer.colors.YELLOW,
+                )
+            if clear_taint:
+                # 复位只由**人**的显式动作触发。它同时往轨迹里记一条 taint_cleared，
+                # 所以这次复位在下次 resume 重算时同样有效（不会被旧事件抬回去）。
+                restored.clear_taint(reason="cli:--clear-taint")
+                typer.secho("污染标记已复位为 none", fg=typer.colors.GREEN)
             result = engine.run_from(restored)
         else:
             session = Session(workspace_root, new_session_id(), checkpoint_every=checkpoint_every)
@@ -196,6 +211,14 @@ def run(
             )
             typer.secho(f"会话: {session.session_id}", fg=typer.colors.CYAN, bold=True)
             typer.secho(f"任务: {task}", fg=typer.colors.CYAN, bold=True)
+            if clear_taint:
+                # 新会话本来就是 none —— 静默忽略会让用户以为"我明明清过了"，
+                # 而真正需要清的那个会话（被标记的那个）他并没有在跑
+                typer.secho(
+                    "提示: --clear-taint 只对 --resume 的会话有意义"
+                    "（新会话的污染标记本来就是 none）",
+                    fg=typer.colors.YELLOW,
+                )
             result = engine.run(task)
     finally:
         # MCP 连接是资源（子进程 + 管道），任务结束必须回收，不能等 GC
@@ -205,13 +228,27 @@ def run(
     typer.secho("---", fg=typer.colors.BRIGHT_BLACK)
 
     # M4-1 任务后提取：把轨迹里可复用的约定写回 learned.md（跨会话生效）
+    # 受污染的会话写到 learned.pending.md（不自动注入，等人复核）—— 判据是
+    # 会话标记，不是提炼出来的内容像不像被带偏（内容过滤会误伤正常条目）。
     if not mock:
-        learned = memory.extract_and_learn(result.events)
+        learned = memory.extract_and_learn(result.events, taint=result.taint)
         if learned:
-            typer.secho(
-                f"已提炼 {len(learned)} 条仓库约定 → .codeagent/rules/learned.md",
-                fg=typer.colors.GREEN,
+            target = (
+                ".codeagent/rules/learned.pending.md（会话被标记为受污染，待人工复核）"
+                if result.taint == TAINT_HIGH
+                else ".codeagent/rules/learned.md"
             )
+            typer.secho(
+                f"已提炼 {len(learned)} 条仓库约定 → {target}",
+                fg=typer.colors.YELLOW if result.taint == TAINT_HIGH else typer.colors.GREEN,
+            )
+    if result.taint != TAINT_NONE:
+        typer.secho(
+            f"本会话污染标记: {result.taint}"
+            + ("（受影响的动作: 网络外发 / 读取凭据文件 / 写入记忆文件）"
+               if result.taint == TAINT_HIGH else ""),
+            fg=typer.colors.YELLOW,
+        )
 
     typer.secho("最终结论:", fg=typer.colors.GREEN, bold=True)
     if result.final_text:
