@@ -2,6 +2,9 @@
 
 M3 版：接入 ContextManager（记账/compact）+ Session（轨迹/检查点/--resume）。
 M6-6：事件实时流式打印（不必等任务结束才看到进度）。
+权限：所有工具调用统一过 PermissionsEngine（默认 allow，路径越界 deny，危险命令 ask；
+      CLI 无确认交互，故 ask 由 loop 按安全默认拒绝）。hooks 未接入 —— 默认 hook 会改变
+      正常流程，待定。
 """
 from __future__ import annotations
 
@@ -17,6 +20,7 @@ from agent.llm import BaseLLM, DeepSeekClient, LLMResult, MockLLM, ToolCall
 from agent.loop import QueryEngine
 from agent.mcp import MCPError, load_mcp_servers
 from agent.memory import MemoryManager
+from agent.permissions import PermissionsEngine
 from agent.session import Session, latest_session, new_session_id
 from agent.tools.base import ToolRegistry
 from agent.tools.subagent import SubagentTool
@@ -133,6 +137,10 @@ def run(
             fg=typer.colors.BRIGHT_BLACK,
         )
     context = ContextManager(llm)  # M3-1 provider-usage-first 记账
+    # M2 权限引擎：CLI 无交互确认（不传 confirm），所以判定是：
+    #   默认 allow（正常行为不变）· 路径越界 deny · 危险命令 ask
+    #   （引擎不把 ask 转成 deny；是 loop 在「无确认交互」时按安全默认拒绝，理由回喂模型）
+    permissions = PermissionsEngine(workspace_root)
     # M4-1 记忆：启动注入工作区记忆块；任务后提取约定（mock 模式不提取，保持脚本确定性）
     memory = MemoryManager(workspace_root, llm=None if mock else llm)
     memory_blocks = memory.blocks()
@@ -155,6 +163,7 @@ def run(
             engine = QueryEngine(
                 llm, registry, workspace_root=workspace_root, context=context,
                 session=session, memory_blocks=memory_blocks, on_event=printer,
+                permissions=permissions,
             )
             typer.secho(
                 f"恢复会话 {sid}（step {restored.step}）→ 续跑", fg=typer.colors.CYAN, bold=True
@@ -165,6 +174,7 @@ def run(
             engine = QueryEngine(
                 llm, registry, workspace_root=workspace_root, context=context,
                 session=session, memory_blocks=memory_blocks, on_event=printer,
+                permissions=permissions,
             )
             typer.secho(f"会话: {session.session_id}", fg=typer.colors.CYAN, bold=True)
             typer.secho(f"任务: {task}", fg=typer.colors.CYAN, bold=True)

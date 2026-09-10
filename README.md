@@ -4,7 +4,7 @@
 **核心循环手写**（不套 LangGraph / Agent SDK），支撑层用成熟库（openai SDK / pydantic v2 / streamlit / typer / pytest）。
 
 > **一句话**：把 Claude Code 的架构用 Python 重写一遍——不是移植代码，是移植设计。
-> 4,162 行源码 / 19 个模块 / 184 个测试。真实跑分见[评估章节](#评估eval)。
+> 4,170 行源码 / 19 个模块 / 189 个测试。真实跑分见[评估章节](#评估eval)。
 
 📄 文档：[技术方案 `docs/TECH_SPEC.md`](docs/TECH_SPEC.md) · [架构详解 `docs/architecture.md`](docs/architecture.md) · [任务清单 `TASKS.md`](TASKS.md) · [参考笔记 `docs/reference/`](docs/reference/)
 
@@ -167,6 +167,10 @@ python -m app.cli --mcp .codeagent/mcp.json "任务"   # 加载 MCP server（第
 CLI 的事件日志是**实时流式**的：工具调用一发生就打一行（`[步 3] ✓ bash(command=python -m pytest -q) [1200ms]`），
 bash 退出码非 0 会额外标 `[exit code: N]`，不用等任务结束才看到进度。
 
+CLI 的每一次工具调用都**统一过权限引擎**（和 Streamlit 控制台同一条链路）：默认 `allow`，
+所以正常流程行为不变；危险命令（`rm -rf` / `git push` / `git reset --hard` …）判定为 `ask`，
+而 CLI 没有交互确认，于是按安全默认**拒绝**并把理由回喂模型；路径越界沙箱则直接 `deny`。
+
 **接 MCP server**（复制 [`mcp.example.json`](mcp.example.json) 为 `.codeagent/mcp.json`）：
 
 ```json
@@ -187,7 +191,7 @@ python -m eval.runner --limit 2 --mock           # 无 key 冒烟：只验证管
 **测试**：
 
 ```bash
-python -m pytest tests/                  # 184 passed
+python -m pytest tests/                  # 189 passed
 ```
 
 ---
@@ -257,10 +261,10 @@ $ python -m eval.runner --limit 2
 | 治理 | `agent/permissions.py` `hooks.py` `memory.py` | 688 |
 | 工具 | `agent/tools/base.py` `bash.py` `files.py` `subagent.py` | 740 |
 | MCP | `agent/mcp.py` | 350 |
-| 入口 | `app/cli.py` `ui_streamlit.py` `replay.py` | 621 |
+| 入口 | `app/cli.py` `ui_streamlit.py` `replay.py` | 629 |
 | 评估 | `eval/golden_tasks.py` `runner.py` | 490 |
-| **源码合计** | **19 个模块** | **4,162** |
-| 测试 | `tests/` | 2,858（184 个用例） |
+| **源码合计** | **19 个模块** | **4,170** |
+| 测试 | `tests/` | 3,032（189 个用例） |
 
 ---
 

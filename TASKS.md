@@ -60,7 +60,7 @@
 
 - 当前里程碑：**M6 完成**（M6-1~M6-7 全部完成；M6-4 演示视频脚本见 docs/interview_guide.md §12）
 - 最近完成：官方通路真实重跑 + M6-7 过度声称的更正（详见下方"验证中发现并修复的真 bug"第 3 条）
-- 代码状态：4,162 行源码 / 19 模块 / 184 测试全绿
+- 代码状态：4,170 行源码 / 19 模块 / 189 测试全绿
 - 验证中发现并修复的真 bug：
   1. **judge 假阴性**：tinydb 的 `pytest.ini` 写死 `--cov*`，本机无 pytest-cov → pytest 以 usage error（退出码 4）退出，**测试一次没跑**，却被判成"没修好"，完成率被压成假的 0%。修法：`-o addopts=` + 把退出码 2/3/4/5 识别为无效判定（记入 error，不污染完成率）。修前 `0/2` → 修后 `1/2`
   2. **`--resume` 文档与实现不一致**：README/CLAUDE.md 写 `python -m app.cli --resume`，但 `task` 是必填位置参数 → 直接报 `Missing argument 'TASK'`。修法：`task` 改为可选 + 非 resume 时空任务报错
@@ -87,4 +87,11 @@
     - `BUDGET=2600` → 步 9（100.7%）与步 11 **LLM 摘要 compact** 触发，stale=`llm_compact`（不是退化成 snip）
     - compact 之后的步 10、11 LLM 调用均成功 → 压出来的消息序列合法（没有孤儿 tool 消息），否则 API 会 400
     - **顺带挖出一个真约束**：光有 token 压力不够。`_find_cut` 要求 `len(messages) - keep_recent > min_keep`（即 **>18 条消息**）才可能存在合法切割点。实测步 8 时 util 已 72.9%（18 条消息）但 `cut=6` 不合法 → **不触发**；步 9 消息涨到 20 条才触发。这解释了为什么"上下文只到 10%"和"util 100% 也不触发"是两回事
-  - **CLI 没有接权限引擎与 hooks**（2026-09-10 发现，**未修**）：`app/cli.py` 构造 `QueryEngine` 时既没传 `permissions=` 也没传 `hooks=`，只有 `app/ui_streamlit.py` 接了。后果：README/CLAUDE.md 宣传的「危险命令拦截 + block-at-submit hook」在 **CLI 路径上不生效**（Streamlit 路径生效）。沙箱本身没漏——`files.py` 每个路径都 `_resolve` 校验、`bash.py` 的 cwd 校验无条件生效、危险命令在无权限引擎时由工具自身兜底拒绝——**漏的是规则引擎（allow/deny/ask）与 hooks 这两层**。默认规则是"一律 allow（只 deny 路径越界、asks 危险命令）"，所以接进去不会改变正常流程，但 hooks 默认接入会改变行为，需用户决定
+  - **CLI 接权限引擎**（2026-09-10 发现 → 同日修）：`app/cli.py` 构造 `QueryEngine` 时既没传 `permissions=` 也没传 `hooks=`，只有 `app/ui_streamlit.py` 接了。后果：README/CLAUDE.md 宣传的「危险命令拦截」在 **CLI 路径上不生效**（Streamlit 路径生效）。
+    - **已修**：两处 `QueryEngine(...)`（正常分支 + `--resume` 分支）都传 `permissions=PermissionsEngine(workspace_root)`。**不传 `confirm`** → 引擎对危险命令给 `ask`，loop 在无确认交互时按安全默认拒绝（消息「权限拒绝: … 需要人工确认，当前无确认交互，已按拒绝处理」）——与接入前的行为一致，只是判定改由引擎统一做。
+    - **默认规则不变**：普通工具/命令仍 `allow`；`bash` 工具自身的危险命令兜底只在「无权限引擎」时生效，现在由引擎接管，拒绝理由的文案随之变化（行为仍是拒绝）。
+    - **按用户要求本轮不接 hooks**：hooks 的默认示例是 block-at-submit（`git commit` 前要求测试通过标记），直接接上会改变正常流程，需另行决定。已加测试锁住「permissions 接了 / hooks 没接」，防止以后误接。
+    - **测试**：`tests/test_cli.py` 新增 5 例（真跑 CLI，用 `CliRunner` + 权限引擎替身）——危险命令经引擎判定为 `ask` 且模型确实收到「权限拒绝」、普通工具仍 `ALLOW`、路径越界 `DENY`、`--resume` 分支同样接线、hooks 仍为 `None`。
+    - 沙箱本身没漏（`files.py` 每个路径都 `_resolve` 校验、`bash.py` 的 cwd 校验无条件生效）——漏的是规则引擎（allow/deny/ask）这一层，现已补上。
+  - **CLI 仍未接 hooks**（同上，**经用户决定暂不接**）
+
