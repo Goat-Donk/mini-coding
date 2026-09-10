@@ -4,7 +4,7 @@
 **核心循环手写**（不套 LangGraph / Agent SDK），支撑层用成熟库（openai SDK / pydantic v2 / streamlit / typer / pytest）。
 
 > **一句话**：把 Claude Code 的架构用 Python 重写一遍——不是移植代码，是移植设计。
-> 4,235 行源码 / 19 个模块 / 223 个测试。真实跑分见[评估章节](#评估eval)。
+> 5,191 行源码 / 20 个模块 / 266 个测试。真实跑分见[评估章节](#评估eval)。
 
 📄 文档：[技术方案 `docs/TECH_SPEC.md`](docs/TECH_SPEC.md) · [架构详解 `docs/architecture.md`](docs/architecture.md) · [任务清单 `TASKS.md`](TASKS.md) · [参考笔记 `docs/reference/`](docs/reference/)
 
@@ -24,6 +24,7 @@
 | **research 子代理** | 把 `(X+Y)×N` 的探索外包，主上下文只收结论 `Z`；子代理只读、无 subagent 工具（天然禁递归） | SubAgent 上下文经济学 |
 | **MCP 客户端** | 手写 MCP stdio 客户端接入标准 MCP server；**第三方工具照样过权限与 hooks**，且**默认不放行**——必须列进 `mcp.json` 的 `allow` 才免确认 | MCP（工具接入标准） |
 | **第三方工具授权** | `Tool.is_external()` → 权限引擎单独归类，默认 `ask`（无交互确认 → 拒绝），拒绝文案带出处与解除方式；子进程环境按名清洗凭据类变量 | 权限与安全审查 |
+| **注入文本检测 + 会话污染标记** | `agent/security.py` 对已知文本模式做**概率性**检测（只出告警）；`high` 标记让**三类不可逆动作**（网络外发 / 读凭据 / 写记忆文件）在 `PermissionsEngine` 的**后置天花板**上从 allow 降为 ask —— 该位置在记忆之后，`allow_always` 短路不了它 | 权限与安全审查 |
 
 ### 实测：缓存命中率曲线（真·冷启动）
 
@@ -162,6 +163,7 @@ streamlit run app/ui_streamlit.py        # 控制台，勾选「Mock 演示」
 ```bash
 python -m app.cli "给 README 加一行说明并验证"
 python -m app.cli --resume               # 从最近检查点续跑（配合 Ctrl+C 杀进程演示）
+python -m app.cli --resume --clear-taint # 复位污染标记（误报被收紧时用它解锁）
 python -m app.cli --mcp .codeagent/mcp.json "任务"   # 加载 MCP server（第三方工具）
 ```
 
@@ -202,7 +204,7 @@ python -m eval.runner --limit 2 --mock           # 无 key 冒烟：只验证管
 **测试**：
 
 ```bash
-python -m pytest tests/                  # 223 passed
+python -m pytest tests/                  # 266 passed
 ```
 
 ---
@@ -268,14 +270,14 @@ $ python -m eval.runner --limit 2
 
 | 层 | 文件 | 行数 |
 |---|---|---|
-| 核心循环 | `agent/loop.py` `llm.py` `state.py` `context.py` `tool_result.py` `session.py` | 1,273 |
-| 治理 | `agent/permissions.py` `hooks.py` `memory.py` | 742 |
-| 工具 | `agent/tools/base.py` `bash.py` `files.py` `subagent.py` | 744 |
-| MCP | `agent/mcp.py` | 350 |
-| 入口 | `app/cli.py` `ui_streamlit.py` `replay.py` | 636 |
+| 核心循环 | `agent/loop.py` `llm.py` `state.py` `context.py` `tool_result.py` `session.py` | 1,447 |
+| 治理 | `agent/permissions.py` `hooks.py` `memory.py` `security.py` | 1,376 |
+| 工具 | `agent/tools/base.py` `bash.py` `files.py` `subagent.py` | 796 |
+| MCP | `agent/mcp.py` | 386 |
+| 入口 | `app/cli.py` `ui_streamlit.py` `replay.py` | 696 |
 | 评估 | `eval/golden_tasks.py` `runner.py` | 490 |
-| **源码合计** | **19 个模块** | **4,235** |
-| 测试 | `tests/` | 3,502（223 个用例） |
+| **源码合计** | **20 个模块** | **5,191** |
+| 测试 | `tests/` | 4,501（266 个用例） |
 
 ---
 
@@ -307,6 +309,46 @@ coding_agent/
 **不做**（范围控制，不是不会）：向量 RAG（CC 自己也是靠 grep/glob/read 检索）· Skills 系统 · A2A · 多代理协调器 · 语音 / Vim / 远程 bridge / TUI 组件层——这些是 Claude Code 里「大规模」而非「核心」的部分。
 
 **硬约束**：LLM 只用 DeepSeek（`deepseek-chat`），测试走 MockLLM · 所有文件操作限制在 `workspace_root` 沙箱内，bash 拦危险命令 · **数据全真实**，agent 操作真实仓库、评估用真实提交，不造假。
+
+---
+
+## 已知未修复的绕过路径
+
+安全机制的可信度不来自「实现了什么」，而来自**它挡不住什么被写清楚了**。下面每一条都是当前代码的真实边界，逐条可复现；写在这里而不是留在脑子里，是因为一份只说能力的清单会让人高估它，而高估本身就是风险。
+
+**先划清范围**：本项目**没有**做 prompt 注入防御。`agent/security.py` 是**概率性**的文本模式匹配，只用于告警与标记；真正收紧能力的只有 `PermissionsEngine` 的确定性门禁。一句话概括这个设计的位置：**注入能不能骗过模型，不由这个项目决定；被标记之后还能不能读走 key、发出去、写进记忆，由门禁决定。**
+
+### 一、检测器（概率性，能绕过）
+
+| # | 绕过路径 | 说明 |
+|---|---|---|
+| S1 | **改一个词就绕过** | 规则是文本匹配，`忽略之前的指令` 换成 `把先前的那些话作废` 即不命中。这是本方法的固有边界，不是没调好 |
+| S2 | **逐字引用完整载荷的文档会判 high** | 词法扫描分不清「引用」与「使用」。顺带提及能挡住，逐字引用挡不住。已作为**已知误报**写进测试钉住 |
+| S3 | **检测器扫自己的源码会命中自己** | `agent/security.py` 里逐字写着这些模式。除非做形状启发式（更不可靠），否则无解。实际影响：只有「读到这个文件」会触发 |
+| S4 | **中文同义改写、跨行/跨段拼接、编码混淆**（base64、全角、Unicode 变体） | 均未覆盖。规则只覆盖明写的常见措辞 |
+| S5 | **扫描范围 = 落进上下文的那些字节** | 工具截断之外的内容不扫。这是刻意的范围对齐（模型看不到的内容，扫它不增加保护），但也意味着**超长输出尾部的载荷不会被发现** |
+
+### 二、门禁（确定性，但判据是词法的）
+
+| # | 绕过路径 | 说明 |
+|---|---|---|
+| S6 | **`curl` 换成脚本就绕过网络外发判据** | `_irreversible_kind` 认的是 `curl/wget/nc/scp/...` 与 `requests.`/`httpx.` 等词。写个 python 脚本用 `http.client` 发包，不在判据里 |
+| S7 | **`.env` 改名即绕过凭据判据** | 认的是文件名。`config.txt` 里放 key 就不在判据里 |
+| S8 | **bash 仍能读写记忆文件** | 三类动作里「写记忆文件」覆盖 `write`/`edit` 与部分命令写法，但 `python -c "open('CLAUDE.md','w')"` 这类绕道不在判据内 |
+| S9 | **`high` 只在**当前**会话生效** | 标记随会话结束而结束。新会话是干净的 —— 这对可用性是必要的，但也意味着攻击可以「一个会话投毒，下个会话收割」，只要中间没有人类的复位动作参与 |
+| S10 | **判定用的是原始参数字符串** | 没做路径规范化后再匹配（`./.env`、`sub/../.env`、Windows 短名等变体未逐一验证） |
+
+### 三、结构性（未做完整覆盖）
+
+| # | 绕过路径 | 说明 |
+|---|---|---|
+| S11 | **MCP 工具不受 workspace 沙箱约束** | 默认 `ask` 是**策略**，不是隔离。显式 `allow` 之后，第三方 server 做什么由它自己决定 —— 这不是沙箱，只是授权开关 |
+| S12 | **子进程环境清洗是按名黑名单** | `*_API_KEY` / `*_TOKEN` / `*_SECRET` / `*PASSWORD*` / `AWS_*` / `*_CREDENTIAL*`。改个名（`MY_PRIVATE_STUFF=xxx`）即绕过。**不是保证** |
+| S13 | **记忆文件仍会原样进 system prompt** | 只加了来源标注与框架声明，没有内容审查。克隆一个仓库，它自带的 `CLAUDE.md` 依然会被注入 —— 门槛从「无声注入」抬到「声明了来源、模型被要求报告越界要求」，但**没有阻断** |
+| S14 | **`@include` 的目录黑名单是枚举的** | 只拒了 `data/tool-results/`。agent 自己写出的其它目录（如 `data/sessions/`）没在名单里 |
+| S15 | **没有子代理/工具层的隔离** | 子代理是「受限只读工具集」，不是沙箱。它跑在同一进程、同一 workspace、同一份环境变量下 |
+
+**这份清单会过时**：它不是「设计上不允许」，是「截至 `d03f413` 还没做」。逐条修掉其中任何一条，都应该同时改这张表。
 
 ---
 

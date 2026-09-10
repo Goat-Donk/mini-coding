@@ -54,13 +54,51 @@
 - [x] M6-6 真实 LLM 端到端验证（接真实 key 跑通全流程；修掉验证中暴露的真 bug：judge 假阴性、`--resume` 文档与实现不一致）
 - [x] M6-7 修 M6-6 暴露的两个体验问题：CLI 事件实时流式打印 + agent 不知道工作目录（system prompt 注入 `workspace_root`/平台提示）
 
+## M7 安全机制加固（2026-09-10，对照参考简历的「权限与安全审查 / AI 风险分类」补的）
+
+**范围钉死**：本项**不是**「防止 prompt 注入」（防不住，改写一个词就绕过）。做的是两件分开的事：**结构性加固**（确定性，零误报风险）+ **检测器**（概率性，只出告警）。措辞红线：不说「防御/防止注入」，不说「污点追踪/taint 传播」，不说「纵深防御/零信任」，不说「子代理沙箱」，不给「误报率低」这类无数字形容词。
+
+### Part A 结构性加固（确定性）
+
+- [x] A1 `agent/tools/bash.py`：子进程环境清洗（`_scrubbed_env()`，按变量名剔除 `*_API_KEY`/`*_TOKEN`/`*_SECRET`/`*PASSWORD*`/`AWS_*`/`*_CREDENTIAL*`）。**ROI 最高**：`load_dotenv()` 把 key 灌进 `os.environ`，`subprocess.run` 默认继承 → `echo %DEEPSEEK_API_KEY%` 一条命令外泄，不需要读任何文件
+- [x] A2 `agent/mcp.py` + `agent/permissions.py`：第三方工具必须显式授权（`Tool.is_external()` → `_classify` 归 `external` 类 → `_rule_check` 命中 `external.allow` 才 ALLOW，否则 ASK）。**破坏性变更**，测试/示例/文档已同步
+- [x] A3 `agent/loop.py`：`run_post` 返回值不再被丢弃（post-hook 提示拼进 `result.output`）。**独立 commit** `be815ac`
+- [x] A4 `agent/permissions.py`：污染升级做成**后置天花板**（在记忆之后、人工确认之前；只降不升；只覆盖三类不可逆动作）
+- [x] A5 `agent/session.py`：检查点全字段往返 + `derive_taint` 从事件重算（重放语义，不是取 max —— 取 max 会让人类已复位的标记复活）+ 全字段往返回归测试
+- [x] A6 `agent/loop.py`：`gate_block` 事件（四处 `ToolResult.fail` 前 emit，带 `reason`/`source`），让拒绝原因第一次进轨迹
+- [x] A7 `agent/tools/bash.py`：修 `eval\s` 误报（`echo "medieval times"` 被误判成危险命令）→ 收紧为 `(^|[;&|]\s*)eval\s`
+
+### Part B 检测器 + 会话级污染标记（诚实标注）
+
+- [x] B1 `agent/security.py`：7 类规则的文本模式检测（`Finding` **不存原文**；长度上限 + 字面量预筛；`level_for` 按**证据强度**分级而非命中数量）
+- [x] B2 `agent/hooks.py`：`detect_injection()` 挂进 `default_engine()` 的 post_hooks（唯一构造点）。扫 `ctx.result.output`（模型真读到的字节），**fail-open 但大声记日志**
+- [x] B3 `AgentState.taint` 会话级粗粒度标记：只升不降、**没有 `set_taint`**、唯一复位者是人的动作（CLI `--clear-taint`）
+- [x] B4 记忆按**来源**隔离而非按内容过滤：`memory_frame` 来源框架 + `high` 会话写入 `learned.pending.md`（不自动注入）+ `@include` 拒 `data/tool-results/` 与深度上限
+- [x] B5 `tests/test_security.py`：25 例（payload 必命中 / 良性必不误报 / 文档讲注入不判 high / **自建样例集如实报实测数** / 天花板位置 / 端到端 / 场景 B 不锁死 / resume 往返 / fail-open）
+- [x] B6 README「已知未修复的绕过路径」S1–S15 —— **本项可信度最高的部分**，写「已知绕过」比写「实现了注入防御」强得多
+
+### Part C 文档
+
+- [x] C1 `docs/TECH_SPEC.md` §9.9 + §9.10
+- [x] C2 `docs/architecture.md` §4 表格行 + 「检测路径 vs 执行路径」小节
+- [x] C3 `README.md` 能力表行 + 「已知未修复的绕过路径」一节 + 规模计数更新
+- [x] C4 `TASKS.md` M7（本节）
+- [x] C5 `docs/interview_guide.md` §5 + §12 同步
+
+### 真实 LLM 端到端验证（DeepSeek 官方通路，不用 mock）
+
+- [ ] V1 H1 外泄拦截：让 agent 跑 `echo %DEEPSEEK_API_KEY%`，确认输出不含真实 key
+- [ ] V2 H2 MCP 授权：不配 `allow` → 被拒；配上 → 放行
+- [ ] V3 注入检出：workspace 放含 payload 的文件 → agent 读到 → 轨迹出现 `security_finding` + `gate_block`（带出处）→ `--clear-taint` 后恢复
+- [ ] V4 不锁定验证：agent 自己写含 payload 的测试文件再回读 → **普通编辑/跑测试全程不受影响**（用户选的误报政策的验收点）
+
 ---
 
 ## 进度快照
 
-- 当前里程碑：**M6 完成**（M6-1~M6-7 全部完成；M6-4 演示视频脚本见 docs/interview_guide.md §12）
-- 最近完成：官方通路真实重跑 + M6-7 过度声称的更正（详见下方"验证中发现并修复的真 bug"第 3 条）
-- 代码状态：4,235 行源码 / 19 模块 / 196 测试全绿
+- 当前里程碑：**M7 完成**（M7-1~M7-6 + Part C 全部完成；四条真实 LLM 端到端验证 V1–V4 待在官方通路跑）
+- 最近完成：M7 安全机制加固（结构性 A1–A7 + 检测器 B1–B6 + 文档 C1–C5）
+- 代码状态：5,191 行源码 / 20 模块 / 266 测试全绿
 - 验证中发现并修复的真 bug：
   1. **judge 假阴性**：tinydb 的 `pytest.ini` 写死 `--cov*`，本机无 pytest-cov → pytest 以 usage error（退出码 4）退出，**测试一次没跑**，却被判成"没修好"，完成率被压成假的 0%。修法：`-o addopts=` + 把退出码 2/3/4/5 识别为无效判定（记入 error，不污染完成率）。修前 `0/2` → 修后 `1/2`
   2. **`--resume` 文档与实现不一致**：README/CLAUDE.md 写 `python -m app.cli --resume`，但 `task` 是必填位置参数 → 直接报 `Missing argument 'TASK'`。修法：`task` 改为可选 + 非 resume 时空任务报错

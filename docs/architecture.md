@@ -34,6 +34,7 @@ flowchart TB
         PERM["permissions.py"]
         HOOK["hooks.py"]
         MEM["memory.py"]
+        SEC["security.py<br/>检测器（概率性）"]
     end
 
     subgraph TOOLS["工具层 agent/tools/"]
@@ -112,7 +113,7 @@ sequenceDiagram
 
 ## 3. 核心层
 
-### 3.1 QueryEngine（`agent/loop.py`，299 行）
+### 3.1 QueryEngine（`agent/loop.py`，419 行）
 
 **只读工具并发，写工具串行** —— 直接照搬 Claude Code `query.ts` 的语义，也是与串行参考实现的主要差异：
 
@@ -220,6 +221,7 @@ sequenceDiagram
 | `permissions.py` | 三类请求（path / command / edit）× 六级决策（`allow_once` / `allow_turn` / `allow_always` / `deny_once` / `deny_always` / `ask`）+ 危险命令黑名单 + 路径沙箱 | `permission.ts` 的最小权限原则；决策粒度吸收自 MiniCode |
 | `hooks.py` | `PreToolUse` / `PostToolUse` 两个事件；内置 **block-at-submit** 示例 + marker 由测试结果自动维护（`default_engine()` 供两个入口共用） | Hooks：阻断型钩子是**确定性约束**，CLAUDE.md 只是建议 |
 | `memory.py` | 分层指令文件（`CODEAGENT.md` < `MINI.md` < `CLAUDE.md` < `.codeagent/rules/*.md`）+ `@include` 递归 + sha256 去重 + 预算（单文件 8K / 总 20K）+ 任务后提取写回 | CLAUDE.md 机制 + Dream consolidation（简化为提取 + 去重） |
+| `security.py` | 7 类文本模式检测（同现判据 + 物证分级）+ 会话级污染标记 + `spotlight` / `memory_frame` 来源框架。**概率性，只出告警** | 无直接对应；本项目对「不可信输入」的处理方式 |
 
 **block-at-submit 是本项目最直观的 hook 演示**：`require_tests_before_commit` 包住 `Bash(git commit)`，检查 `data/tests_pass.marker` 是否存在——不存在就**阻断提交**并把「先去跑 pytest」回喂给模型，逼它进入「测试 → 修复 → 再提交」的循环。这是「用确定性代码约束 agent 行为」，比在提示词里写一百遍「记得跑测试」都管用。
 
@@ -228,6 +230,47 @@ sequenceDiagram
 **记忆的闭环**：`.codeagent/rules/learned.md` 是唯一可写的记忆文件。任务结束后 `extract_conventions` 从轨迹里提炼 `- ` 条目 → `consolidate`（归一化 / 子串包含合并 / hash 去重）→ `save_learned` 写回 → **下次 `discover` 自动包含**。约定因此跨会话生效，而且**排最后 = 优先级最高**（离当前工作区最近的知识最该被信任）。
 
 `@include` 的安全边界值得单说：只接受相对路径，显式拒绝绝对路径、`..` 段（含 `sub/../x` 这种伪装）、沙箱逃逸；循环 include 做 seen 集合检测；文件缺失给占位注释而不是报错——**记忆文件坏了不该让整个任务崩掉**。
+
+### 检测路径 vs 执行路径（M7）
+
+这一层里有两类东西，混在一起谈会把整个安全叙事讲错：
+
+```mermaid
+flowchart LR
+    IN["工具输出<br/>（不可信字节）"] --> DET["security.py<br/>文本模式检测<br/><b>概率性</b>"]
+    DET -->|告警| BANNER["横幅 + security_finding 事件"]
+    DET -->|级别| TAINT["AgentState.taint<br/>会话级标记"]
+    TAINT --> CEIL{"permissions.py<br/>_apply_taint_ceiling<br/><b>确定性</b>"}
+    CEIL -->|三类不可逆动作| ASK["ALLOW → ASK"]
+    CEIL -->|其余一切| UNCHANGED["判定不变"]
+    ASK --> HUMAN["人工确认<br/>（无交互 → 拒绝）"]
+    style DET fill:#ffe6e6
+    style CEIL fill:#e6f5e6
+```
+
+**分界线是「谁在做判断」**：左边那半靠猜（文本匹配，改一个词就绕过），右边那半靠查表（标记级别 + 动作类别，两个可判定的量）。所以右边能进执行路径，左边不能 —— 左边只影响告警和标记，**从不直接决定放行/拒绝**。
+
+这不是洁癖，是项目自己写在第 0 节的原则：**可靠性来自运行时的确定性，而不是提示词的祈祷**。把一个概率性分类器放进执行路径，等于把可靠性建立在猜测上；而且误报的代价会直接落在用户身上 —— CLI 没有确认交互，一次误判就是「本该能做的事突然做不了，且没有纠正的入口」。
+
+**天花板的位置是这一层最要紧的一个坐标**（`permissions.py:_decide`）：
+
+```python
+1) 路径越界 → 硬 deny
+2) 常驻记忆 _always   ┐
+3) 本回合记忆 _turn   ├─ 用户的选择在这里
+4) 规则判定 _rule_check ┘
+5) 后置天花板  ← 必须在这里
+6) ask → confirm()   ← 人的当场决定
+```
+
+- **不能写在 4) 里面**。写成规则链的一条分支会被 2)/3) 短路：用户只要开过一次 `allow_always`，任何基于规则的收紧就**永久失效**——而「记得越久越省事」正是用户去开它的原因，两个方向正好相反。
+- **不能放在 6) 之后**。`confirm` 是一个真实的人当场作出的决定，自动机制不该反过来推翻它；否则人点了「允许」系统仍按拒绝处理，确认框就成了摆设。
+
+**只收紧三类动作**（网络外发 / 读取凭据 / 写入记忆文件），判据是「一旦发生就收不回来」。`write` 一个普通源码文件、`ls`、`git status` 都在外面：它们可撤销、可由人复核，收紧它们只会让 agent 变成路障。误报成本是不对称的 —— 多收紧一类动作，就是多一类「本该能做的事突然做不了」，而漏判只是少一层告警（沙箱、危险命令黑名单、第三方工具授权这些**确定性门禁照常生效**）。
+
+**污染标记是会话级、粗粒度的**，不是逐值数据流追踪：做不到「这个字符串来自不可信来源、那个没有」。它只升不降，`AgentState` 上**刻意没有 `set_taint`** —— 不存在的 API 无法被某条代码路径误用去擦掉标记，唯一复位者是人的动作（`--clear-taint`），且复位本身会往轨迹里写 `taint_cleared`，所以 `--resume` 重算时不会被旧的 `security_finding` 抬回去。
+
+> 「检测出问题 → 收紧能力 → 人解锁」这条链能成立，靠的是**后一半**。检测器换个说法就绕过（README「已知未修复的绕过路径」的 S1–S5 逐条写着），但一旦标记置上，收紧与解锁都是确定性的。
 
 ## 5. 工具层（`agent/tools/`）
 
