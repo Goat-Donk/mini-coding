@@ -119,6 +119,7 @@ class QueryEngine:
                 result = self.llm.chat(messages, self.registry.schemas())
                 state.usage += result.usage
                 state.last_usage = result.usage  # M3 provider 锚点
+                state.usage_stale_reason = None  # 新 usage 锚定当前（compact 后）上下文
                 state.step += 1
                 state.record_event(
                     "llm_call",

@@ -1,5 +1,12 @@
-"""M3-1 tests: agent/context.py（provider-usage-first 记账 + cache-aware 布局）。"""
-from agent.context import ContextManager, ContextStats, _message_text
+"""M3 tests: agent/context.py（记账 + cache-aware 布局 + compact 流水线）。"""
+from agent.context import (
+    SNIP_BOUNDARY_MARKER,
+    SUMMARY_MARKER,
+    ContextManager,
+    ContextStats,
+    build_compact_summary_prompt,
+    _message_text,
+)
 from agent.llm import LLMResult, MockLLM, ToolCall, Usage
 from agent.state import (
     AgentState,
@@ -158,3 +165,116 @@ def test_message_text_extraction():
         }],
     }
     assert _message_text(msg) == '{"x": 1}'
+
+
+# ---------- M3-3 compact 流水线 ----------
+
+def make_rounds(n_rounds: int, *, tool_chars: int) -> list[dict]:
+    """[system, task] + n_rounds 个完整轮次（assistant tool_calls + tool 结果）。"""
+    msgs = [system("sys"), user("任务")]
+    for i in range(n_rounds):
+        call = ToolCall(id=f"c{i}", name="bash", arguments={"command": f"echo {i}"})
+        msgs.append(assistant_tool_calls([call]))
+        msgs.append(tool_result(f"c{i}", "o" * tool_chars))
+    return msgs
+
+
+def test_snip_triggers_in_warning_band():
+    """70%~85% 只触发确定性 snip（不调 LLM）：保留最近 12 条、前缀不动、裁剪后 ≤60%。"""
+    mgr = make_manager(budget=10_000)  # 默认 0.70/0.85, keep_recent=12, min_keep=6
+    msgs = make_rounds(10, tool_chars=1600)  # 10×756 + 2 ≈ 7562 → ~75.6%（warning 带）
+    orig = list(msgs)
+    state = make_state(msgs)
+    assert mgr.account(state).warning_level == "warning"
+
+    prepared = mgr.prepare(state)
+    assert prepared[0] == orig[0] and prepared[1] == orig[1]  # system + task 前缀不动
+    assert prepared[2] == {"role": "user", "content": SNIP_BOUNDARY_MARKER}
+    assert prepared[3:] == orig[10:]  # 保留最近 12 条（len 22 - 12 = 10）
+    assert len(prepared) == 2 + 1 + 12
+    assert state.usage_stale_reason == "snip_compact"
+    # 裁剪后 ≤ 60% 目标
+    assert mgr.account(state).utilization <= 0.60
+    # 没有调用 LLM：空响应 MockLLM 被调用会抛 RuntimeError
+
+
+def test_snip_boundary_never_splits_tool_round():
+    """naive 切割点落在 tool 消息上 → 回退到完整轮次边界，不留孤儿 tool 结果。"""
+    mgr = make_manager(budget=4000, keep_recent=3, min_keep=2)
+    msgs = make_rounds(4, tool_chars=1500)  # 4×756 ≈ 3026 → ~75.6%（warning 带）
+    orig = list(msgs)
+    state = make_state(msgs)
+    assert mgr.account(state).warning_level == "warning"
+
+    prepared = mgr.prepare(state)
+    # naive cut = 10-3 = 7（落在 tool c2 上）→ 对齐后回退到 6（完整轮次 c2 起）
+    assert prepared[2] == {"role": "user", "content": SNIP_BOUNDARY_MARKER}
+    assert prepared[3:] == orig[6:]  # assistant c2 + tool c2 + assistant c3 + tool c3
+    assert state.usage_stale_reason == "snip_compact"
+    assert mgr.account(state).utilization <= 0.60
+
+
+def test_llm_compact_at_critical():
+    """critical(≥85%) 触发 LLM 摘要：中段压成摘要消息、system/task 保留、标记 stale。"""
+    msgs = make_rounds(4, tool_chars=2000)  # 4×1006 ≈ 4026 → ~100%（critical）
+    orig = list(msgs)
+    seen = {}
+
+    def completer(messages, tools):
+        seen["text"] = messages[-1]["content"]
+        return LLMResult(content="摘要：任务进展顺利，还剩一步验证。")
+
+    state = make_state(msgs)
+    manager = ContextManager(
+        MockLLM([completer]),
+        token_budget=4000,
+        keep_recent=3,
+        min_keep=2,
+    )
+    assert manager.account(state).warning_level in ("critical", "blocked")  # ≥85%
+    prepared = manager.prepare(state)
+    assert prepared[0] == orig[0] and prepared[1] == orig[1]
+    assert prepared[2]["role"] == "user"
+    assert SUMMARY_MARKER in prepared[2]["content"]
+    assert "任务进展顺利" in prepared[2]["content"]
+    assert prepared[3:] == orig[6:]  # 最近 3 条对齐边界 = 2 个完整轮次
+    assert state.usage_stale_reason == "llm_compact"
+    # 摘要只覆盖中段（round 0/1），不含最近轮次（round 3）
+    assert "echo 0" in seen["text"] and "echo 3" not in seen["text"]
+
+
+def test_llm_compact_falls_back_to_snip_on_error():
+    """LLM 摘要失败（异常/空摘要）→ 退化确定性 snip，任务不中断。"""
+    mgr = make_manager(budget=4000)
+    msgs = make_rounds(4, tool_chars=2000)
+    orig = list(msgs)
+
+    def boom(messages, tools):
+        raise RuntimeError("LLM 服务不可用")
+
+    state = make_state(msgs)
+    manager = ContextManager(MockLLM([boom]), token_budget=4000, keep_recent=3, min_keep=2)
+    prepared = manager.prepare(state)
+    assert prepared[0] == orig[0] and prepared[1] == orig[1]
+    assert prepared[2] == {"role": "user", "content": SNIP_BOUNDARY_MARKER}
+    assert prepared[3:] == orig[6:]
+    assert state.usage_stale_reason == "snip_compact"
+
+
+def test_build_compact_summary_prompt():
+    msgs = build_compact_summary_prompt("对话内容")
+    assert msgs[0]["role"] == "system"
+    assert msgs[1]["role"] == "user"
+    assert "任务目标" in msgs[0]["content"]
+    assert "尚未完成的任务" in msgs[0]["content"]
+    assert msgs[1]["content"] == "对话内容"
+
+
+def test_prepare_noop_when_under_snip_threshold():
+    """利用率 <70% → 不 compact，消息原样返回。"""
+    mgr = make_manager(budget=10_000)
+    msgs = [system("sys"), user("任务")]
+    state = make_state(msgs)
+    assert mgr.account(state).warning_level == "normal"
+    assert mgr.prepare(state) == msgs
+    assert state.usage_stale_reason is None

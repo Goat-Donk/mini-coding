@@ -26,7 +26,7 @@
 
 - [x] M3-1 `agent/context.py`：**provider-usage-first 记账**（assistant 消息附 usage + 尾部估算 + 50/85/95% 分级告警）+ **cache-aware 消息布局**（稳定前缀置前）+ 预算（验收：`pytest tests/test_context.py`；命中率曲线上升）
 - [x] M3-2 `agent/tool_result.py`：**超大工具结果落盘**（>50K 字符 → `data/tool-results/` + 预览替换 `<persisted-output>`；批内预算 200K 兜底）——替代纯截断（验收：`pytest tests/test_tool_result.py`）
-- [ ] M3-3 `agent/context.py` compact 流水线：**确定性 snip compact**（70% 触发、保留最近 12 条、无 LLM）→ **LLM 摘要 compact**（critical 才触发、boundary 对齐 API 轮次、压缩前 usage 标记 stale）（验收：`pytest tests/test_context.py`）
+- [x] M3-3 `agent/context.py` compact 流水线：**确定性 snip compact**（70% 触发、保留最近 12 条、无 LLM）→ **LLM 摘要 compact**（critical 才触发、boundary 对齐 API 轮次、压缩前 usage 标记 stale）（验收：`pytest tests/test_context.py`）
 - [ ] M3-4 `agent/session.py`：JSONL 轨迹 + 每 N 步检查点 + resume（验收：`pytest tests/test_session.py`；杀进程后 `--resume` 续跑）
 - [ ] M3-5 控制台加指标：缓存命中率/省钱曲线 + 检查点列表 + 上下文用量分级（验收：控制台可见指标）
 - [ ] M3-6 更新 TECH_SPEC + commit + push
@@ -56,6 +56,6 @@
 
 ## 进度快照
 
-- 当前里程碑：**M3 进行中**（上下文治理 + 检查点，差异化核心；M3-1/M3-2 已 push）
-- 最近完成：M3-1 provider-usage-first 记账 + cache-aware 布局；M3-2 超大工具结果落盘 + 批预算
-- 下一步：**M3-3 compact 流水线**——确定性 snip（70% 触发/保留最近 12 条）→ LLM 摘要（critical 才触发）
+- 当前里程碑：**M3 进行中**（上下文治理 + 检查点，差异化核心；M3-1~M3-3 已 push）
+- 最近完成：M3-1 provider-usage-first 记账 + cache-aware 布局；M3-2 超大工具结果落盘 + 批预算；M3-3 compact 流水线（snip + LLM 摘要）
+- 下一步：**M3-4 session**——JSONL 轨迹 + 每 N 步检查点 + resume

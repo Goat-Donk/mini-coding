@@ -41,6 +41,11 @@ WARNING_LEVELS = (
 )
 
 SNIP_BOUNDARY_MARKER = "[已裁剪的历史消息，见会话轨迹 JSONL]"
+SUMMARY_MARKER = "[历史对话已摘要，完整轨迹见会话 JSONL]"
+
+# 稳定前缀长度：messages[0] 恒为 system、messages[1] 恒为首条 user（任务）。
+# compact 只删/改前缀之后的"中段"，永不触碰前缀（cache-aware 约定）。
+_PREFIX_LEN = 2
 
 
 @dataclass
@@ -71,6 +76,24 @@ def _message_text(message: dict) -> str:
         if isinstance(args, str) and args:
             parts.append(args)
     return "\n".join(parts)
+
+
+def build_compact_summary_prompt(conversation_text: str) -> list[dict]:
+    """构造 LLM 摘要 compact 用的 messages（system 指令 + 待压缩对话文本）。
+
+    压缩要求（TECH_SPEC §6.3）：保留任务目标、关键决策、错误与修复、未完成任务。
+    """
+    return [
+        {
+            "role": "system",
+            "content": (
+                "你是 CodeAgent 的上下文压缩器。请把给定的对话历史压缩成一段精炼的"
+                "中文摘要，必须保留：当前任务目标、已经做出的关键决策、遇到的错误与修复、"
+                "尚未完成的任务。只输出摘要本身，不要附加任何解释。"
+            ),
+        },
+        {"role": "user", "content": conversation_text},
+    ]
 
 
 class ContextManager:
@@ -139,14 +162,99 @@ class ContextManager:
                 return messages[idx:]
         return messages
 
-    # ---------- cache-aware 布局 ----------
+    # ---------- cache-aware 布局 + compact 流水线 ----------
 
     def prepare(self, state, tool_schemas: list[dict] | None = None) -> list[dict]:
-        """M3 流水线入口：记账 → compact（M3-3）→ 返回布局稳定的消息。
+        """M3 流水线入口：记账 → 分级 compact → 返回布局稳定的消息。
 
-        cache-aware 约定：system（+记忆块）恒在首位、工具 schema 顺序稳定
-        （由 registry.schemas() 插入序保证），compact 只动中段不碰前缀。
+        两级 compact（TECH_SPEC §6.3，"先确定性后 LLM"）：
+        - utilization ≥ 0.70（warning 带）→ 确定性 snip：中段删除 + boundary 标记，
+          成本≈0；
+        - utilization ≥ 0.85（critical/blocked）→ LLM 摘要 compact：中段压成摘要
+          消息（信息保真更高），LLM 失败退化为 snip。
+        cache-aware 约定：system + 任务恒在首位、compact 只动中段不碰前缀。
         """
         self.last_stats = self.account(state)
-        # M3-3 在此接入：_maybe_snip / _maybe_compact（现在只记账）
+        if self.last_stats.utilization >= self.compact_threshold:
+            self._compact_with_summary(state, state.messages)
+        elif self.last_stats.utilization >= self.snip_threshold:
+            self._snip(state, state.messages)
         return state.messages
+
+    # ---------- 两级 compact ----------
+
+    def _snip(self, state, messages: list[dict]) -> bool:
+        """确定性裁剪：保留最近 keep_recent 条（轮次边界对齐），中段删除。"""
+        cut = self._find_cut(messages)
+        if cut is None:
+            return False
+        recent = messages[cut:]
+        del messages[_PREFIX_LEN:cut]
+        messages.insert(_PREFIX_LEN, {"role": "user", "content": SNIP_BOUNDARY_MARKER})
+        state.usage_stale_reason = "snip_compact"  # 旧 provider usage 不再适配新上下文
+        return True
+
+    def _compact_with_summary(self, state, messages: list[dict]) -> bool:
+        """LLM 摘要 compact：中段压成 context_summary 消息；LLM 失败退化 snip。"""
+        cut = self._find_cut(messages)
+        if cut is None:
+            return False
+        middle = messages[_PREFIX_LEN:cut]
+        recent = messages[cut:]
+        if not middle:
+            return False
+        try:
+            summary = self.llm.complete(
+                build_compact_summary_prompt(self._conversation_to_text(middle))
+            )
+        except Exception:
+            return self._snip(state, messages)  # 摘要失败不阻塞任务
+        summary = (summary or "").strip()
+        if not summary:
+            return self._snip(state, messages)
+
+        marker = {"role": "user", "content": f"{SUMMARY_MARKER}\n{summary}"}
+        del messages[_PREFIX_LEN:cut]
+        messages.insert(_PREFIX_LEN, marker)
+        state.usage_stale_reason = "llm_compact"
+        return True
+
+    def _find_cut(self, messages: list[dict]) -> int | None:
+        """计算保留窗口起点（从尾部保留 keep_recent 条），并对齐 API 轮次边界。
+
+        无效切割点两种（会破坏 OpenAI 消息格式）：
+        - 前一条是 assistant 且带 tool_calls：它的 tool 结果在右侧，会孤儿化；
+        - 首条是 tool 消息：它的 assistant 在左侧被删，tool 结果成孤儿。
+        历史太短（窗口起点 ≤ min_keep，无中段可裁）或无合法边界 → 返回 None。
+        """
+        cut = len(messages) - self.keep_recent
+        if cut <= self.min_keep:
+            return None
+        while cut > self.min_keep and not self._is_round_boundary(messages, cut):
+            cut -= 1
+        if not self._is_round_boundary(messages, cut):
+            return None  # 保守放弃：找不到合法切割点
+        return cut
+
+    @staticmethod
+    def _is_round_boundary(messages: list[dict], idx: int) -> bool:
+        """idx 是否落在完整 API 轮次边界（不切开 assistant(tool_calls)+tool 整组）。"""
+        if idx <= 0 or idx >= len(messages):
+            return True
+        prev = messages[idx - 1]
+        if prev.get("role") == "assistant" and prev.get("tool_calls"):
+            return False
+        if messages[idx].get("role") == "tool":
+            return False
+        return True
+
+    @staticmethod
+    def _conversation_to_text(messages: list[dict]) -> str:
+        """把中段消息拍平成可读文本（供摘要 prompt）。"""
+        lines = []
+        for message in messages:
+            text = _message_text(message)
+            if not text:
+                continue
+            lines.append(f"[{message.get('role')}] {text}")
+        return "\n\n".join(lines)
