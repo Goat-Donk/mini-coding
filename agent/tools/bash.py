@@ -2,7 +2,8 @@
 
 - 危险命令黑名单：M1 直接拒绝（M2 起转权限 ask，此处保留兜底）
 - 平台适配：POSIX 用 bash -lc，Windows 用 cmd /c
-- 超时上限 300s；输出截断 MAX_CHARS 并带提示
+- 超时上限 300s；输出安全上限 MAX_CHARS（M3-2 起超大输出由 tool_result.py 落盘，
+  此上限只是极端安全兜底，不丢弃常规内容）
 - 退出码非 0 仍算 success=True：命令执行本身完成，业务失败交给模型判断
 """
 from __future__ import annotations
@@ -16,7 +17,7 @@ from pydantic import BaseModel
 
 from agent.tools.base import Tool, ToolContext, ToolResult
 
-MAX_CHARS = 20_000
+MAX_CHARS = 500_000  # 兜底安全上限；超大输出走 tool_result 落盘
 MAX_TIMEOUT = 300
 TRUNCATED_MESSAGE = (
     "\n... [输出被截断，共 {total} 字符，仅显示前 {limit} 字符] ...\n"

@@ -15,7 +15,7 @@ from pydantic import BaseModel
 
 from agent.tools.base import Tool, ToolContext, ToolResult
 
-MAX_CHARS = 20_000
+MAX_CHARS = 500_000  # 兜底安全上限；超大输出走 tool_result 落盘（M3-2）
 TRUNCATED_MESSAGE = (
     "\n... [输出被截断，共 {total} 字符，仅显示前 {limit} 字符] ..."
 )

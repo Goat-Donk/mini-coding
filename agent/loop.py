@@ -19,6 +19,7 @@ from agent.hooks import HookEngine
 from agent.llm import BaseLLM, ToolCall, Usage
 from agent.permissions import Decision, PermissionsEngine
 from agent.state import AgentState, assistant_tool_calls, system, tool_result, user
+from agent.tool_result import ToolResultStore, compact_batch
 from agent.tools.base import ToolContext, ToolRegistry, ToolResult
 
 
@@ -64,6 +65,7 @@ class QueryEngine:
         empty_response_retries: int = 2,           # 空响应重试上限（M1-9）
         permissions: PermissionsEngine | None = None,  # M2 权限引擎
         hooks: HookEngine | None = None,               # M2 hooks 引擎
+        tool_result_store: ToolResultStore | None = None,  # M3 超大结果落盘
         memory_blocks: list[str] | None = None,    # M4 注入
         context: object | None = None,             # M3 接 ContextManager
         session: object | None = None,             # M3 接 session（轨迹/检查点）
@@ -76,6 +78,7 @@ class QueryEngine:
         self.empty_response_retries = max(0, empty_response_retries)
         self.permissions = permissions
         self.hooks = hooks
+        self.tool_result_store = tool_result_store
         self.memory_blocks = list(memory_blocks or [])
         self.context = context
         self.session = session
@@ -229,6 +232,10 @@ class QueryEngine:
                 results = list(executor.map(invoke, calls))
         else:
             results = [invoke(call) for call in calls]
+
+        # M3-2：超大工具结果落盘（上下文替换为预览+路径，避免截断丢信息）
+        if self.tool_result_store is not None:
+            results = compact_batch(results, self.tool_result_store)
 
         # 消息追加：一条 assistant tool_calls + N 条 tool 结果（顺序与 calls 对应）
         state.messages.append(assistant_tool_calls(calls))
