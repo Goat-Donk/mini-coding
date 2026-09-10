@@ -651,6 +651,19 @@ DEFAULT_SYSTEM_PROMPT = f"""\
 - 打印：每步事件（工具调用名+参数摘要+结果截断）+ 最终结论 + 总 token/步骤
 - **M2+**：加 `--resume`、权限 ask 交互、`--checkpoint-dir`（M3）
 
+### 8.2 app/ui_streamlit.py（M2-3 控制台 v1）
+
+**文件**：`app/ui_streamlit.py`；运行 `streamlit run app/ui_streamlit.py`（无 key 自动 Mock 演示）。
+
+**架构（worker 线程 + 事件队列轮询）**：
+- QueryEngine 在后台线程跑（daemon）；`_EmitProxy` 实现 session.emit → 事件推入 `queue.Queue`（复用 record_event 的回调通道）
+- 主线程每次脚本运行 `get_nowait()` 排空队列 → 追加到 `session_state["log"]` → 渲染；running 中 `sleep(0.3) + st.rerun()` 轮询；**空闲状态不 rerun**（AppTest 无头测试必需，否则初始渲染死循环）
+- **权限确认桥 ConfirmBridge**：worker 的 confirm 回调 `answers.get()` 阻塞等待；UI 读到 `confirm.current` 渲染 5 按钮（允许本次/本回合/总是/拒绝本次/总是），点击把粒度字符串 `answers.put` 并 rerun；新任务重置桥
+- hooks：内置 `require_tests_before_commit`（git commit 前检查 data/tests_pass.marker）
+- 最终展示：结论 + 终止原因/步骤/token/缓存命中率
+
+**测试**：`tests/test_ui_streamlit.py`（AppTest 无头跑通 mock 任务；验收 `python -m pytest tests/test_ui_streamlit.py`）。
+
 ---
 
 ## 9. 后续里程碑模块规格（占位，届时展开补全）
