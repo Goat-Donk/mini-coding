@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from agent.hooks import HookEngine
 from agent.llm import BaseLLM, ToolCall, Usage
 from agent.permissions import Decision, PermissionsEngine
 from agent.state import AgentState, assistant_tool_calls, system, tool_result, user
@@ -62,6 +63,7 @@ class QueryEngine:
         loop_detection_window: int = 4,            # 最近 N 步工具签名相同即停
         empty_response_retries: int = 2,           # 空响应重试上限（M1-9）
         permissions: PermissionsEngine | None = None,  # M2 权限引擎
+        hooks: HookEngine | None = None,               # M2 hooks 引擎
         memory_blocks: list[str] | None = None,    # M4 注入
         context: object | None = None,             # M3 接 ContextManager
         session: object | None = None,             # M3 接 session（轨迹/检查点）
@@ -73,6 +75,7 @@ class QueryEngine:
         self.loop_detection_window = max(1, loop_detection_window)
         self.empty_response_retries = max(0, empty_response_retries)
         self.permissions = permissions
+        self.hooks = hooks
         self.memory_blocks = list(memory_blocks or [])
         self.context = context
         self.session = session
@@ -99,7 +102,10 @@ class QueryEngine:
             state.emitter = getattr(self.session, "emit", None)
 
         ctx = ToolContext(
-            workspace_root=self.workspace_root, cwd=cwd, permissions=self.permissions
+            workspace_root=self.workspace_root,
+            cwd=cwd,
+            permissions=self.permissions,
+            hooks=self.hooks,
         )
         signatures_window: deque[list[str]] = deque(maxlen=self.loop_detection_window)
         empty_retry_count = 0
@@ -206,25 +212,7 @@ class QueryEngine:
 
         def invoke(call: ToolCall) -> tuple[str, str]:
             """返回 (tool_call_id, output)。单条调用无论成败都封包成文本回喂模型。"""
-            tool = self.registry.get(call.name) if call.name in self.registry else None
-            if tool is None:
-                available = ", ".join(self.registry.names())
-                result = ToolResult.fail(f"未知工具 {call.name}，可用工具: {available}")
-            elif self.permissions is not None:
-                decision = self.permissions.check(call.name, call.arguments, ctx)
-                if decision is Decision.DENY:
-                    result = ToolResult.fail(
-                        f"权限拒绝: 未获允许执行 {call.name}（{self.permissions.describe(call.name, call.arguments)}）"
-                    )
-                elif decision is Decision.ASK:
-                    # headless 无确认回调 → 安全默认拒绝（M2-3 控制台接入交互后走 ask）
-                    result = ToolResult.fail(
-                        f"权限拒绝: {call.name} 需要人工确认，当前无确认交互，已按拒绝处理"
-                    )
-                else:
-                    result = tool.run(call.arguments, ctx)
-            else:
-                result = tool.run(call.arguments, ctx)
+            result = self._gate_and_run(call, state, ctx)
             state.record_event(
                 "tool_call",
                 name=call.name,
@@ -245,3 +233,41 @@ class QueryEngine:
         state.messages.append(assistant_tool_calls(calls))
         for tool_call_id, output in results:
             state.messages.append(tool_result(tool_call_id, output))
+
+    def _gate_and_run(
+        self, call: ToolCall, state: AgentState, ctx: ToolContext
+    ) -> ToolResult:
+        """工具调用门禁链：hooks(block-at-submit) → permissions(ask/deny) → 执行 → post hooks。"""
+        tool = self.registry.get(call.name) if call.name in self.registry else None
+        if tool is None:
+            available = ", ".join(self.registry.names())
+            return ToolResult.fail(f"未知工具 {call.name}，可用工具: {available}")
+
+        # 1) PreToolUse hooks：阻断则拦截（信息回喂模型自修复）
+        if self.hooks is not None:
+            block = self.hooks.run_pre(call.name, call.arguments, state)
+            if block is not None:
+                msg = f"[hook 阻断] {block.reason}"
+                if block.hint:
+                    msg += f"\n提示: {block.hint}"
+                return ToolResult.fail(msg)
+
+        # 2) 权限：deny 拒绝；ask 无确认交互时安全默认拒绝（M2-3 起控制台接入）
+        if self.permissions is not None:
+            decision = self.permissions.check(call.name, call.arguments, ctx)
+            if decision is Decision.DENY:
+                return ToolResult.fail(
+                    f"权限拒绝: 未获允许执行 {call.name}（{self.permissions.describe(call.name, call.arguments)}）"
+                )
+            if decision is Decision.ASK:
+                return ToolResult.fail(
+                    f"权限拒绝: {call.name} 需要人工确认，当前无确认交互，已按拒绝处理"
+                )
+
+        # 3) 执行
+        result = tool.run(call.arguments, ctx)
+
+        # 4) PostToolUse hooks（观察/提示，非阻断）
+        if self.hooks is not None:
+            self.hooks.run_post(call.name, call.arguments, result, state)
+        return result
