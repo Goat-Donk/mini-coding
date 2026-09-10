@@ -13,28 +13,31 @@
 - [x] M1-6 `agent/state.py` + `agent/loop.py`：QueryEngine 循环 + 只读并发（验收：`pytest tests/test_loop.py`；`python -m app.cli "读 README 并总结"`）
 - [x] M1-7 测试全部跑通 + `app/cli.py` 最小版（验收：`python -m pytest tests/` 全绿；`python -m app.cli --mock "任务"` 演示）
 - [x] M1-8 首次 commit + push（验收：`git log` 有记录、`git push` 成功）
+- [ ] M1-9 loop 空响应恢复：模型返回空文本自动重试（≤2 次）+ continuation prompt（验收：`pytest tests/test_loop.py::test_empty_response_recovered`）
 
 ## M2 权限 + hooks + 控制台 v1（Day 4–6）
 
-- [ ] M2-1 `agent/permissions.py`：规则文件引擎（allow/deny/ask）+ 危险命令黑名单 + 路径沙箱（验收：`pytest tests/test_permissions.py`；`rm -rf` 被拦/需确认）
+- [ ] M2-1 `agent/permissions.py`：规则文件引擎 + **决策粒度（allow_once/allow_turn/allow_always/deny_once/deny_always/ask）** + 危险命令黑名单 + 路径沙箱（验收：`pytest tests/test_permissions.py`；`rm -rf` 走 ask）
 - [ ] M2-2 `agent/hooks.py`：PreToolUse/PostToolUse 分发 + 内置 block-at-submit 示例（git commit 前检查测试通过标记）（验收：`pytest tests/test_hooks.py`）
 - [ ] M2-3 `app/ui_streamlit.py` v1：实时循环/工具调用/权限确认按钮（验收：`streamlit run app/ui_streamlit.py` 能跑通一个任务）
 - [ ] M2-4 更新 TECH_SPEC（permissions/hooks 规格补全）+ commit + push
 
-## M3 上下文 + 检查点（Day 7–10）★ 两大差异化
+## M3 上下文 + 检查点（Day 7–11）★ 两大差异化 + MiniCode 吸收
 
-- [ ] M3-1 `agent/context.py`：token 预算 + 自动 compact + cache-aware 消息布局（稳定前缀置前）（验收：`pytest tests/test_context.py`；命中率随时间上升）
-- [ ] M3-2 `agent/session.py`：JSONL 轨迹 + 每 N 步检查点 + resume（验收：`pytest tests/test_session.py`；杀进程后 `--resume` 续跑）
-- [ ] M3-3 控制台加指标：缓存命中率/省钱曲线 + 检查点列表（验收：控制台可见指标）
-- [ ] M3-4 更新 TECH_SPEC + commit + push
+- [ ] M3-1 `agent/context.py`：**provider-usage-first 记账**（assistant 消息附 usage + 尾部估算 + 50/85/95% 分级告警）+ **cache-aware 消息布局**（稳定前缀置前）+ 预算（验收：`pytest tests/test_context.py`；命中率曲线上升）
+- [ ] M3-2 `agent/tool_result.py`：**超大工具结果落盘**（>50K 字符 → `data/tool-results/` + 预览替换 `<persisted-output>`；批内预算 200K 兜底）——替代纯截断（验收：`pytest tests/test_tool_result.py`）
+- [ ] M3-3 `agent/context.py` compact 流水线：**确定性 snip compact**（70% 触发、保留最近 12 条、无 LLM）→ **LLM 摘要 compact**（critical 才触发、boundary 对齐 API 轮次、压缩前 usage 标记 stale）（验收：`pytest tests/test_context.py`）
+- [ ] M3-4 `agent/session.py`：JSONL 轨迹 + 每 N 步检查点 + resume（验收：`pytest tests/test_session.py`；杀进程后 `--resume` 续跑）
+- [ ] M3-5 控制台加指标：缓存命中率/省钱曲线 + 检查点列表 + 上下文用量分级（验收：控制台可见指标）
+- [ ] M3-6 更新 TECH_SPEC + commit + push
 
-## M4 记忆 + research 子 agent（Day 11–14）
+## M4 记忆 + research 子 agent（Day 12–15）
 
-- [ ] M4-1 `agent/memory.py`：repo 记忆文件（CLAUDE.md 机制：少而精）+ 任务后提取 + 简化 consolidation（验收：`pytest tests/test_memory.py`；跨会话应用约定）
-- [ ] M4-2 `agent/tools/subagent.py`：research 子 agent（只读嵌套循环、独立上下文、返回结构化报告）（验收：`pytest tests/test_subagent.py`；「探索仓库并总结架构」出报告）
+- [ ] M4-1 `agent/memory.py`：**分层指令文件**（工作区根 MINI.md/CLAUDE.md/.codeagent/rules/*.md + `@include` 解析 + hash 去重 + 每文件 8K/总计 20K 预算）+ **任务后提取 + 简化 consolidation**（跨会话应用约定）（验收：`pytest tests/test_memory.py`）
+- [ ] M4-2 `agent/tools/subagent.py`：research 子 agent（只读嵌套循环、独立上下文、受限工具集、可取消，返回结构化报告）（验收：`pytest tests/test_subagent.py`；「探索仓库并总结架构」出报告）
 - [ ] M4-3 更新 TECH_SPEC + commit + push
 
-## M5 评估 + 控制台打磨（Day 15–18）
+## M5 评估 + 控制台打磨（Day 16–18）
 
 - [ ] M5-1 `eval/golden_tasks.py`：黄金任务集（clone tinydb，从 git history 构造修 bug 任务 + 隐藏测试）
 - [ ] M5-2 `eval/runner.py`：跑任务→测试判定→完成率/成本指标→回归报告（验收：`python -m eval.runner` 出报告）

@@ -454,29 +454,95 @@ class AgentState:
 
 ---
 
-## 6. agent/context.py（◐M1 占位 → M3 补全）
+## 6. agent/context.py（◐M1 占位 → M3 补全，★ 差异化 + MiniCode 吸收）
 
 **文件**：`agent/context.py`（M1 已建文件，功能 M3 实现）
 
+### 6.1 类与数据结构
+
 ```python
+@dataclass
+class ContextStats:
+    total_tokens: int
+    provider_usage_tokens: int      # 最近一次 provider usage 的 total
+    estimated_tokens: int           # usage 之后尾部消息的估算
+    utilization: float              # total / budget
+    warning_level: str              # "normal"(<50%) | "warning"(≥50%) | "critical"(≥85%) | "blocked"(≥95%)
+
 class ContextManager:
-    def __init__(self, llm: BaseLLM, *, token_budget: int = 64000, compact_threshold_ratio: float = 0.85):
-        # token_budget：允许注入模型的最大输入 token（硬预算）
-        # compact_threshold_ratio：达预算 85% 触发 compact（M3）
+    def __init__(self, llm: BaseLLM, *, token_budget: int = 64000,
+                 snip_threshold: float = 0.70, compact_threshold: float = 0.85):
+        ...
     def prepare(self, state: AgentState) -> list[dict]:
-        # M1：原样返回 state.messages（无压缩）
-        # M3：实现 cache-aware 布局 + token 估算 + 超预算 compact（摘要旧消息）
+        # M3 流水线（按序）：
+        # 1) token 记账（provider-usage-first + 尾部估算，见 6.2）
+        # 2) 超过预算 → compact（见 6.3）
+        # 3) cache-aware 布局（见 6.4）
         raise NotImplementedError  # M3 实现后删除
 ```
 
-**M3 规格要点（占位，届时展开）**：
-- **Cache-aware 布局**：稳定前缀置前（system prompt + 全部工具 schema + repo 记忆），易变工具结果置后 → 最大化 DeepSeek 磁盘缓存命中。
-- 缓存命中度量：每次调用后把 `usage.prompt_cache_hit_tokens` 记入事件，控制台画"命中率×步骤"曲线。
-- compact：把最早的 assistant/user 对话对合并成摘要（用 llm.complete），替换原消息。
+### 6.2 provider-usage-first token 记账（MiniCode token-estimator 移植）
+
+- **思路**：assistant 消息后附带本次调用的 `Usage`（在 loop 里 `withProviderUsage` 写入消息）；统计时**从尾部找最近一条有效 usage**，`total = usage.total_tokens + estimate(尾部新增消息)` —— 不需要每步都重算全量。
+- 消息级估算：`estimate_tokens(message)`，按角色给 字符/token 比例（system 3.5 / user 3.0 / assistant 3.5 / tool 2.0）。
+- 分级告警：utilization = total/budget；`normal <0.5 ≤ warning <0.85 ≤ critical <0.95 ≤ blocked`。
+- **compact 后**：保留消息的 usage 标记 stale（state 里记 `usage_stale_reason`），避免旧 usage 计新上下文。
+
+### 6.3 compact 流水线（两级，先确定性后 LLM）
+
+1. **确定性 snip compact**（无 LLM，成本≈0）：utilization ≥ snip_threshold(0.70) 触发。
+   - 从尾部扫描保留最近 N=12 条消息（至少 6 条），其余**中段**删除。
+   - 删除处插入 `snip_boundary` 标记消息（`[已裁剪的历史消息，见会话轨迹]`），让模型知道中间发生了什么。
+   - 对齐：boundary 必须落在完整 API 轮次边界（assistant tool_calls + 其 tool 结果整组），不能切开。
+   - 目标：裁剪后 utilization ≤ 0.60。
+2. **LLM 摘要 compact**（critical/blocked 才触发，M3-3）：用 `llm.complete` 把最早的中段对话压成 `context_summary` 消息。
+   - boundary 对齐 API 轮次；system 消息保留；保留最近消息的 usage 标记 stale。
+   - 摘要 prompt：`build_compact_summary_prompt(conversation_text)`（要求保留：任务目标、关键决策、错误与修复、未完成任务）。
+
+### 6.4 cache-aware 消息布局（我们的独家，叠加在其上）
+
+- **目标**：最大化 DeepSeek 磁盘缓存命中 → 稳定前缀（system + 全部工具 schema + 记忆块）永远在最前且不变。
+- **实现**：`prepare()` 返回的消息顺序 = `[system, 记忆, ...对话消息]`；**不允许** compact/插入把 system 与工具 schema 之间的顺序打乱（工具 schema 由 registry 传入）。
+- 命中度量：每次 llm 调用后把 `usage.prompt_cache_hit_tokens / prompt_cache_miss_tokens` 记入事件，控制台画"命中率×步骤"曲线 + 省钱估算（省省钱 = 命中 token × 单价差）。
+
+### 6.5 测试（tests/test_context.py，M3）
+
+- 记账：mock messages → total 精确值 + 尾部估算正确；warning 分级正确
+- snip：>70% 触发、保留最近 N 条、boundary 对齐不切工具组、裁剪后 ≤60%
+- LLM compact：critical 触发、stale usage 标记、system 保留
+- cache-aware：稳定前缀顺序不被 compact 破坏
 
 ---
 
-## 7. agent/loop.py（★M1 完成）
+## 6b. agent/tool_result.py（M3，MiniCode tool-result-storage 移植）
+
+**文件**：`agent/tool_result.py`
+
+### 6b.1 设计
+
+- **问题**：M1 的 `_truncate` 截断丢弃了超出 MAX_CHARS 的数据（如 grep 100 条、大文件 read），模型拿不到完整信息。
+- **方案**：超大工具输出**落盘**到 `data/tool-results/{session_id}/{tool_call_id}.txt`，上下文里替换为：
+  ```
+  <persisted-output>
+  Output too large (N chars). Full output saved to: data/tool-results/{session}/{id}.txt
+  Preview (first 2000 chars):
+  <预览>
+  </persisted-output>
+  ```
+- 阈值：单条 >50K 字符落盘；**批内预算** 200K/轮（即使单条没超，批总量超限按最大优先落盘）。
+- 同一次运行内替换复用（`replacements: dict[id, str]`），不重复写盘。
+- **接入点**：loop 的 `_execute_tool_calls` 执行结果后调用 `maybe_persist(output) -> 替换文本`；M1 的 `_truncate` 保留给 read/edit 的 diff 展示（可读性），工具结果走落盘。
+
+### 6b.2 测试（tests/test_tool_result.py）
+
+- 大输出落盘：内容写入正确路径，替换文本含预览+路径
+- 小输出不动；批内预算触发时最大优先落盘
+- 同 id 二次出现复用替换不重复写盘
+- session_id 隔离目录
+
+---
+
+## 7. agent/loop.py（★M1 完成 → M1-9 补空响应恢复）
 
 **文件**：`agent/loop.py`
 
@@ -561,6 +627,8 @@ DEFAULT_SYSTEM_PROMPT = f"""\
 - **消息顺序**：assistant tool_calls 消息后跟 N 条 tool 结果消息，顺序与 calls 一致（OpenAI 硬性要求 id 对应）。
 - max_steps 到 → final_text 说明原因（不是假装成功）。
 - 并发结果也要按 calls 顺序回填 tool 结果消息（concurrent.futures as_completed 不可用，需 map 保序）。
+- **空响应恢复（M1-9）**：模型返回空/纯空白文本且无工具调用 → 若 `empty_retry_count < empty_response_retries(2)`，push continuation prompt（"上次返回为空，继续完成下一步或给出最终结论"）重试；达到上限才按 completed(空) 结束。
+- **超大工具结果**：M3 接入 `agent/tool_result.py`，执行结果落盘替换（替代截断）。
 
 ### 7.5 测试（tests/test_loop.py）
 
@@ -587,10 +655,12 @@ DEFAULT_SYSTEM_PROMPT = f"""\
 
 ## 9. 后续里程碑模块规格（占位，届时展开补全）
 
-### 9.1 agent/permissions.py（M2）
-- `PermissionMode`: allow / deny / ask；规则文件 `permissions.json`：`{"tools": {"bash": {"dangerous": "ask"}}, "commands": {...}, "paths": {"allow": [...], "deny": [...]}}`
-- `PermissionsEngine.check(tool_name, arguments, ctx) -> "allow"|"deny"|"ask"`；ask → 回调用户确认（CLI 输入 / Streamlit 按钮）
+### 9.1 agent/permissions.py（M2，含 MiniCode 决策粒度）
+- **决策粒度**（替代原 allow/deny/ask 三态）：`allow_once / allow_turn / allow_always / deny_once / deny_always / ask`。ask 时 CLI/Streamlit 弹确认，用户选一次性/本回合/总是/拒绝。
+- 规则文件 `permissions.json`：`{"tools": {"bash": {"dangerous": "ask"}}, "commands": {...}, "paths": {"allow": [...], "deny": [...]}}`
+- 三类请求：**path**（读/写/列/搜）、**command**、**edit**；每类 allowlist/denylist + 决策记忆（once/turn/always 落内存或文件）
 - 危险命令黑名单从 bash.py 提取共享；路径沙箱复用 files._resolve 语义
+- `PermissionsEngine.check(tool_name, arguments, ctx) -> 决策`；ask → 回调用户确认
 
 ### 9.2 agent/hooks.py（M2）
 - `HookContext`：event_name / tool_name / arguments / result / state
@@ -602,11 +672,13 @@ DEFAULT_SYSTEM_PROMPT = f"""\
 - 检查点：每 N 步写 `data/checkpoints/{session_id}/{step}.json`（messages + state + 快照）
 - `resume(session_id, step)` 恢复状态继续 run；CLI `--resume`
 
-### 9.4 agent/memory.py（M4）
-- repo 记忆文件：`workspace_root/CODEAGENT.md`（不叫 CLAUDE.md 以免与项目冲突）
-- 任务结束提取：llm.complete 从轨迹提炼"仓库约定/经验" → 去重 → 追加/更新记忆文件（少而精、只记可复用约定）
-- 跨会话注入：新会话把记忆文件内容注入 system_prompt
-- 简化 consolidation：去重 + 合并相似条目（不 prune 不调度）
+### 9.4 agent/memory.py（M4，分层指令文件 + 提取，MiniCode 简化移植）
+- **分层指令文件**：在工作区根（workspace_root）发现候选 `CODEAGENT.md` / `MINI.md` / `CLAUDE.md` + `.codeagent/rules/*.md`（不做全局 home 层，只做项目层）。
+- `@include` 解析：`@相对路径` 行递归读取；拒绝绝对路径/`..`；循环检测；缺失给占位注释。
+- 内容 hash 去重（靠后/靠 workspace_root 的优先）；预算渲染：每文件 ≤8K 字符、总计 ≤20K，超限截断 + 提示。
+- 任务结束提取：llm.complete 从轨迹提炼"仓库约定/经验" → 去重 → 追加/更新记忆文件（少而精、只记可复用约定）。
+- 跨会话注入：新会话把记忆文件内容注入 system_prompt（loop 已支持 memory_blocks）。
+- 简化 consolidation：去重 + 合并相似条目（不 prune 不调度）。
 
 ### 9.5 agent/tools/subagent.py（M4）
 - `SubagentInput{task, tools: list[str] = ["glob","grep","read"]}`（只读工具受限）

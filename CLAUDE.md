@@ -21,11 +21,12 @@
 | LLM | agent/llm.py | BaseLLM → DeepSeekClient / MockLLM；usage+cache 采集 |
 | 工具 | agent/tools/ | base(基类+schema) / bash / files(read·write·edit·glob·grep) / subagent |
 | 状态 | agent/state.py | 消息构造（OpenAI 格式）+ AgentState |
-| 上下文 | agent/context.py | cache-aware 布局 + token 预算 + compact（M3） |
-| 权限 | agent/permissions.py | allow/deny/ask 规则引擎 + 黑名单 + 沙箱（M2） |
+| 上下文 | agent/context.py | provider-usage-first 记账 + cache-aware 布局 + snip/LLM compact（M3） |
+| 工具结果 | agent/tool_result.py | 超大工具结果落盘 + 预览替换 + 批预算（M3） |
+| 权限 | agent/permissions.py | once/turn/always 决策粒度 + 黑名单 + 沙箱（M2） |
 | 钩子 | agent/hooks.py | Pre/PostToolUse + block-at-submit（M2） |
 | 会话 | agent/session.py | JSONL 轨迹 + 检查点 + resume（M3） |
-| 记忆 | agent/memory.py | repo 记忆（CLAUDE.md 机制）+ 提取 + 去重（M4） |
+| 记忆 | agent/memory.py | 分层指令文件(@include+去重+预算) + 提取 + 简化 consolidation（M4） |
 | 入口 | app/cli.py · app/ui_streamlit.py | typer CLI / Streamlit 控制台 |
 | 评估 | eval/golden_tasks.py · runner.py | 黄金任务 + 完成率/成本回归（M5） |
 
@@ -51,6 +52,7 @@ streamlit run app/ui_streamlit.py            # 控制台（M2 起）
 
 - CC 源码笔记 → `docs/reference/claude-code-notes.md`（含用户飞书文档《CC》要点）
 - offer-Master 笔记 → `docs/reference/offer-master-notes.md`
+- MiniCode 笔记 → `docs/reference/minicode-notes.md`（长会话上下文治理：落盘/记账/compact/分层记忆/权限粒度）
 - Anthropic 模式 / MCP·A2A 调研 → 见 TECH_SPEC §0 与 reference 笔记
 
 ## 续作三步（clear 对话后从这里开始）
