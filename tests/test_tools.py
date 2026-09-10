@@ -6,12 +6,14 @@
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
 from pydantic import BaseModel
 
 from agent.tools.base import Tool, ToolContext, ToolRegistry, ToolResult
+from agent.tools.files import GlobTool
 
 
 # ---------- 辅助：测试用工具 ----------
@@ -120,3 +122,233 @@ def test_toolresult_ok():
     result = ToolResult.ok("正常", data={"k": 1})
     assert result.success
     assert result.data == {"k": 1}
+
+
+# ---------- registry.default ----------
+
+def test_registry_default_tools(tmp_path):
+    registry = ToolRegistry.default(tmp_path)
+    assert set(registry.names()) == {"bash", "read", "write", "edit", "glob", "grep"}
+    assert {t.name for t in registry.read_only()} == {"read", "glob", "grep"}
+    assert {t.name for t in registry.writable()} == {"bash", "write", "edit"}
+
+
+# ---------- M1-5 bash ----------
+
+@pytest.fixture
+def bash_ctx(tmp_path: Path) -> ToolContext:
+    return make_ctx(tmp_path)
+
+
+def _bash():
+    from agent.tools.bash import BashTool
+    return BashTool()
+
+
+def test_bash_echo(bash_ctx):
+    # Windows 下 cmd /c 会吞双引号、; 是命令分隔符 → 用无空格/引号/分号的 -c 写法
+    result = _bash().run({"command": "python -c print('hello')"}, bash_ctx)
+    assert result.success
+    assert "hello" in result.output
+    assert result.data["exit_code"] == 0
+
+
+@pytest.mark.parametrize("command", ["rm -rf /", "git push origin main"])
+def test_bash_dangerous_rejected(bash_ctx, command):
+    result = _bash().run({"command": command}, bash_ctx)
+    assert not result.success
+    assert "危险" in result.output
+
+
+def test_bash_timeout(bash_ctx):
+    # Windows 用 ping（每包 ~1s，6 包 ≈ 5s），POSIX 用 sleep —— 避开 cmd 对引号/分号的解析
+    cmd = "ping -n 6 127.0.0.1" if os.name == "nt" else "sleep 5"
+    result = _bash().run({"command": cmd, "timeout": 1}, bash_ctx)
+    assert not result.success
+    assert "超时" in result.output
+
+
+def test_bash_cwd_escape(bash_ctx):
+    result = _bash().run({"command": "dir", "cwd": "../outside"}, bash_ctx)
+    assert not result.success
+    assert "越界" in result.output
+
+
+def test_bash_exit_code_not_fail(bash_ctx):
+    result = _bash().run({"command": "python -c exit(3)"}, bash_ctx)
+    assert result.success          # 退出码非 0 不算工具失败
+    assert result.data["exit_code"] == 3
+
+
+def test_bash_needs_permission_dangerous():
+    tool = _bash()
+    assert tool.needs_permission({"command": "rm -rf /"})
+    assert not tool.needs_permission({"command": "python -c 'print(1)'"})
+
+
+# ---------- M1-5 files ----------
+
+@pytest.fixture
+def files_ctx(tmp_path: Path) -> ToolContext:
+    return make_ctx(tmp_path)
+
+
+def _read():
+    from agent.tools.files import ReadTool
+    return ReadTool()
+
+
+def _write():
+    from agent.tools.files import WriteTool
+    return WriteTool()
+
+
+def _edit():
+    from agent.tools.files import EditTool
+    return EditTool()
+
+
+def _glob():
+    from agent.tools.files import GlobTool
+    return GlobTool()
+
+
+def _grep():
+    from agent.tools.files import GrepTool
+    return GrepTool()
+
+
+def test_write_then_read(files_ctx):
+    w = _write().run({"path": "sub/a.txt", "content": "line1\nline2\n"}, files_ctx)
+    assert w.success
+
+    r = _read().run({"path": "sub/a.txt"}, files_ctx)
+    assert r.success
+    assert "1: line1" in r.output
+    assert "2: line2" in r.output
+    assert r.data["total_lines"] == 2
+
+
+def test_read_missing_file(files_ctx):
+    result = _read().run({"path": "nope.txt"}, files_ctx)
+    assert not result.success
+    assert "nope.txt" in result.output
+
+
+def test_read_offset_limit(files_ctx):
+    (files_ctx.workspace_root / "f.txt").write_text("\n".join(f"line{i}" for i in range(10)), encoding="utf-8")
+    result = _read().run({"path": "f.txt", "offset": 2, "limit": 3}, files_ctx)
+    assert "3: line2" in result.output  # 行号 = offset+1
+    assert "6: line5" not in result.output
+
+
+def test_edit_unique(files_ctx):
+    (files_ctx.workspace_root / "f.txt").write_text("a = 1\nb = 2\na = 1\n", encoding="utf-8")
+    result = _edit().run(
+        {"path": "f.txt", "old_string": "b = 2", "new_string": "b = 3"}, files_ctx
+    )
+    assert result.success
+    assert "+b = 3" in result.output      # diff 展示
+    assert "-b = 2" in result.output
+    assert _read().run({"path": "f.txt"}, files_ctx).output.count("b = 3") == 1
+
+
+def test_edit_no_match(files_ctx):
+    (files_ctx.workspace_root / "f.txt").write_text("hello\n", encoding="utf-8")
+    result = _edit().run(
+        {"path": "f.txt", "old_string": "not here", "new_string": "x"}, files_ctx
+    )
+    assert not result.success
+    assert "read" in result.output  # 提示用 read 查看
+
+
+def test_edit_multiple_match(files_ctx):
+    (files_ctx.workspace_root / "f.txt").write_text("a\nb\na\n", encoding="utf-8")
+    result = _edit().run({"path": "f.txt", "old_string": "a", "new_string": "A"}, files_ctx)
+    assert not result.success
+    assert "不唯一" in result.output
+
+    result = _edit().run(
+        {"path": "f.txt", "old_string": "a", "new_string": "A", "replace_all": True}, files_ctx
+    )
+    assert result.success
+    assert result.data["replacements"] == 2
+    assert "A" in _read().run({"path": "f.txt"}, files_ctx).output
+
+
+def test_edit_absolute_path_inside_sandbox(files_ctx):
+    target = files_ctx.workspace_root / "inside.txt"
+    target.write_text("x\n", encoding="utf-8")
+    result = _edit().run({"path": str(target), "old_string": "x", "new_string": "y"}, files_ctx)
+    assert result.success
+
+
+def test_glob_basic(files_ctx):
+    for name in ("a.py", "b.py", "c.txt"):
+        (files_ctx.workspace_root / name).write_text("", encoding="utf-8")
+    (files_ctx.workspace_root / "sub").mkdir()
+    (files_ctx.workspace_root / "sub" / "d.py").write_text("", encoding="utf-8")
+
+    result = _glob().run({"pattern": "**/*.py"}, files_ctx)
+    assert result.success
+    assert "a.py" in result.output
+    assert "sub/d.py" in result.output
+    assert "c.txt" not in result.output
+
+
+def test_glob_truncated(files_ctx):
+    for i in range(GlobTool.MAX_FILES + 20):
+        (files_ctx.workspace_root / f"f{i}.txt").write_text("", encoding="utf-8")
+    result = _glob().run({"pattern": "*.txt"}, files_ctx)
+    assert result.success
+    assert result.data["truncated"]
+    assert "文件过多" in result.output
+
+
+def test_grep_basic(files_ctx):
+    (files_ctx.workspace_root / "a.py").write_text("import os\ndef foo():\n    pass\n", encoding="utf-8")
+    (files_ctx.workspace_root / "b.py").write_text("import sys\n", encoding="utf-8")
+    result = _grep().run({"pattern": r"^import"}, files_ctx)
+    assert result.success
+    assert "a.py:1: import os" in result.output
+    assert "b.py:1: import sys" in result.output
+
+
+def test_grep_include_filter(files_ctx):
+    (files_ctx.workspace_root / "a.py").write_text("import os\n", encoding="utf-8")
+    (files_ctx.workspace_root / "a.md").write_text("import os\n", encoding="utf-8")
+    result = _grep().run({"pattern": "import", "include": "*.py"}, files_ctx)
+    assert "a.md" not in result.output
+    assert "a.py:1: import os" in result.output
+
+
+def test_grep_max_matches(files_ctx):
+    for i in range(10):
+        (files_ctx.workspace_root / f"f{i}.py").write_text("hit\n", encoding="utf-8")
+    result = _grep().run({"pattern": "hit", "max_matches": 3}, files_ctx)
+    assert result.data["truncated"]
+    assert len(result.data["matches"]) == 3
+
+
+def test_grep_skips_git_dir(files_ctx):
+    (files_ctx.workspace_root / ".git").mkdir()
+    (files_ctx.workspace_root / ".git" / "config").write_text("hit\n", encoding="utf-8")
+    result = _grep().run({"pattern": "hit"}, files_ctx)
+    assert "config" not in result.output
+
+
+@pytest.mark.parametrize(
+    "tool, arguments",
+    [
+        ("read", {"path": "../escape.txt"}),
+        ("write", {"path": "../escape.txt", "content": "x"}),
+        ("edit", {"path": "../escape.txt", "old_string": "a", "new_string": "b"}),
+        ("glob", {"pattern": "*", "path": "../outside"}),
+        ("grep", {"pattern": "x", "path": "../outside"}),
+    ],
+)
+def test_path_escape(files_ctx, tool, arguments):
+    tools = {"read": _read, "write": _write, "edit": _edit, "glob": _glob, "grep": _grep}
+    result = tools[tool]().run(arguments, files_ctx)
+    assert not result.success
+    assert "越界" in result.output or "不存在" in result.output
