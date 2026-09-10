@@ -46,3 +46,9 @@ eval/repos/
 # 而假 .env 也不该跟着仓库到处走。数字与结论记录在 TASKS.md，工作区本地留档。
 m7verify/
 m7verify-nolock/
+
+# --- M8 四项机制的真实验证工作区 ---
+# m8verify/：await_user / skills / plan / 分级截断 A/B 的真实轨迹与检查点。
+# 与 m7verify/ 同理不进仓库（真实对话轨迹 + 为制造 token 压力放的样本数据）。
+# 数字与结论记录在 TASKS.md 的 P7 小节，工作区本地留档。
+m8verify/

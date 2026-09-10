@@ -242,7 +242,24 @@ def run(
             if sid is None:
                 typer.secho("没有可恢复的会话检查点（data/checkpoints/ 为空）", fg=typer.colors.YELLOW)
                 raise typer.Exit(1)
-            session, restored = Session.from_checkpoint(workspace_root, sid, step=step)
+            # `checkpoint_every` **必须转发**：`from_checkpoint` 的默认值是 5，而这条
+            # 路径原先没传 —— 于是 `--resume --checkpoint-every 1` 会静默回落到
+            # "每 5 步一次"。后果不是报错，而是**恢复出来的这一段一步都不落盘**：
+            # 真跑现场是 kill 在 step 5（检查点 [1..5]），`--resume` 接着跑到 step 9，
+            # 结束时的检查点数**还是 5** —— 4 步工作全在内存里，再崩一次就整段丢。
+            # 而"计划清单跨回合"恰恰是为这种场景准备的。修好后同一段跑出 [1..10]。
+            # 回落的那条路也有测试钉着（tests/test_cli.py::test_resume_honors_checkpoint_every）。
+            session, restored = Session.from_checkpoint(
+                workspace_root, sid, step=step, checkpoint_every=checkpoint_every
+            )
+            # 先接上事件出口，**再**记下面的 resume 事件。`record_event` 只在
+            # `state.emitter` 非空时才写 JSONL，而 emitter 原先要等 `run_from` 才被
+            # 引擎接上（`loop.py` 里 `state.emitter = self._make_emitter()`）——
+            # 于是 `taint_cleared` / `plan_resumed` / `resume_instruction` 这三条
+            # 恢复期事件一条都进不了轨迹（`clear_taint` 的注释里写的"同时往轨迹里
+            # 记一条"因此是假的）。引擎启动时会重新接一个"session + 实时回调"的组合
+            # 出口，这里先接 session 那半边不会写重复：两边写的是不同的事件。
+            restored.emitter = session.emit
             engine = QueryEngine(
                 llm, registry, workspace_root=workspace_root, context=context,
                 session=session, memory_blocks=memory_blocks, on_event=printer,

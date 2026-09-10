@@ -229,6 +229,66 @@ def test_custom_system_prompt_with_braces_does_not_crash(tmp_path):
     assert "{未知槽位}" in seen["system"]             # 未知槽位不报错、不消失
 
 
+# ---------- M8-P7：真跑验证挖出的"机制在、但没人把模型引向它" ----------
+
+def _capture_system_prompt(tmp_path, registry) -> str:
+    """跑一个只回文本的假模型，把 system prompt 截回来。"""
+    seen = {}
+
+    def capture(messages, tools):
+        seen["system"] = messages[0]["content"]
+        return LLMResult(content="ok")
+
+    QueryEngine(MockLLM([capture]), registry, workspace_root=tmp_path).run("任务")
+    return seen["system"]
+
+
+def test_default_system_prompt_points_at_update_plan():
+    """计划那一条必须**点名工具**，否则模型只会写正文、从不调 `update_plan`。
+
+    这是真跑验证挖出来的（2026-09-11，DeepSeek 官方通路）：给一个明确三步的任务，
+    模型 6 步做完了全部三件事，但 `update_plan` 调用次数是 **0** —— 原 prompt 只说
+    「先用 3~6 步的简短计划」，它写不写正文都算满足，于是"计划清单跨回合"这个
+    能力在真跑里一次都没被触发过（连正文计划都没写）。机制、单测、文档都在，
+    缺的是**把模型引向它的那一句话**。
+
+    `update_plan` 在 `ToolRegistry.default()` 里，每个入口都有，所以可以无条件点名。
+    """
+    assert "`update_plan`" in DEFAULT_SYSTEM_PROMPT
+
+
+def test_ask_user_hint_follows_whether_the_tool_is_registered(tmp_path):
+    """`{ask_user_hint}` 要跟着**注册表**走，因为 ask_user 是按入口注册的。
+
+    `eval/runner.py` 用的 `ToolRegistry.default()` 里**刻意没有** ask_user
+    （headless 没人能回答）。prompt 若写死「用 ask_user 提问」，评测里模型就会去调
+    一个不存在的工具 —— 后果不是报错，而是白费一步（`_gate_and_run` 回喂「未知工具」
+    并列出可用工具，模型再改道）。所以两种情形都要钉住。
+    """
+    without = _capture_system_prompt(tmp_path, ToolRegistry.default(tmp_path))
+    assert "{ask_user_hint}" not in without                  # 槽位必须被填掉
+    assert "`ask_user`" not in without                       # 没有工具就不提它
+
+    registry = ToolRegistry.default(tmp_path)
+    registry.register(build_ask_tool())
+    with_tool = _capture_system_prompt(tmp_path, registry)
+    assert "{ask_user_hint}" not in with_tool
+    assert "`ask_user`" in with_tool                         # 有工具才点它的名
+
+
+def test_no_system_prompt_slot_is_left_unfilled(tmp_path):
+    """所有槽位都要被填掉。漏一个的表现是模型读到字面量 `{xxx}` 而不是内容 ——
+    不报错，只是那一段提示等于不存在。"""
+    registry = ToolRegistry.default(tmp_path)
+    registry.register(build_ask_tool())
+    system_prompt = _capture_system_prompt(tmp_path, registry)
+    for slot in (
+        "{workspace_root}", "{platform}", "{repo_memory_block}",
+        "{skills_block}", "{ask_user_hint}",
+    ):
+        assert slot not in system_prompt, f"{slot} 没被填"
+
+
 def test_on_event_receives_events_in_order(tmp_path):
     """on_event 实时回调：按发生顺序收到每个事件（CLI 流式输出靠它）。"""
     (tmp_path / "a.txt").write_text("hello\n", encoding="utf-8")

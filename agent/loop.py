@@ -61,10 +61,12 @@ DEFAULT_SYSTEM_PROMPT = """\
 
 工作方式：
 - 先用工具探索（glob/grep/read）理解代码，再动手修改；不要臆测文件内容。
-- 修改代码前，如果任务复杂，先用 3~6 步的简短计划（仅步骤与验证方式，不要冗长）。
+- 任务复杂时，先调 `update_plan` 排一份 3~6 步的简短计划（只写步骤与验证方式，不要冗长），
+  之后每完成一步就更新它。这份清单会随检查点落盘 —— 任务中途被打断时，它就是你恢复进度的依据。
 - 小改动用 edit（精确匹配），大改动用 write；完成后运行测试验证。
 - 每条消息最多做必要的工具调用；工具失败时根据错误信息自行修复后重试。
 - 工具返回里带 `[exit code: N]`，N≠0 表示命令没成功 —— 先看错误信息定位原因，不要重复同样的调用。
+{ask_user_hint}
 
 硬性约束：
 - 只能在工作目录（沙箱）内操作，禁止访问沙箱外路径。
@@ -76,6 +78,19 @@ DEFAULT_SYSTEM_PROMPT = """\
 {repo_memory_block}
 
 {skills_block}"""
+
+#: `{ask_user_hint}` 槽位的两个取值 —— 取决于 `ask_user` **这次有没有被注册**。
+#:
+#: 为什么要分两种写法，而不是把这句话写死在 prompt 里：`ask_user` 是**按入口注册**的
+#: （`eval/runner.py` 用 `ToolRegistry.default()`，里面刻意没有它）。写死的话，headless
+#: 评测里模型会去调一个不存在的工具 —— 后果不是报错，而是**白白浪费一步**（`_gate_and_run`
+#: 返回「未知工具」并把可用工具名回喂，模型再改道）。这正是真跑验证时发现的那类问题：
+#: 机制在，但没有任何东西把模型引向它；而引错了方向同样无声无息。
+_ASK_USER_HINT = (
+    "- 信息不足、需求有歧义、或者有不可逆的选择要人拍板时，**调 `ask_user` 提问**，"
+    "不要靠猜 —— 猜错的代价由提需求的人承担。"
+)
+_NO_ASK_USER_HINT = ""   # 没有这个工具时整行消失（槽位本身仍在，见 test_loop.py 的断言）
 
 
 def _platform_hint() -> str:
@@ -310,6 +325,11 @@ class QueryEngine:
             "platform": _platform_hint(),
             "repo_memory_block": memory_block,
             "skills_block": render_skills_block(self.skills) if self.skills else "",
+            # 按**实际注册了哪些工具**填这一行：见 `_ASK_USER_HINT` 的说明。
+            # 渲染一次就随 `state.system_prompt` 进检查点，所以不会每轮变。
+            "ask_user_hint": (
+                _ASK_USER_HINT if "ask_user" in self.registry.names() else _NO_ASK_USER_HINT
+            ),
         }
         prompt = self.system_prompt
         for name, value in slots.items():

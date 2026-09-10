@@ -481,3 +481,101 @@ def test_cli_skills_reach_the_system_prompt(tmp_path, monkeypatch):
     system = seen_system[-1]
     assert "release" in system and "发布三步走" in system   # 索引进了提示词
     assert "正文独有内容-zz9" not in system                  # 正文没进
+
+
+# ---------- M8-P7：`--resume` 这一段的持久性（真跑验证挖出来的两处） ----------
+
+def _distinct_reads(start: int, count: int):
+    """count 次**各不相同**的只读调用 —— 循环检测认的是"连续 4 次相同调用"，
+    所以验证步数时不能用同一个调用重复 N 次（会被 loop_detected 提前掐掉，
+    那样测出来的是检测器而不是被测的机制）。"""
+    letters = "abcdefgh"
+    return [
+        MockLLM.tool("read", {"path": f"{letters[(start + i) % 8]}.txt"}).responses[0]
+        for i in range(count)
+    ]
+
+
+def test_resume_honors_checkpoint_every(tmp_path, monkeypatch):
+    """`--resume --checkpoint-every 1` 必须真按 1 步一存，不能静默回落到 5。
+
+    这条是 P7-c 真跑验证挖出来的：`Session.from_checkpoint` 的默认
+    `checkpoint_every=5`，而 `--resume` 分支**没把这个参数传下去** —— 于是
+    一个用 `--checkpoint-every 1` 起的会话，崩了之后恢复出来的那一段一步都不落盘。
+    真实现场：kill 在 step 5（检查点 step-1..5），`--resume` 接着跑到 step 9，
+    结束时的检查点数**还是 5** —— 4 步工作全在内存里，再崩一次就没了。
+    而"计划清单跨回合"恰恰是为这种场景准备的，所以这不是边角料。
+
+    "静默"是这条最值得钉的地方：命令跑成功了、输出正常、退出码 0，
+    唯一的证据是检查点数没涨。
+    """
+    for letter in "abcdefgh":
+        (tmp_path / f"{letter}.txt").write_text(f"{letter}\n", encoding="utf-8")
+
+    first = _invoke(
+        tmp_path, monkeypatch,
+        MockLLM.script(*_distinct_reads(0, 1), LLMResult(content="第一段结束")),
+        extra_args=("--checkpoint-every", "1"),
+    )
+    assert first.exit_code == 0, first.output
+
+    from agent.session import Session, latest_session
+
+    sid = latest_session(tmp_path)
+    assert Session(tmp_path, sid).list_checkpoints() == [1]
+
+    second = _invoke(
+        tmp_path, monkeypatch,
+        MockLLM.script(*_distinct_reads(1, 3), LLMResult(content="续跑结束")),
+        extra_args=("--resume", "--checkpoint-every", "1"),
+    )
+    assert second.exit_code == 0, second.output
+
+    # 续跑跑了 step 2/3/4 → 每步一存就该是 [1,2,3,4]；
+    # 回落成 5 的话这一步都写不出来（原样 [1]）
+    assert Session(tmp_path, sid).list_checkpoints() == [1, 2, 3, 4]
+
+
+def test_resume_events_reach_the_trajectory(tmp_path, monkeypatch):
+    """恢复期记的三条事件（taint_cleared / plan_resumed / resume_instruction）必须落进 JSONL。
+
+    `record_event` 的行为是「设了 `state.emitter` 才写轨迹」，而 emitter 原先要等
+    引擎启动（`loop.py` 的 `state.emitter = self._make_emitter()`）才被接上 ——
+    这三条全在 `run_from` **之前**记，于是**一条都进不了轨迹**。`clear_taint`
+    的注释里那句"它同时往轨迹里记一条 taint_cleared"因此是假的。
+
+    为什么值得单独钉：轨迹 JSONL 是这个项目里"当时发生了什么"的**唯一append-only
+    记录**（`--plan` 读检查点、`replay.py` 读它、审计也读它）。少一条
+    `plan_resumed`，读轨迹的人看到的是"模型突然按一份没来源的计划往下做"。
+    """
+    import json
+
+    from agent.session import latest_session
+
+    workspace = tmp_path
+    first_llm = MockLLM.script(
+        LLMResult(content=None, tool_calls=[ToolCall(
+            id="c1", name="update_plan",
+            arguments={"items": ["读 README", "改 a.txt"], "statuses": ["in_progress", "pending"]},
+        )]),
+        LLMResult(content="排好计划了"),
+    )
+    assert _invoke(
+        workspace, monkeypatch, first_llm, extra_args=("--checkpoint-every", "1")
+    ).exit_code == 0
+
+    sid = latest_session(workspace)
+    second = _invoke(
+        workspace, monkeypatch,
+        MockLLM.script(LLMResult(content="继续做完了")),
+        extra_args=("--resume", "--clear-taint"),
+        task="接着做",
+    )
+    assert second.exit_code == 0, second.output
+    assert "计划恢复: 2 条" in second.output
+
+    trajectory = workspace / "data" / "sessions" / f"{sid}.jsonl"
+    kinds = [json.loads(line)["type"] for line in trajectory.read_text(encoding="utf-8").splitlines()]
+    assert "plan_resumed" in kinds, f"计划恢复这件事没进轨迹：{kinds}"
+    assert "resume_instruction" in kinds, f"续跑指示没进轨迹：{kinds}"
+    assert "taint_cleared" in kinds, f"人工复位没进轨迹：{kinds}"
