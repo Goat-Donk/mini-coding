@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 from agent.context import ContextManager
 from agent.llm import BaseLLM, DeepSeekClient, LLMResult, MockLLM, ToolCall
 from agent.loop import QueryEngine
+from agent.memory import MemoryManager
 from agent.session import Session, latest_session, new_session_id
 from agent.tools.base import ToolRegistry
 
@@ -63,6 +64,13 @@ def run(
     llm = _build_llm(mock)
     registry = ToolRegistry.default(workspace_root)
     context = ContextManager(llm)  # M3-1 provider-usage-first 记账
+    # M4-1 记忆：启动注入工作区记忆块；任务后提取约定（mock 模式不提取，保持脚本确定性）
+    memory = MemoryManager(workspace_root, llm=None if mock else llm)
+    memory_blocks = memory.blocks()
+    if memory_blocks:
+        typer.secho(
+            f"记忆注入: {len(memory_blocks)} 个记忆块", fg=typer.colors.BRIGHT_BLACK
+        )
 
     if resume:
         sid = session_id or latest_session(workspace_root)
@@ -71,7 +79,8 @@ def run(
             raise typer.Exit(1)
         session, restored = Session.from_checkpoint(workspace_root, sid, step=step)
         engine = QueryEngine(
-            llm, registry, workspace_root=workspace_root, context=context, session=session
+            llm, registry, workspace_root=workspace_root, context=context,
+            session=session, memory_blocks=memory_blocks,
         )
         typer.secho(
             f"恢复会话 {sid}（step {restored.step}）→ 续跑", fg=typer.colors.CYAN, bold=True
@@ -80,11 +89,21 @@ def run(
     else:
         session = Session(workspace_root, new_session_id(), checkpoint_every=checkpoint_every)
         engine = QueryEngine(
-            llm, registry, workspace_root=workspace_root, context=context, session=session
+            llm, registry, workspace_root=workspace_root, context=context,
+            session=session, memory_blocks=memory_blocks,
         )
         typer.secho(f"会话: {session.session_id}", fg=typer.colors.CYAN, bold=True)
         typer.secho(f"任务: {task}", fg=typer.colors.CYAN, bold=True)
         result = engine.run(task)
+
+    # M4-1 任务后提取：把轨迹里可复用的约定写回 learned.md（跨会话生效）
+    if not mock:
+        learned = memory.extract_and_learn(result.events)
+        if learned:
+            typer.secho(
+                f"已提炼 {len(learned)} 条仓库约定 → .codeagent/rules/learned.md",
+                fg=typer.colors.GREEN,
+            )
 
     typer.secho(f"工作目录: {workspace_root}", fg=typer.colors.BRIGHT_BLACK)
     typer.secho("---", fg=typer.colors.BRIGHT_BLACK)
