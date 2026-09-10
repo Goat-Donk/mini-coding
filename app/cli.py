@@ -46,7 +46,7 @@ def _build_llm(mock: bool) -> BaseLLM:
 
 @app.command()
 def run(
-    task: str,
+    task: str = typer.Argument("", help="任务描述（--resume 时可省略，任务从检查点恢复）"),
     mock: bool = typer.Option(False, "--mock", help="无 key 演示"),
     resume: bool = typer.Option(False, "--resume", help="从检查点续跑（不新建会话）"),
     session_id: str | None = typer.Option(
@@ -63,6 +63,12 @@ def run(
     ),
 ):
     """在 workspace 内执行一个任务（或从检查点续跑）。"""
+    if not resume and not task.strip():
+        typer.secho(
+            '请提供任务描述，例如：python -m app.cli "读 README 并总结项目结构"',
+            fg=typer.colors.YELLOW,
+        )
+        raise typer.Exit(1)
     workspace_root = _default_workspace()
     workspace_root.mkdir(parents=True, exist_ok=True)
 
