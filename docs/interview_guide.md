@@ -7,7 +7,7 @@
 
 ## 0. 一分钟版本（开场白）
 
-> 我写了一个小型 AI Coding Agent，叫 CodeAgent，参考 Claude Code 的架构用 Python 从零实现，3,600 多行、156 个测试。
+> 我写了一个小型 AI Coding Agent，叫 CodeAgent，参考 Claude Code 的架构用 Python 从零实现，4,000 行、168 个测试。
 > **核心循环是手写的**——没有用 LangGraph 或 Agent SDK，因为我想搞清楚 agent 的循环、上下文治理、权限这些底层是怎么运作的。
 > 我重点解决的是长会话里真正会出问题的地方：上下文怎么不爆、DeepSeek 的缓存怎么持续命中省钱、进程被杀怎么续跑、记忆怎么跨会话生效、以及**改得对不对由谁来判**。
 > 最后我给它配了一套真实仓库的评估：从 tinydb 的 git history 里挖真实的 bug 修复提交当题目，用隐藏测试判分，出完成率和成本报告。
@@ -199,11 +199,36 @@ else:
 > 上下文治理里的**记账准确性**。一开始我按消息全量估算 token，但估算偏差会累积，导致 compact 触发时机完全不对——要么该压不压（爆上下文），要么过早压（白丢信息）。改成 provider 实测值做锚点、只估尾部之后，触发时机才稳定。另一个坑是 compact 后忘了把旧 usage 标 stale，结果用压缩前的 usage 度量压缩后的上下文，utilization 直接算错。
 
 **Q：下一步会做什么？**
-> MCP 客户端——让工具层能接标准 MCP server（Claude Code 的工具生态就是这个）。我的权限/hooks 是分成独立层的，MCP 工具进来能直接复用这两层，不需要改循环。
+> 三个方向：
+> ① **MCP 的 HTTP/SSE 传输**——现在只做了 stdio（本地 server），远端 MCP server 走 HTTP，协议层可复用，只换传输；
+> ② **子代理并发**——现在 research 子代理是单发的，可以做成最多 3 个并发（各自独立上下文），适合「同时调研 3 个模块」这类任务；
+> ③ **评估集扩容**——现在只跑 tinydb 一个仓库，接更多仓库能让完成率更有统计意义。
 
 ---
 
-## 11. 现场演示动线（5 分钟）
+## 11. MCP 客户端（工具生态）
+
+**做了什么**：手写了一个最小 MCP 客户端，能把标准 MCP server 的工具接进来当普通工具用。
+
+**为什么手写而不用官方 `mcp` SDK**（这题一定会被问）：
+> ① 官方 SDK 是 **async**（anyio）的，而我的 QueryEngine 是**同步**循环——为了一个工具把整条循环改成 async 不划算，同步版本阻抗最小；
+> ② MCP 的 stdio 传输就是「JSON-RPC 2.0 按行分隔」，协议面很窄（`initialize` / `tools/list` / `tools/call`），手写一遍比封一层 SDK 更透明；
+> ③ 不引入新依赖。
+
+**一个真实的工程坑**：读管道**没法设超时**（Windows 上 `select` 也不支持 pipe）。我的解法是给 stdout/stderr 各起一个后台线程持续抽干：stdout 抽到队列里，请求按 `id` 去队列里取（`queue.get(timeout=...)` 天然支持超时）；stderr 抽到环形缓冲——这样出错时能把 **server 自己的报错**带进异常信息，而不是干巴巴一句"超时"。
+
+**安全边界（这是我认为最该讲的一点）**：MCP 工具来自第三方 server，**不受我的 workspace 沙箱约束**。所以：
+1. **必须显式配置才注册**（`--mcp`），不进默认工具集；
+2. 只读性**只信 server 声明的 `annotations.readOnlyHint`**，没声明就当可写 → 串行执行，绝不并发跑未知副作用；
+3. **但它们照样走 `_gate_and_run` 门禁链**——权限引擎和 hooks 对 MCP 工具同样生效。
+
+第 3 点是**分层设计的回报**：接入一个全新的工具来源，循环一行都不用改。如果权限和 hooks 是写死在循环里的，这里就得动核心代码。
+
+**测试怎么做**：写了一个**真实的假 MCP server**（`tests/fake_mcp_server.py`）——真子进程、真管道、真 JSON-RPC 往返。所以测试能覆盖握手、跨进程读超时、server 中途崩溃这些**只有真进程才会暴露**的问题。还有一个测试让 MCP 工具**经真实 QueryEngine 循环**被调用，验证集成而不只是协议。
+
+---
+
+## 12. 现场演示动线（5 分钟）
 
 1. **无 key 演示**（30 秒）：`python -m app.cli --mock "读 README 并总结项目结构"` — 真实执行 glob，Mock 给结论
 2. **危险命令拦截**（30 秒）：让 agent 跑 `rm -rf /`，看 bash 工具的危险模式匹配直接拒绝，**并给出安全替代方案**（"请改用 read + edit"）——不是干巴巴一句"禁止"
@@ -211,3 +236,4 @@ else:
 4. **崩溃恢复**（1.5 分钟）：跑长任务 → 中途 `Ctrl+C` → `--resume` 接着跑完，展示检查点文件
 5. **控制台**（1.5 分钟）：`streamlit run app/ui_streamlit.py` — 缓存命中率曲线 + 省钱估算 + 检查点回放
 6. **评估**（可选）：`python -m eval.runner --limit 2 --mock` — 展示报告的诚实判定（0% = mock 真没修 bug）
+7. **MCP**（可选）：`python -m app.cli --mock --mcp .codeagent/mcp.json "任务"` — 看第三方工具被注册进工具集并走同一套门禁

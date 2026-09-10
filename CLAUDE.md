@@ -27,7 +27,8 @@
 | 钩子 | agent/hooks.py | Pre/PostToolUse + block-at-submit（M2） |
 | 会话 | agent/session.py | JSONL 轨迹 + 检查点 + resume（M3） |
 | 记忆 | agent/memory.py | 分层指令文件(@include+去重+预算) + 提取 + 简化 consolidation（M4） |
-| 入口 | app/cli.py · app/ui_streamlit.py | typer CLI / Streamlit 控制台 |
+| MCP | agent/mcp.py | 手写 MCP stdio 客户端 + 工具适配器（第三方工具照样过权限/hooks）（M6） |
+| 入口 | app/cli.py · app/ui_streamlit.py · app/replay.py | typer CLI / Streamlit 控制台 / 检查点回放 |
 | 评估 | eval/golden_tasks.py · runner.py | 黄金任务 + 完成率/成本回归（M5） |
 
 ## 常用命令

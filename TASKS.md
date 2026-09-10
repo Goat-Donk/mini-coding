@@ -48,7 +48,7 @@
 
 - [x] M6-1 README 完善（mermaid 架构图）+ docs/architecture.md（逐层对应 CC 源码）
 - [x] M6-2 docs/interview_guide.md（面试讲解稿）
-- [ ] M6-3 （有余力）MCP 客户端接入一个标准 MCP server
+- [x] M6-3 MCP 客户端接入一个标准 MCP server
 - [ ] M6-4 录制演示视频（修 bug → 加功能 → 杀进程恢复 → 跨会话记忆）
 - [ ] M6-5 收尾：CLAUDE.md 精简为 Lean 约定版 + 最终 commit/push
 

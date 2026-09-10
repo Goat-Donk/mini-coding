@@ -248,6 +248,26 @@ class Tool:
 | `glob` / `grep` | 结果截断 + 明确提示「还有更多」（照搬 CC 的 `TRUNCATED_MESSAGE`——**截断必须可感知**，否则模型以为看全了） |
 | `subagent` | research 子代理（下节） |
 
+### MCP 接入（`agent/mcp.py`，M6-3）
+
+标准 MCP server 的工具也能接进来当普通工具用——**重点是它不需要改循环**：
+
+```mermaid
+flowchart LR
+    A[".codeagent/mcp.json<br/>显式配置"] --> B["MCPClient.start()<br/>Popen + initialize 握手"]
+    B --> C["tools/list<br/>远端工具描述"]
+    C --> D["MCPToolAdapter<br/>包成本项目的 Tool"]
+    D --> E["ToolRegistry"]
+    E --> F["QueryEngine._gate_and_run<br/>hooks → permissions → 执行"]
+    F --> G["tools/call<br/>JSON-RPC 到子进程"]
+```
+
+- **必须显式配置才注册**（第三方 server 不受 workspace 沙箱约束，绝不进 `ToolRegistry.default`）；
+- 只读性**只信 server 声明的 `annotations.readOnlyHint`**，没声明就当可写 → 串行执行；
+- 但**照样过权限与 hooks**——这是把治理做成独立层的直接回报。
+
+传输实现的两个要点：stdout/stderr 各一个后台线程抽干（管道阻塞读没法设超时，Windows 上 `select` 也不支持 pipe），stdout → 队列（请求按 id 关联，`queue.get(timeout)` 天然支持超时），stderr → 环形缓冲（出错时带上 server 的真实报错）。适配器覆写 `schema()`（用远端 `inputSchema`）与 `run()`（跳过本地 pydantic 校验，参数原样透传——远端才是权威校验方）。
+
 ### research 子代理（`agent/tools/subagent.py`）
 
 上下文经济学：一个复杂探索需要输入 X、过程累积 Y、产出结论 Z。跑 N 个，主上下文会累积 `(X+Y+Z)×N`；子代理把 `(X+Y)×N` 外包，主上下文只收 Z。
@@ -307,6 +327,7 @@ flowchart LR
 | SubAgent 只回结论 | `agent/tools/subagent.py` | 单 research 子代理，只读白名单，无递归 |
 | block-at-submit hooks | `agent/hooks.py` | 一致（git commit 检查测试标记） |
 | `/resume` + JSONL 轨迹 | `agent/session.py` | 做到 **step 级**检查点，可任务中途续跑 |
+| MCP 工具接入 | `agent/mcp.py` | 手写同步 stdio 客户端（官方 SDK 是 async，与同步循环阻抗大）；MCP 工具走同一套权限/hooks |
 | （无） | `eval/` | Claude Code 没有内置评估；本项目加了轨迹驱动评估 |
 | CONTEXT_COLLAPSE 等五种压缩 | `context.py` 两级 compact | 只做 snip + LLM 摘要（复杂度/收益比最优） |
 

@@ -868,6 +868,53 @@ def render_message(message: dict) -> str    # tool 结果截断 500；tool_calls
 - 测试：tests/test_ui_replay.py（6 个：消息渲染/tool 截断/多模态兜底/会话排序/步骤读取/
   AppTest 无异常 + 回放区出现该会话）。
 
+### 9.8 agent/mcp.py（M6-3 已实现：MCP 客户端，有余力项）
+
+```python
+PROTOCOL_VERSION = "2025-06-18";  DEFAULT_TIMEOUT = 20.0
+
+class MCPError(RuntimeError): ...
+
+class MCPClient:
+    def __init__(self, command: list[str], *, name="mcp", timeout=20.0, cwd=None): ...
+    def start(self) -> MCPClient          # Popen + initialize 握手 + initialized 通知
+    def list_tools(self) -> list[dict]    # tools/list → [{name, description, inputSchema, annotations}]
+    def call_tool(self, name, arguments) -> ToolResult   # tools/call → content 拍平成文本
+    def close(self) -> None               # 关 stdin → terminate → kill 兜底
+    def __enter__/__exit__                # with 用法
+    server_info: dict;  protocol_version: str | None
+
+class MCPToolAdapter(Tool):
+    input_model = BaseModel               # 占位：schema/run 均覆写
+    def is_read_only(self) -> bool        # 只信 server 的 annotations.readOnlyHint，默认 False
+    def schema(self) -> dict              # 用远端 inputSchema，不从 pydantic 生成
+    def run(self, arguments, ctx) -> ToolResult   # 跳过本地校验，参数原样透传
+
+def load_mcp_servers(config_path, registry, *, workspace_root=None) -> tuple[list[MCPClient], list[str]]
+def _flatten_content(content) -> str      # text 拼接；resource/其它类型给可读占位（不静默丢）
+```
+
+- **为什么手写而非用官方 `mcp` SDK**：官方 SDK 是 async（anyio），而 QueryEngine 是同步循环，
+  为一个工具把整条循环改成 async 不划算；MCP stdio 就是「JSON-RPC 2.0 按行分隔」，
+  协议面很窄（3 个方法），手写更透明且不引入新依赖。
+- **传输实现**：stdout/stderr 各一个后台线程抽干（管道阻塞读没法设超时，Windows 上
+  `select` 也不支持 pipe）；stdout → 队列，请求按 `id` 关联响应；stderr → 环形缓冲
+  （40 行），出错时把 server 的真实报错带进异常信息，而不是干巴巴一句"超时"。
+- **安全边界（重要）**：MCP 工具来自第三方 server，**不受 workspace 沙箱约束**。所以
+  ① 必须显式配置（`--mcp`）才注册，不进 `ToolRegistry.default`；
+  ② 只读性只信 server 声明的 `readOnlyHint`，没声明就当可写（串行，绝不并发跑未知副作用）；
+  ③ 但它们**照样走 `_gate_and_run` 门禁链**——hooks 与权限引擎对 MCP 工具同样生效。
+  这正是把权限/钩子做成独立层的回报：接入新工具来源无需改循环。
+- **配置**（`.codeagent/mcp.json`）：
+  `{"servers": {"<别名>": {"command": ["python","-m","some_server"], "timeout": 20}}}`
+- **容错**：单个 server 启动失败/崩溃只打印 stderr 提示并跳过，不影响其它 server 与主流程
+  （MCP 是增强项，不该成为启动路径上的单点故障）；与内置工具重名时加 `<别名>__` 前缀，
+  **不静默遮蔽**内置工具。客户端由调用方 `close()`（子进程 + 管道是资源，不等 GC）。
+- 测试：tests/test_mcp.py（12 个）+ tests/fake_mcp_server.py——**真子进程、真管道、
+  真 JSON-RPC**（不是 mock）：握手/列工具/成功·isError·未知工具/只读注解透传/
+  跳过本地校验/重名加前缀/坏 server 不炸主流程/崩溃与超时诊断/**经真实 QueryEngine
+  循环调用 MCP 工具**。
+
 ---
 
 ## 10. 验收总命令
@@ -879,5 +926,6 @@ python -m app.cli "给 README 加一行说明并验证"     # 真实 DeepSeek（
 python -m eval.golden_tasks --clone --limit 10   # M5-1：拉 tinydb 并列出真实 fix 提交
 python -m eval.runner --limit 3                  # M5-2：真实跑 3 个黄金任务出回归报告
 python -m eval.runner --limit 2 --mock           # M5-2 无 key 冒烟（judge 会如实失败）
+python -m app.cli --mcp .codeagent/mcp.json "任务"  # M6-3 加载 MCP server 后执行任务
 streamlit run app/ui_streamlit.py               # M2-3 控制台（含 M5-3 检查点回放）
 ```

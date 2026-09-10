@@ -4,7 +4,7 @@
 **核心循环手写**（不套 LangGraph / Agent SDK），支撑层用成熟库（openai SDK / pydantic v2 / streamlit / typer / pytest）。
 
 > **一句话**：把 Claude Code 的架构用 Python 重写一遍——不是移植代码，是移植设计。
-> 3,645 行源码 / 18 个模块 / 156 个测试。
+> 4,017 行源码 / 19 个模块 / 168 个测试。
 
 📄 文档：[技术方案 `docs/TECH_SPEC.md`](docs/TECH_SPEC.md) · [架构详解 `docs/architecture.md`](docs/architecture.md) · [任务清单 `TASKS.md`](TASKS.md) · [参考笔记 `docs/reference/`](docs/reference/)
 
@@ -22,6 +22,7 @@
 | **真·轨迹驱动评估** | 从 tinydb 真实 git history 挖 bug 修复提交构造黄金任务，隐藏测试判分，出完成率/成本回归报告 | SWE-bench 思路 |
 | **分层记忆 + 自进化** | `CODEAGENT.md` / `CLAUDE.md` / `.codeagent/rules/*.md` 分层 + `@include` + hash 去重 + 预算；任务后提取约定写回，**下次会话自动生效** | CLAUDE.md 机制 |
 | **research 子代理** | 把 `(X+Y)×N` 的探索外包，主上下文只收结论 `Z`；子代理只读、无 subagent 工具（天然禁递归） | SubAgent 上下文经济学 |
+| **MCP 客户端** | 手写 MCP stdio 客户端接入标准 MCP server；**第三方工具照样过权限与 hooks**（分层设计的回报） | MCP（工具接入标准） |
 
 另外吸收了 [MiniCode](https://github.com/LiuMengxuan04/MiniCode) 的长会话治理经验：provider-usage-first token 记账、超大工具结果落盘+预览、确定性 snip 裁剪、空响应重试、细粒度权限决策。
 
@@ -136,7 +137,17 @@ streamlit run app/ui_streamlit.py        # 控制台，勾选「Mock 演示」
 ```bash
 python -m app.cli "给 README 加一行说明并验证"
 python -m app.cli --resume               # 从最近检查点续跑（配合 Ctrl+C 杀进程演示）
+python -m app.cli --mcp .codeagent/mcp.json "任务"   # 加载 MCP server（第三方工具）
 ```
+
+**接 MCP server**（`.codeagent/mcp.json`）：
+
+```json
+{"servers": {"fs": {"command": ["python", "-m", "some_mcp_server"]}}}
+```
+
+MCP 工具**必须显式配置才注册**——第三方 server 不受 workspace 沙箱约束，所以只读性只信 server 声明的
+`readOnlyHint`（没声明就当可写、串行执行），但它们**照样走权限与 hooks 门禁链**。
 
 **跑评估**（真实仓库 + 隐藏测试判定）：
 
@@ -149,7 +160,7 @@ python -m eval.runner --limit 2 --mock           # 无 key 冒烟：只验证管
 **测试**：
 
 ```bash
-python -m pytest tests/                  # 156 passed
+python -m pytest tests/                  # 168 passed
 ```
 
 ---
@@ -188,10 +199,11 @@ dcf0a013  fix: correctly handle falsy values in LRUCache
 | 核心循环 | `agent/loop.py` `llm.py` `state.py` `context.py` `tool_result.py` `session.py` | 1,210 |
 | 治理 | `agent/permissions.py` `hooks.py` `memory.py` | 688 |
 | 工具 | `agent/tools/base.py` `bash.py` `files.py` `subagent.py` | 740 |
-| 入口 | `app/cli.py` `ui_streamlit.py` `replay.py` | 555 |
+| MCP | `agent/mcp.py` | 350 |
+| 入口 | `app/cli.py` `ui_streamlit.py` `replay.py` | 577 |
 | 评估 | `eval/golden_tasks.py` `runner.py` | 452 |
-| **源码合计** | **18 个模块** | **3,645** |
-| 测试 | `tests/` | 2,269（156 个用例） |
+| **源码合计** | **19 个模块** | **4,017** |
+| 测试 | `tests/` | 2,586（168 个用例） |
 
 ---
 

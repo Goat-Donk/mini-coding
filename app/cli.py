@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 from agent.context import ContextManager
 from agent.llm import BaseLLM, DeepSeekClient, LLMResult, MockLLM, ToolCall
 from agent.loop import QueryEngine
+from agent.mcp import MCPError, load_mcp_servers
 from agent.memory import MemoryManager
 from agent.session import Session, latest_session, new_session_id
 from agent.tools.base import ToolRegistry
@@ -57,6 +58,9 @@ def run(
     checkpoint_every: int = typer.Option(
         5, "--checkpoint-every", help="每 N 步写一次检查点"
     ),
+    mcp: Path | None = typer.Option(
+        None, "--mcp", help="MCP 配置文件路径（如 .codeagent/mcp.json），加载后注册远端工具"
+    ),
 ):
     """在 workspace 内执行一个任务（或从检查点续跑）。"""
     workspace_root = _default_workspace()
@@ -65,6 +69,19 @@ def run(
     llm = _build_llm(mock)
     registry = ToolRegistry.default(workspace_root)
     registry.register(SubagentTool(llm, workspace_root))  # M4-2 research 子代理
+    # M6-3 MCP：显式配置才加载（第三方 server 不受沙箱约束，必须 opt-in）
+    mcp_clients: list = []
+    if mcp is not None:
+        try:
+            mcp_clients, registered = load_mcp_servers(mcp, registry, workspace_root=workspace_root)
+        except (FileNotFoundError, MCPError) as exc:
+            typer.secho(f"MCP 加载失败: {exc}", fg=typer.colors.RED)
+            raise typer.Exit(1)
+        typer.secho(
+            f"MCP: {len(mcp_clients)} 个 server，注册 {len(registered)} 个工具"
+            + (f"（{', '.join(registered)}）" if registered else ""),
+            fg=typer.colors.BRIGHT_BLACK,
+        )
     context = ContextManager(llm)  # M3-1 provider-usage-first 记账
     # M4-1 记忆：启动注入工作区记忆块；任务后提取约定（mock 模式不提取，保持脚本确定性）
     memory = MemoryManager(workspace_root, llm=None if mock else llm)
@@ -74,29 +91,34 @@ def run(
             f"记忆注入: {len(memory_blocks)} 个记忆块", fg=typer.colors.BRIGHT_BLACK
         )
 
-    if resume:
-        sid = session_id or latest_session(workspace_root)
-        if sid is None:
-            typer.secho("没有可恢复的会话检查点（data/checkpoints/ 为空）", fg=typer.colors.YELLOW)
-            raise typer.Exit(1)
-        session, restored = Session.from_checkpoint(workspace_root, sid, step=step)
-        engine = QueryEngine(
-            llm, registry, workspace_root=workspace_root, context=context,
-            session=session, memory_blocks=memory_blocks,
-        )
-        typer.secho(
-            f"恢复会话 {sid}（step {restored.step}）→ 续跑", fg=typer.colors.CYAN, bold=True
-        )
-        result = engine.run_from(restored)
-    else:
-        session = Session(workspace_root, new_session_id(), checkpoint_every=checkpoint_every)
-        engine = QueryEngine(
-            llm, registry, workspace_root=workspace_root, context=context,
-            session=session, memory_blocks=memory_blocks,
-        )
-        typer.secho(f"会话: {session.session_id}", fg=typer.colors.CYAN, bold=True)
-        typer.secho(f"任务: {task}", fg=typer.colors.CYAN, bold=True)
-        result = engine.run(task)
+    try:
+        if resume:
+            sid = session_id or latest_session(workspace_root)
+            if sid is None:
+                typer.secho("没有可恢复的会话检查点（data/checkpoints/ 为空）", fg=typer.colors.YELLOW)
+                raise typer.Exit(1)
+            session, restored = Session.from_checkpoint(workspace_root, sid, step=step)
+            engine = QueryEngine(
+                llm, registry, workspace_root=workspace_root, context=context,
+                session=session, memory_blocks=memory_blocks,
+            )
+            typer.secho(
+                f"恢复会话 {sid}（step {restored.step}）→ 续跑", fg=typer.colors.CYAN, bold=True
+            )
+            result = engine.run_from(restored)
+        else:
+            session = Session(workspace_root, new_session_id(), checkpoint_every=checkpoint_every)
+            engine = QueryEngine(
+                llm, registry, workspace_root=workspace_root, context=context,
+                session=session, memory_blocks=memory_blocks,
+            )
+            typer.secho(f"会话: {session.session_id}", fg=typer.colors.CYAN, bold=True)
+            typer.secho(f"任务: {task}", fg=typer.colors.CYAN, bold=True)
+            result = engine.run(task)
+    finally:
+        # MCP 连接是资源（子进程 + 管道），任务结束必须回收，不能等 GC
+        for client in mcp_clients:
+            client.close()
 
     # M4-1 任务后提取：把轨迹里可复用的约定写回 learned.md（跨会话生效）
     if not mock:
