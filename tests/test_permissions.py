@@ -1,11 +1,13 @@
-"""M2-1 tests: agent/permissions.py（规则引擎 + 决策粒度 + 黑名单 + 沙箱）。"""
+"""M2-1 tests: agent/permissions.py（规则引擎 + 决策粒度 + 黑名单 + 沙箱 + 第三方工具）。"""
 import json
 from pathlib import Path
+
+from pydantic import BaseModel
 
 from agent.llm import LLMResult, MockLLM
 from agent.loop import QueryEngine
 from agent.permissions import Decision, PermissionsEngine
-from agent.tools.base import ToolContext, ToolRegistry
+from agent.tools.base import Tool, ToolContext, ToolRegistry, ToolResult
 
 
 def make_ctx(tmp_path: Path) -> ToolContext:
@@ -172,6 +174,75 @@ def test_load_rules_file(tmp_path):
     assert engine.check("bash", {"command": "git status"}, ctx) is Decision.ALLOW
 
 
+# ---------- 第三方工具（MCP）默认不放行 ----------
+
+def test_external_tool_asks_by_default(tmp_path):
+    """未授权的第三方工具 → ASK（不是默认 allow）；内置工具不受影响。
+
+    这条钉住的是 H2：外部工具曾经落到 `("tool", name)` 分类 → `_rule_check`
+    一路走到兜底的 `return ALLOW`，等于接上第三方 server 就零策略放行。
+    """
+    engine = PermissionsEngine(tmp_path, external_tools=["remote_read"])
+    ctx = make_ctx(tmp_path)
+    assert engine.check("remote_read", {"uri": "file:///c:/secret"}, ctx) is Decision.ASK
+    assert engine.check("bash", {"command": "ls"}, ctx) is Decision.ALLOW
+
+
+def test_external_tool_allowed_by_rule(tmp_path):
+    """显式写进 external.allow → 放行（授权是配置动作，不是默认行为）。"""
+    engine = PermissionsEngine(
+        tmp_path, external_tools=["remote_read"], rules={"external": {"allow": ["remote_read"]}}
+    )
+    ctx = make_ctx(tmp_path)
+    assert engine.check("remote_read", {}, ctx) is Decision.ALLOW
+
+
+def test_allow_external_is_additive(tmp_path):
+    """规则文件的 external.allow 与 mcp.json 的 allow 是**并集**（无顺序依赖）。"""
+    rules_file = tmp_path / "permissions.json"
+    rules_file.write_text(json.dumps({"external": {"allow": ["a"]}}), encoding="utf-8")
+    engine = PermissionsEngine(tmp_path, rules_path=rules_file, external_tools=["a", "b"])
+    engine.allow_external(["b"])
+    ctx = make_ctx(tmp_path)
+    assert engine.check("a", {}, ctx) is Decision.ALLOW
+    assert engine.check("b", {}, ctx) is Decision.ALLOW
+
+
+def test_external_tool_confirm_allow_always_remembers(tmp_path):
+    """授权也可以是交互式的：用户对第三方工具选 allow_always → 该工具常驻放行。"""
+    asked = []
+    engine = PermissionsEngine(
+        tmp_path,
+        external_tools=["remote_read"],
+        confirm=lambda q: asked.append(q) or "allow_always",
+    )
+    ctx = make_ctx(tmp_path)
+    assert engine.check("remote_read", {}, ctx) is Decision.ALLOW
+    assert engine.check("remote_read", {}, ctx) is Decision.ALLOW
+    assert len(asked) == 1
+    assert "第三方" in asked[0]  # 确认文案点明它不受沙箱约束
+
+
+def test_external_classification_beats_path_classification(tmp_path):
+    """名字同时像内置工具时，`external_tools` 里的名字按外部处理（更严的方向）。
+
+    正常情况下不会出现：MCP 工具与内置重名时 `load_mcp_servers` 会加 `<别名>__`
+    前缀。这里钉的是**优先级**——万一有人手工传进一个 `read`，也只会更严不会更松。
+    """
+    engine = PermissionsEngine(tmp_path, external_tools=["read"])
+    ctx = make_ctx(tmp_path)
+    assert engine.check("read", {"path": "a.txt"}, ctx) is Decision.ASK
+
+
+def test_denial_hint_names_the_fix(tmp_path):
+    """拒绝理由带出处与解除方式；无关工具不给误导性提示。"""
+    engine = PermissionsEngine(tmp_path, external_tools=["remote_read"])
+    hint = engine.denial_hint("remote_read")
+    assert hint is not None
+    assert "allow" in hint and "remote_read" in hint
+    assert engine.denial_hint("bash") is None
+
+
 # ---------- 循环集成 ----------
 
 def test_loop_permissions_deny(tmp_path):
@@ -246,3 +317,82 @@ def test_loop_permissions_ask_headless_denies(tmp_path):
     calls = [e for e in result.events if e["type"] == "tool_call"]
     assert calls[0]["success"] is False
     assert "权限拒绝" in seen["feedback"]
+
+
+# ---------- 循环集成：第三方工具 ----------
+
+class RemoteEchoInput(BaseModel):
+    text: str = ""
+
+
+class RemoteEchoTool(Tool):
+    """假第三方工具：声明 is_external() → 权限默认不放行。"""
+
+    name = "remote_echo"
+    description = "假的 MCP 工具"
+    input_model = RemoteEchoInput
+    ran = False
+
+    @classmethod
+    def is_external(cls) -> bool:
+        return True
+
+    def execute(self, args, ctx):
+        type(self).ran = True
+        return ToolResult.ok("远端结果")
+
+
+def _engine_with_external(tmp_path, permissions) -> tuple[QueryEngine, dict]:
+    seen = {}
+
+    def then_answer(messages, tools):
+        if any(m["role"] == "tool" for m in messages):
+            seen["feedback"] = messages[-1]["content"]
+        return LLMResult(content="换个办法")
+
+    registry = ToolRegistry.default(tmp_path)
+    registry.register(RemoteEchoTool())
+    engine = QueryEngine(
+        MockLLM.script(MockLLM.tool("remote_echo", {"text": "hi"}).responses[0], then_answer),
+        registry,
+        workspace_root=tmp_path,
+        permissions=permissions,
+    )
+    return engine, seen
+
+
+def test_loop_unauthorized_external_tool_blocked_with_provenance(tmp_path):
+    """未授权的第三方工具：不执行、回喂模型，且拒绝理由写明**怎么解除**。
+
+    三件事一起验：① 工具真的没跑（`ran` 保持 False）；② 模型收到了拒绝；
+    ③ 拒绝文案指出加 `allow` 到 mcp.json —— 没有出处和解除方式的拒绝，
+    只会让 agent 反复重试同一个调用。
+    """
+    RemoteEchoTool.ran = False
+    engine, seen = _engine_with_external(
+        tmp_path, PermissionsEngine(tmp_path, external_tools=["remote_echo"])
+    )
+    result = engine.run("调远端")
+    assert result.terminated_reason == "completed"
+    assert RemoteEchoTool.ran is False
+    calls = [e for e in result.events if e["type"] == "tool_call"]
+    assert calls[0]["success"] is False
+    assert "权限拒绝" in seen["feedback"]
+    assert "mcp.json" in seen["feedback"]
+    assert "remote_echo" in seen["feedback"]
+
+
+def test_loop_authorized_external_tool_runs(tmp_path):
+    """授权后照常执行 —— 加固不该把正常用法一并打死。"""
+    RemoteEchoTool.ran = False
+    engine, _ = _engine_with_external(
+        tmp_path,
+        PermissionsEngine(
+            tmp_path, external_tools=["remote_echo"], rules={"external": {"allow": ["remote_echo"]}}
+        ),
+    )
+    result = engine.run("调远端")
+    assert RemoteEchoTool.ran is True
+    calls = [e for e in result.events if e["type"] == "tool_call"]
+    assert calls[0]["success"] is True
+

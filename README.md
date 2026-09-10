@@ -4,7 +4,7 @@
 **核心循环手写**（不套 LangGraph / Agent SDK），支撑层用成熟库（openai SDK / pydantic v2 / streamlit / typer / pytest）。
 
 > **一句话**：把 Claude Code 的架构用 Python 重写一遍——不是移植代码，是移植设计。
-> 4,235 行源码 / 19 个模块 / 196 个测试。真实跑分见[评估章节](#评估eval)。
+> 4,235 行源码 / 19 个模块 / 223 个测试。真实跑分见[评估章节](#评估eval)。
 
 📄 文档：[技术方案 `docs/TECH_SPEC.md`](docs/TECH_SPEC.md) · [架构详解 `docs/architecture.md`](docs/architecture.md) · [任务清单 `TASKS.md`](TASKS.md) · [参考笔记 `docs/reference/`](docs/reference/)
 
@@ -22,7 +22,8 @@
 | **真·轨迹驱动评估** | 从 tinydb 真实 git history 挖 bug 修复提交构造黄金任务，隐藏测试判分，出完成率/成本回归报告 | SWE-bench 思路 |
 | **分层记忆 + 自进化** | `CODEAGENT.md` / `CLAUDE.md` / `.codeagent/rules/*.md` 分层 + `@include` + hash 去重 + 预算；任务后提取约定写回，**下次会话自动生效** | CLAUDE.md 机制 |
 | **research 子代理** | 把 `(X+Y)×N` 的探索外包，主上下文只收结论 `Z`；子代理只读、无 subagent 工具（天然禁递归） | SubAgent 上下文经济学 |
-| **MCP 客户端** | 手写 MCP stdio 客户端接入标准 MCP server；**第三方工具照样过权限与 hooks**（分层设计的回报） | MCP（工具接入标准） |
+| **MCP 客户端** | 手写 MCP stdio 客户端接入标准 MCP server；**第三方工具照样过权限与 hooks**，且**默认不放行**——必须列进 `mcp.json` 的 `allow` 才免确认 | MCP（工具接入标准） |
+| **第三方工具授权** | `Tool.is_external()` → 权限引擎单独归类，默认 `ask`（无交互确认 → 拒绝），拒绝文案带出处与解除方式；子进程环境按名清洗凭据类变量 | 权限与安全审查 |
 
 ### 实测：缓存命中率曲线（真·冷启动）
 
@@ -176,11 +177,19 @@ marker 由 `PostToolUse` 在**测试命令真跑成功**（退出码 0）时自�
 **接 MCP server**（复制 [`mcp.example.json`](mcp.example.json) 为 `.codeagent/mcp.json`）：
 
 ```json
-{"servers": {"fs": {"command": ["npx", "-y", "@modelcontextprotocol/server-filesystem", "."]}}}
+{"servers": {"fs": {
+  "command": ["npx", "-y", "@modelcontextprotocol/server-filesystem", "."],
+  "allow": ["read_file", "list_directory"]
+}}}
 ```
 
 MCP 工具**必须显式配置才注册**——第三方 server 不受 workspace 沙箱约束，所以只读性只信 server 声明的
 `readOnlyHint`（没声明就当可写、串行执行），但它们**照样走权限与 hooks 门禁链**。
+
+> **⚠️ 行为变更（M7）**：MCP 工具**列进 `allow` 才免确认**，没列的一律判定 `ask` ——
+> CLI 无交互确认 → 拒绝，并把「给对应 server 加 `allow`」写进拒绝理由回喂模型。
+> 在此之前它们是零策略放行的（`_classify` 落到通用 `tool` 分类 → 兜底 `ALLOW`），
+> 即「接上第三方 server 就默认信任」。`allow` 支持通配（`"e*"`、`"*"`），写 `"*"` 是显式选择全放行。
 
 **跑评估**（真实仓库 + 隐藏测试判定）：
 
@@ -193,7 +202,7 @@ python -m eval.runner --limit 2 --mock           # 无 key 冒烟：只验证管
 **测试**：
 
 ```bash
-python -m pytest tests/                  # 196 passed
+python -m pytest tests/                  # 223 passed
 ```
 
 ---
@@ -266,7 +275,7 @@ $ python -m eval.runner --limit 2
 | 入口 | `app/cli.py` `ui_streamlit.py` `replay.py` | 636 |
 | 评估 | `eval/golden_tasks.py` `runner.py` | 490 |
 | **源码合计** | **19 个模块** | **4,235** |
-| 测试 | `tests/` | 3,140（196 个用例） |
+| 测试 | `tests/` | 3,502（223 个用例） |
 
 ---
 

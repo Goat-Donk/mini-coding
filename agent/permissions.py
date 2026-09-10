@@ -19,7 +19,7 @@ import fnmatch
 import json
 from enum import Enum
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterable
 
 from agent.tools.bash import BashTool
 from agent.tools.base import ToolContext
@@ -71,15 +71,23 @@ class PermissionsEngine:
         rules: dict | None = None,
         rules_path: Path | None = None,
         confirm: Callable[[str], str | None] | None = None,
+        external_tools: Iterable[str] = (),
     ) -> None:
-        """confirm(question) -> 粒度字符串（如 "allow_once"/"deny_always"），None = 拒绝。"""
+        """confirm(question) -> 粒度字符串（如 "allow_once"/"deny_always"），None = 拒绝。
+
+        external_tools：第三方工具名（MCP 等）。它们**默认不放行**，必须由
+        `external.allow` 规则显式授权 —— 这些工具不受 workspace 沙箱约束，
+        「没配规则就放行」对它们是错的默认值。
+        """
         self.workspace_root = Path(workspace_root).resolve()
         self.confirm = confirm
+        self._external: set[str] = set(external_tools)
         self._rules: dict = {
             "tools": {},
             "commands": {"allow": [], "deny": []},
             "paths": {"allow": [], "deny": []},
             "edits": {"allow": [], "deny": []},
+            "external": {"allow": []},
         }
         self._turn: dict[str, Decision] = {}    # 本回合记忆
         self._always: dict[str, Decision] = {}  # 常驻记忆
@@ -98,10 +106,20 @@ class PermissionsEngine:
                 for sub in ("allow", "deny"):
                     if sub in data[key]:
                         self._rules[key][sub] = list(data[key][sub])
+        if "external" in data and "allow" in data["external"]:
+            self._rules["external"]["allow"] = list(data["external"]["allow"])
 
     def load_rules_file(self, path: Path) -> None:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
         self.load_rules(data)
+
+    def allow_external(self, names: Iterable[str]) -> None:
+        """把第三方工具加进免确认名单（来自 mcp.json 的 `allow`）。
+
+        与规则文件里的 `external.allow` 是**并集**，不互相覆盖 —— 否则
+        「先 load_rules_file 还是先 load_mcp」会决定谁生效，成了隐性顺序依赖。
+        """
+        self._rules["external"]["allow"] = list(self._rules["external"]["allow"]) + list(names)
 
     # ---------- 主入口 ----------
 
@@ -143,6 +161,11 @@ class PermissionsEngine:
             what = f"执行命令: {target[:120]}"
         elif kind in ("path", "edit"):
             what = f"{tool_name} 文件: {target[:120]}"
+        elif kind == "external":
+            what = (
+                f"调用第三方工具: {tool_name}"
+                "（不受 workspace 沙箱约束，需显式授权）"
+            )
         else:
             what = f"调用工具: {tool_name}"
         return (
@@ -150,10 +173,31 @@ class PermissionsEngine:
             "(allow_once/allow_turn/allow_always/deny_once/deny_always)"
         )
 
+    def denial_hint(self, tool_name: str) -> str | None:
+        """被拒时给用户的**解除指引**（带出处，不是一句"没权限"）。
+
+        拒绝而不说怎么解，等于把一个安全机制变成路障：用户既不知道是谁拦的，
+        也不知道该改哪个文件。第三方工具是当前唯一需要外部配置才能放行的类别，
+        所以这里直接写出配置项和写法。
+        """
+        if tool_name in self._external:
+            return (
+                f"{tool_name} 来自第三方（MCP）server，不受 workspace 沙箱约束，"
+                f'需在 mcp.json 里显式授权：给对应 server 加 "allow": ["{tool_name}"]'
+            )
+        return None
+
     # ---------- 内部 ----------
 
     def _classify(self, tool_name: str, arguments: dict) -> tuple[str, str]:
-        """返回 (请求类别, 记忆键 target)。"""
+        """返回 (请求类别, 记忆键 target)。
+
+        `_external` 放在最前：名字同时像内置工具时按**外部**处理。两者不该
+        重叠（MCP 工具与内置重名时 load_mcp_servers 会加 `<别名>__` 前缀），
+        但万一重叠，取更严的那条 —— 外部工具的兜底是 ASK，内置工具是 ALLOW。
+        """
+        if tool_name in self._external:
+            return "external", tool_name
         if tool_name == "bash":
             return "command", arguments.get("command", "")
         if tool_name in EDIT_TOOLS:
@@ -220,6 +264,12 @@ class PermissionsEngine:
                     return Decision.DENY
                 if self._matches_any(candidates, self._rules["edits"]["allow"]):
                     return Decision.ALLOW
+        elif kind == "external":
+            # 第三方工具（MCP 等）：不受 workspace 沙箱约束，「没配规则就放行」是错的
+            # 默认值。必须显式授权：要么写进 external.allow，要么用户在确认里选 allow_*。
+            if self._matches_any([tool_name], self._rules["external"]["allow"]):
+                return Decision.ALLOW
+            return Decision.ASK
 
         # 2) 危险命令默认 ask（兜底）
         if tool_name == "bash" and BashTool._is_dangerous(

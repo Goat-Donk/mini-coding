@@ -93,11 +93,13 @@ def test_load_servers_registers_tools_and_renames_conflicts(tmp_path):
         encoding="utf-8",
     )
     registry = ToolRegistry([ReadTool()])  # 内置 read 先占位
-    clients, registered = load_mcp_servers(config, registry, workspace_root=tmp_path)
+    clients, registered, allowed = load_mcp_servers(config, registry, workspace_root=tmp_path)
     try:
         assert set(registered) == {"echo", "write_note", "boom"}
         assert "echo" in registry and registry.get("echo").is_read_only() is True
         assert "read" in registry and isinstance(registry.get("read"), ReadTool)
+        # 没配 allow → 一个都不授权（第三方工具默认不放行）
+        assert allowed == []
     finally:
         for c in clients:
             c.close()
@@ -115,7 +117,7 @@ def test_load_servers_skips_broken_server_without_raising(tmp_path, capsys):
         encoding="utf-8",
     )
     registry = ToolRegistry()
-    clients, registered = load_mcp_servers(config, registry, workspace_root=tmp_path)
+    clients, registered, _ = load_mcp_servers(config, registry, workspace_root=tmp_path)
     try:
         assert "echo" in registered          # good 正常注册
         assert "echo" in registry
@@ -123,6 +125,69 @@ def test_load_servers_skips_broken_server_without_raising(tmp_path, capsys):
         for c in clients:
             c.close()
     assert "已跳过" in capsys.readouterr().err
+
+
+def test_load_servers_only_allows_configured_tools(tmp_path):
+    """`allow` 白名单：只有列出的工具免确认，其余照旧默认不放行。
+
+    这里钉住的是**配置值的语义**（哪些名字算被授权），不是权限引擎的判定——
+    后者由 test_permissions.py 的 external 用例覆盖。
+    """
+    config = tmp_path / "mcp.json"
+    config.write_text(
+        json.dumps({"servers": {"fake": {
+            "command": server_command("--note-path", str(tmp_path / "n.txt")),
+            "allow": ["echo"],
+        }}}),
+        encoding="utf-8",
+    )
+    registry = ToolRegistry()
+    clients, registered, allowed = load_mcp_servers(config, registry, workspace_root=tmp_path)
+    try:
+        assert set(registered) == {"echo", "write_note", "boom"}
+        assert allowed == ["echo"]           # write_note / boom 未被授权
+    finally:
+        for c in clients:
+            c.close()
+
+
+def test_load_servers_allow_supports_glob(tmp_path):
+    """`allow` 支持通配（写 `"*"` 等于整台 server 全放行，是显式选择而非默认）。"""
+    config = tmp_path / "mcp.json"
+    config.write_text(
+        json.dumps({"servers": {"fake": {
+            "command": server_command("--note-path", str(tmp_path / "n.txt")),
+            "allow": ["e*"],             # 只命中 echo
+        }}}),
+        encoding="utf-8",
+    )
+    registry = ToolRegistry()
+    clients, registered, allowed = load_mcp_servers(config, registry, workspace_root=tmp_path)
+    try:
+        assert set(registered) == {"echo", "write_note", "boom"}
+        assert allowed == ["echo"]
+    finally:
+        for c in clients:
+            c.close()
+
+
+def test_allow_matches_final_name_when_prefixed():
+    """重名加前缀后，配**注册名**写法（`fake__echo`）也能命中。
+
+    远端名与注册名只在 load 那一处同时可见，所以匹配在那里做——否则用户得去
+    猜前缀，配置就成了实现细节的泄漏。这里直接测匹配函数，因为 fake server
+    没有与内置工具同名的工具，造不出真实的重名场景。
+    """
+    from agent.mcp import _is_allowed
+
+    # 未加前缀：远端名直配
+    assert _is_allowed("echo", "echo", ["echo"]) is True
+    # 加了前缀：用注册名配
+    assert _is_allowed("echo", "fake__echo", ["fake__echo"]) is True
+    # 加了前缀但用户仍按远端名配 —— 也认（避免用户被迫理解前缀规则）
+    assert _is_allowed("echo", "fake__echo", ["echo"]) is True
+    # 都不匹配 → 不授权
+    assert _is_allowed("echo", "fake__echo", ["write_note"]) is False
 
 
 def test_mcp_tool_runs_through_query_engine(tmp_path):
@@ -140,7 +205,7 @@ def test_mcp_tool_runs_through_query_engine(tmp_path):
         encoding="utf-8",
     )
     registry = ToolRegistry.default(tmp_path)
-    clients, _ = load_mcp_servers(config, registry, workspace_root=tmp_path)
+    clients, _, _ = load_mcp_servers(config, registry, workspace_root=tmp_path)
     try:
         llm = MockLLM.script(
             LLMResult(content=None, tool_calls=[

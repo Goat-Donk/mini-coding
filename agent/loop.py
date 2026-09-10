@@ -343,9 +343,17 @@ class QueryEngine:
                     f"权限拒绝: 未获允许执行 {call.name}（{self.permissions.describe(call.name, call.arguments)}）"
                 )
             if decision is Decision.ASK:
-                return ToolResult.fail(
-                    f"权限拒绝: {call.name} 需要人工确认，当前无确认交互，已按拒绝处理"
+                # 拒绝必须带**出处与解除方式**：只说"没权限"会让 agent 反复重试
+                # 同一个调用、让用户不知道该改哪个文件。
+                hint = (
+                    self.permissions.denial_hint(call.name)
+                    if hasattr(self.permissions, "denial_hint")
+                    else None
                 )
+                msg = f"权限拒绝: {call.name} 需要人工确认，当前无确认交互，已按拒绝处理"
+                if hint:
+                    msg += f"\n出处: {hint}"
+                return ToolResult.fail(msg)
 
         # 3) 执行
         result = tool.run(call.arguments, ctx)

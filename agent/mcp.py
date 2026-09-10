@@ -16,6 +16,7 @@
 """
 from __future__ import annotations
 
+import fnmatch
 import json
 import queue
 import subprocess
@@ -268,6 +269,11 @@ class MCPToolAdapter(Tool):
     def is_read_only(self) -> bool:  # type: ignore[override]
         return self._read_only
 
+    @classmethod
+    def is_external(cls) -> bool:  # type: ignore[override]
+        """第三方 server 的工具：不受 workspace 沙箱约束，权限默认不放行。"""
+        return True
+
     def schema(self) -> dict:
         return {
             "type": "function",
@@ -299,15 +305,26 @@ def load_mcp_servers(
     registry: ToolRegistry,
     *,
     workspace_root: Path | None = None,
-) -> tuple[list[MCPClient], list[str]]:
+) -> tuple[list[MCPClient], list[str], list[str]]:
     """按配置文件启动若干 MCP server，把它们的工具注册进 registry。
 
     配置格式（`.codeagent/mcp.json`）：
-        {"servers": {"<别名>": {"command": ["python", "-m", "some_server"]}}}
+        {"servers": {"<别名>": {
+            "command": ["python", "-m", "some_server"],
+            "allow": ["get_current_time"]        # 可选：允许免确认调用的工具
+        }}}
 
-    返回 (clients, 注册的工具名)。**clients 由调用方负责 close()**——进程和
-    连接是资源，不能交给 GC 碰运气。任何单个 server 失败都不影响其它 server 与
-    主流程（MCP 是增强项，不该成为启动路径上的单点故障）。
+    返回 `(clients, 注册的工具名, 已授权免确认的工具名)`。**clients 由调用方负责
+    close()**——进程和连接是资源，不能交给 GC 碰运气。任何单个 server 失败都不影响
+    其它 server 与主流程（MCP 是增强项，不该成为启动路径上的单点故障）。
+
+    **`allow` 未列出 = 不放行**：MCP 工具来自第三方 server，不受 workspace 沙箱
+    约束，所以权限引擎对它们默认 ASK（CLI 无确认交互 → 拒绝）。这是刻意的行为
+    变更：接第三方 server 必须显式说明允许它干什么，而不是接上就放行。
+
+    `allow` 里写**远端工具名**（也支持 fnmatch 通配，如 `"time__*"`）；匹配在
+    这里完成——因为只有这一处同时知道「远端名」和「注册名」（与内置工具重名时
+    会加 `<别名>__` 前缀），权限引擎拿到的就是两个扁平的最终名单。
     """
     config_path = Path(config_path)
     if not config_path.exists():
@@ -319,11 +336,13 @@ def load_mcp_servers(
 
     clients: list[MCPClient] = []
     registered: list[str] = []
+    allowed: list[str] = []
     for alias, spec in (config.get("servers") or {}).items():
         command = (spec or {}).get("command") or []
         if not command:
             print(f"[mcp] 跳过 {alias}: 缺少 command", file=sys.stderr)
             continue
+        allow_patterns = [str(p) for p in ((spec or {}).get("allow") or [])]
         client = MCPClient(
             command,
             name=alias,
@@ -340,6 +359,7 @@ def load_mcp_servers(
         clients.append(client)
         for remote in remote_tools:
             adapter = MCPToolAdapter(client, remote)
+            raw_name = adapter.name
             if adapter.name in registry:
                 # 与内置工具同名：内置优先，MCP 工具加前缀避免覆盖（也避免静默遮蔽）
                 adapter.name = f"{alias}__{adapter.name}"
@@ -347,4 +367,20 @@ def load_mcp_servers(
                     continue
             registry.register(adapter)
             registered.append(adapter.name)
-    return clients, registered
+            if _is_allowed(raw_name, adapter.name, allow_patterns):
+                allowed.append(adapter.name)
+        if not allow_patterns:
+            print(
+                f"[mcp] {alias} 未配置 allow：其工具默认需人工确认，"
+                f'请在 mcp.json 里加 "allow": ["<工具名>"]',
+                file=sys.stderr,
+            )
+    return clients, registered, allowed
+
+
+def _is_allowed(raw_name: str, final_name: str, patterns: list[str]) -> bool:
+    """远端名或注册名命中任一 allow 模式即免确认（支持 `time__*` 这类通配）。"""
+    return any(
+        fnmatch.fnmatch(raw_name, pat) or fnmatch.fnmatch(final_name, pat)
+        for pat in patterns
+    )

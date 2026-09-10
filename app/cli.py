@@ -2,7 +2,8 @@
 
 M3 版：接入 ContextManager（记账/compact）+ Session（轨迹/检查点/--resume）。
 M6-6：事件实时流式打印（不必等任务结束才看到进度）。
-权限：所有工具调用统一过 PermissionsEngine（默认 allow，路径越界 deny，危险命令 ask；
+权限：所有工具调用统一过 PermissionsEngine（默认 allow，路径越界 deny，危险命令 ask，
+      第三方/MCP 工具须在 mcp.json 的 allow 里显式授权，否则 ask；
       CLI 无确认交互，故 ask 由 loop 按安全默认拒绝）。hooks 走 default_engine()
       （block-at-submit：git commit 前需 data/tests_pass.marker，由测试成功自动写入）。
 """
@@ -126,9 +127,12 @@ def run(
     registry.register(SubagentTool(llm, workspace_root))  # M4-2 research 子代理
     # M6-3 MCP：显式配置才加载（第三方 server 不受沙箱约束，必须 opt-in）
     mcp_clients: list = []
+    mcp_allowed: list[str] = []
     if mcp is not None:
         try:
-            mcp_clients, registered = load_mcp_servers(mcp, registry, workspace_root=workspace_root)
+            mcp_clients, registered, mcp_allowed = load_mcp_servers(
+                mcp, registry, workspace_root=workspace_root
+            )
         except (FileNotFoundError, MCPError) as exc:
             typer.secho(f"MCP 加载失败: {exc}", fg=typer.colors.RED)
             raise typer.Exit(1)
@@ -137,11 +141,21 @@ def run(
             + (f"（{', '.join(registered)}）" if registered else ""),
             fg=typer.colors.BRIGHT_BLACK,
         )
+        typer.secho(
+            f"MCP 授权: {len(mcp_allowed)}/{len(registered)} 个工具免确认"
+            + ("（其余需人工确认，CLI 无交互 → 拒绝）" if len(mcp_allowed) < len(registered) else ""),
+            fg=typer.colors.BRIGHT_BLACK,
+        )
     context = ContextManager(llm)  # M3-1 provider-usage-first 记账
     # M2 权限引擎：CLI 无交互确认（不传 confirm），所以判定是：
     #   默认 allow（正常行为不变）· 路径越界 deny · 危险命令 ask
+    #   · 第三方工具 ask（须在 mcp.json 的 allow 里显式授权）
     #   （引擎不把 ask 转成 deny；是 loop 在「无确认交互」时按安全默认拒绝，理由回喂模型）
-    permissions = PermissionsEngine(workspace_root)
+    permissions = PermissionsEngine(
+        workspace_root,
+        external_tools=[tool.name for tool in registry.external()],
+    )
+    permissions.allow_external(mcp_allowed)
     # M2 hooks：标准治理链（block-at-submit + 测试结果维护 marker）。
     # 与控制台共用 default_engine()，避免两个入口各接一套接出漂移。
     hooks = default_engine(workspace_root)

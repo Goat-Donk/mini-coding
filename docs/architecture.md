@@ -266,7 +266,11 @@ flowchart LR
 
 - **必须显式配置才注册**（第三方 server 不受 workspace 沙箱约束，绝不进 `ToolRegistry.default`）；
 - 只读性**只信 server 声明的 `annotations.readOnlyHint`**，没声明就当可写 → 串行执行；
-- 但**照样过权限与 hooks**——这是把治理做成独立层的直接回报。
+- 但**照样过权限与 hooks**——这是把治理做成独立层的直接回报；
+- **权限默认不放行**（M7）：`is_external()` 为真的工具归到 `external` 类，只有列进
+  `mcp.json` 的 `allow`（或规则文件的 `external.allow`）才 `ALLOW`，否则 `ASK`。
+  「接上第三方 server 就默认信任」是错的默认值，而门禁链本身不会替你做这个判断——
+  能走门禁 ≠ 门禁有正确策略，这是 A2 修的东西。
 
 传输实现的两个要点：stdout/stderr 各一个后台线程抽干（管道阻塞读没法设超时，Windows 上 `select` 也不支持 pipe），stdout → 队列（请求按 id 关联，`queue.get(timeout)` 天然支持超时），stderr → 环形缓冲（出错时带上 server 的真实报错）。适配器覆写 `schema()`（用远端 `inputSchema`）与 `run()`（跳过本地 pydantic 校验，参数原样透传——远端才是权威校验方）。
 

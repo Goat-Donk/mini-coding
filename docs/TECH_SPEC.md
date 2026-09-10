@@ -890,10 +890,13 @@ class MCPClient:
 class MCPToolAdapter(Tool):
     input_model = BaseModel               # 占位：schema/run 均覆写
     def is_read_only(self) -> bool        # 只信 server 的 annotations.readOnlyHint，默认 False
+    def is_external(self) -> bool         # True：第三方工具，权限引擎默认不放行（M7）
     def schema(self) -> dict              # 用远端 inputSchema，不从 pydantic 生成
     def run(self, arguments, ctx) -> ToolResult   # 跳过本地校验，参数原样透传
 
-def load_mcp_servers(config_path, registry, *, workspace_root=None) -> tuple[list[MCPClient], list[str]]
+def load_mcp_servers(config_path, registry, *, workspace_root=None)
+        -> tuple[list[MCPClient], list[str], list[str]]   # (clients, 注册名, 已授权名)
+def _is_allowed(raw_name, final_name, patterns) -> bool    # 远端名或注册名命中 allow 即免确认
 def _flatten_content(content) -> str      # text 拼接；resource/其它类型给可读占位（不静默丢）
 ```
 
@@ -906,17 +909,26 @@ def _flatten_content(content) -> str      # text 拼接；resource/其它类型�
 - **安全边界（重要）**：MCP 工具来自第三方 server，**不受 workspace 沙箱约束**。所以
   ① 必须显式配置（`--mcp`）才注册，不进 `ToolRegistry.default`；
   ② 只读性只信 server 声明的 `readOnlyHint`，没声明就当可写（串行，绝不并发跑未知副作用）；
-  ③ 但它们**照样走 `_gate_and_run` 门禁链**——hooks 与权限引擎对 MCP 工具同样生效。
+  ③ 它们**照样走 `_gate_and_run` 门禁链**——hooks 与权限引擎对 MCP 工具同样生效；
+  ④ **权限默认不放行**（M7）：`is_external()` 为真的工具由 `_classify` 归到 `external`
+  类，`_rule_check` 命中 `rules["external"]["allow"]` 才 `ALLOW`，否则 `ASK`。
   这正是把权限/钩子做成独立层的回报：接入新工具来源无需改循环。
 - **配置**（`.codeagent/mcp.json`）：
-  `{"servers": {"<别名>": {"command": ["python","-m","some_server"], "timeout": 20}}}`
+  `{"servers": {"<别名>": {"command": ["python","-m","some_server"], "timeout": 20, "allow": ["工具名"]}}}`
+  `allow` 是**免确认白名单**，支持 fnmatch（`"e*"` / `"*"`）。匹配在 `load_mcp_servers`
+  里做，因为只有那一处同时知道「远端名」与「注册名」（重名时后者加了 `<别名>__` 前缀）——
+  否则用户得去猜前缀，配置就成了实现细节的泄漏。`load_mcp_servers` 返回的第三个值
+  （已授权名列表）由入口交给 `PermissionsEngine.allow_external()`；它与规则文件里的
+  `external.allow` 是**并集**，所以「先加载 mcp 还是先加载规则文件」不影响结果。
 - **容错**：单个 server 启动失败/崩溃只打印 stderr 提示并跳过，不影响其它 server 与主流程
   （MCP 是增强项，不该成为启动路径上的单点故障）；与内置工具重名时加 `<别名>__` 前缀，
   **不静默遮蔽**内置工具。客户端由调用方 `close()`（子进程 + 管道是资源，不等 GC）。
-- 测试：tests/test_mcp.py（12 个）+ tests/fake_mcp_server.py——**真子进程、真管道、
+- 测试：tests/test_mcp.py（14 个）+ tests/fake_mcp_server.py——**真子进程、真管道、
   真 JSON-RPC**（不是 mock）：握手/列工具/成功·isError·未知工具/只读注解透传/
-  跳过本地校验/重名加前缀/坏 server 不炸主流程/崩溃与超时诊断/**经真实 QueryEngine
-  循环调用 MCP 工具**。
+  跳过本地校验/重名加前缀/坏 server 不炸主流程/崩溃与超时诊断/**allow 白名单语义**/
+  **经真实 QueryEngine 循环调用 MCP 工具**。权限侧的判定与拒绝文案在
+  tests/test_permissions.py（外部工具默认 `ASK`、授权后 `ALLOW`、裸名与加前缀名都能配、
+  拒绝理由含出处与解除方式）。
 
 ---
 

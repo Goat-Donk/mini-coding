@@ -103,7 +103,13 @@ def run_task(
         llm = build_llm(mock)
         registry = ToolRegistry.default(workspace)
         registry.register(SubagentTool(llm, workspace))  # M4-2 research 子代理
-        permissions = PermissionsEngine(workspace, confirm=confirm.ask)
+        # 第三方工具（MCP）默认需显式授权：这里虽未加载 MCP，仍按注册表实际
+        # 情况传入，避免以后接上 MCP 时权限层悄悄漏掉（同类漂移已经犯过一次）
+        permissions = PermissionsEngine(
+            workspace,
+            confirm=confirm.ask,
+            external_tools=[tool.name for tool in registry.external()],
+        )
         # 与 CLI 共用同一条标准治理链（避免两个入口接线漂移）
         hooks = default_engine(workspace)
         session = Session(workspace, new_session_id(), on_event=events_q.put)

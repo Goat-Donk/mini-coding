@@ -70,6 +70,15 @@ class Tool(ABC):
         """只读工具可并发执行；默认 False（可写）。"""
         return False
 
+    @classmethod
+    def is_external(cls) -> bool:
+        """是否来自第三方（如 MCP server）。
+
+        外部工具不受 workspace 沙箱约束，权限引擎默认**不放行**它们，
+        必须在配置里显式列出才允许（见 permissions.py 的 external 规则）。
+        """
+        return False
+
     def needs_permission(self, arguments: dict) -> bool:
         """工具自声明是否需要人工确认（M1：bash 危险命令返回 True）。"""
         return False
@@ -149,6 +158,10 @@ class ToolRegistry:
 
     def writable(self) -> list[Tool]:
         return [tool for tool in self._tools.values() if not tool.is_read_only()]
+
+    def external(self) -> list[Tool]:
+        """第三方工具（MCP 等）。权限引擎对它们默认不放行，须显式授权。"""
+        return [tool for tool in self._tools.values() if tool.is_external()]
 
     @classmethod
     def default(cls, workspace_root: Path) -> "ToolRegistry":
