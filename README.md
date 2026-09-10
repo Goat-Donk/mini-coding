@@ -4,7 +4,7 @@
 **核心循环手写**（不套 LangGraph / Agent SDK），支撑层用成熟库（openai SDK / pydantic v2 / streamlit / typer / pytest）。
 
 > **一句话**：把 Claude Code 的架构用 Python 重写一遍——不是移植代码，是移植设计。
-> 4,170 行源码 / 19 个模块 / 189 个测试。真实跑分见[评估章节](#评估eval)。
+> 4,235 行源码 / 19 个模块 / 196 个测试。真实跑分见[评估章节](#评估eval)。
 
 📄 文档：[技术方案 `docs/TECH_SPEC.md`](docs/TECH_SPEC.md) · [架构详解 `docs/architecture.md`](docs/architecture.md) · [任务清单 `TASKS.md`](TASKS.md) · [参考笔记 `docs/reference/`](docs/reference/)
 
@@ -18,7 +18,7 @@
 |---|---|---|
 | **cache-aware 上下文布局** | 稳定前缀（system+task 固定不动）+ 两级 compact，让 DeepSeek 磁盘缓存持续命中；控制台实时画命中率与省钱曲线 | TOKEN_BUDGET / CONTEXT_COLLAPSE |
 | **step 级检查点 / 崩溃恢复** | 每 5 步原子落盘 state，`--resume` 从最近检查点**接着 step 计数**续跑；任务中途 kill 进程不丢进度 | `/resume` |
-| **block-at-submit hooks** | `PreToolUse` 包裹 `git commit`，`data/tests_pass.marker` 不存在就**阻断**——逼 agent 进入「测试并修复」循环 | Hooks（block-at-submit） |
+| **block-at-submit hooks** | `PreToolUse` 包裹 `git commit`，`data/tests_pass.marker` 不存在就**阻断**——逼 agent 进入「测试并修复」循环；marker 只在**测试命令真跑成功**时由 `PostToolUse` 写入，失败即清除 | Hooks（block-at-submit） |
 | **真·轨迹驱动评估** | 从 tinydb 真实 git history 挖 bug 修复提交构造黄金任务，隐藏测试判分，出完成率/成本回归报告 | SWE-bench 思路 |
 | **分层记忆 + 自进化** | `CODEAGENT.md` / `CLAUDE.md` / `.codeagent/rules/*.md` 分层 + `@include` + hash 去重 + 预算；任务后提取约定写回，**下次会话自动生效** | CLAUDE.md 机制 |
 | **research 子代理** | 把 `(X+Y)×N` 的探索外包，主上下文只收结论 `Z`；子代理只读、无 subagent 工具（天然禁递归） | SubAgent 上下文经济学 |
@@ -167,9 +167,11 @@ python -m app.cli --mcp .codeagent/mcp.json "任务"   # 加载 MCP server（第
 CLI 的事件日志是**实时流式**的：工具调用一发生就打一行（`[步 3] ✓ bash(command=python -m pytest -q) [1200ms]`），
 bash 退出码非 0 会额外标 `[exit code: N]`，不用等任务结束才看到进度。
 
-CLI 的每一次工具调用都**统一过权限引擎**（和 Streamlit 控制台同一条链路）：默认 `allow`，
+CLI 的每一次工具调用都**统一过权限引擎与 hooks**（和 Streamlit 控制台同一条链路，由 `hooks.default_engine()` 一处构造）：默认 `allow`，
 所以正常流程行为不变；危险命令（`rm -rf` / `git push` / `git reset --hard` …）判定为 `ask`，
 而 CLI 没有交互确认，于是按安全默认**拒绝**并把理由回喂模型；路径越界沙箱则直接 `deny`。
+hooks 侧是 block-at-submit：`git commit` 在 `data/tests_pass.marker` 不存在时被拦下，
+marker 由 `PostToolUse` 在**测试命令真跑成功**（退出码 0）时自动写入、失败时清除。
 
 **接 MCP server**（复制 [`mcp.example.json`](mcp.example.json) 为 `.codeagent/mcp.json`）：
 
@@ -191,7 +193,7 @@ python -m eval.runner --limit 2 --mock           # 无 key 冒烟：只验证管
 **测试**：
 
 ```bash
-python -m pytest tests/                  # 189 passed
+python -m pytest tests/                  # 196 passed
 ```
 
 ---
@@ -258,13 +260,13 @@ $ python -m eval.runner --limit 2
 | 层 | 文件 | 行数 |
 |---|---|---|
 | 核心循环 | `agent/loop.py` `llm.py` `state.py` `context.py` `tool_result.py` `session.py` | 1,273 |
-| 治理 | `agent/permissions.py` `hooks.py` `memory.py` | 688 |
-| 工具 | `agent/tools/base.py` `bash.py` `files.py` `subagent.py` | 740 |
+| 治理 | `agent/permissions.py` `hooks.py` `memory.py` | 742 |
+| 工具 | `agent/tools/base.py` `bash.py` `files.py` `subagent.py` | 744 |
 | MCP | `agent/mcp.py` | 350 |
-| 入口 | `app/cli.py` `ui_streamlit.py` `replay.py` | 629 |
+| 入口 | `app/cli.py` `ui_streamlit.py` `replay.py` | 636 |
 | 评估 | `eval/golden_tasks.py` `runner.py` | 490 |
-| **源码合计** | **19 个模块** | **4,170** |
-| 测试 | `tests/` | 3,032（189 个用例） |
+| **源码合计** | **19 个模块** | **4,235** |
+| 测试 | `tests/` | 3,140（196 个用例） |
 
 ---
 

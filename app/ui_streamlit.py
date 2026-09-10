@@ -4,8 +4,8 @@
 - 无 DEEPSEEK_API_KEY → 自动 Mock 演示（glob → 结论），有 key 用真实 DeepSeek
 - 权限 ask：worker 线程阻塞等待，UI 弹按钮（允许本次/本回合/总是/拒绝），
   选择写入线程安全队列后 worker 继续（决策粒度记忆进 PermissionsEngine）
-- hooks：内置 require_tests_before_commit（block-at-submit），git commit 前
-  检查 data/tests_pass.marker
+- hooks：走 default_engine()（与 CLI 同一条链）—— block-at-submit 检查
+  data/tests_pass.marker，marker 由测试命令跑成功时自动写入
 - M3-5 指标：缓存命中率曲线 + 省钱估算（DeepSeek 输入缓存定价差）、上下文
   用量分级（最近 prompt tokens / 预算）、检查点列表（Session 落盘）
 
@@ -25,7 +25,7 @@ import streamlit as st
 from dotenv import load_dotenv
 
 from agent.context import ContextStats
-from agent.hooks import HookEngine, require_tests_before_commit
+from agent.hooks import default_engine
 from agent.llm import BaseLLM, DeepSeekClient, MockLLM, LLMResult, ToolCall
 from agent.loop import QueryEngine
 from agent.permissions import PermissionsEngine
@@ -104,7 +104,8 @@ def run_task(
         registry = ToolRegistry.default(workspace)
         registry.register(SubagentTool(llm, workspace))  # M4-2 research 子代理
         permissions = PermissionsEngine(workspace, confirm=confirm.ask)
-        hooks = HookEngine([require_tests_before_commit(workspace)], workspace_root=workspace)
+        # 与 CLI 共用同一条标准治理链（避免两个入口接线漂移）
+        hooks = default_engine(workspace)
         session = Session(workspace, new_session_id(), on_event=events_q.put)
         events_q.put({"type": "session_start", "session_id": session.session_id})
         engine = QueryEngine(

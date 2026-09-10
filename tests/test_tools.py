@@ -186,6 +186,19 @@ def test_bash_needs_permission_dangerous():
     assert not tool.needs_permission({"command": "python -c 'print(1)'"})
 
 
+def test_bash_preserves_double_quotes(bash_ctx):
+    """回归：Windows 上内嵌双引号曾被 list2cmdline 转义成 \\" 传给 cmd。
+
+    症状是 `git commit -m "feat: x"` 直接失败（git 把消息后半段当 pathspec）。
+    修法：win32 上传字符串而非列表，绕开 list2cmdline。
+    """
+    result = _bash().run({"command": 'python -c "print(\'quoted ok\')"'}, bash_ctx)
+    assert result.success
+    assert "quoted ok" in result.output
+    assert "\\" not in result.output.split("[exit code")[0], result.output
+    assert result.data["exit_code"] == 0
+
+
 # ---------- M1-5 files ----------
 
 @pytest.fixture

@@ -687,7 +687,7 @@ DEFAULT_SYSTEM_PROMPT = f"""\
   监听器异常被 try/except 吞掉不影响轨迹落盘
 - 主线程每次脚本运行 `get_nowait()` 排空队列 → 追加到 `session_state["log"]` → 渲染；running 中 `sleep(0.3) + st.rerun()` 轮询；**空闲状态不 rerun**（AppTest 无头测试必需，否则初始渲染死循环）
 - **权限确认桥 ConfirmBridge**：worker 的 confirm 回调 `answers.get()` 阻塞等待；UI 读到 `confirm.current` 渲染 5 按钮（允许本次/本回合/总是/拒绝本次/总是），点击把粒度字符串 `answers.put` 并 rerun；新任务重置桥
-- hooks：内置 `require_tests_before_commit`（git commit 前检查 data/tests_pass.marker）
+- hooks：走 `default_engine()`（与 CLI 同一条链）—— block-at-submit 检查 data/tests_pass.marker，marker 由测试命令真跑成功时自动写入
 - 最终展示：结论 + 终止原因/步骤/token/缓存命中率
 - **M3-5 运行指标**（始终可见，不折叠）：① 上下文用量分级进度条（最近一次 provider
   `usage.prompt_tokens` / CONTEXT_BUDGET=64K，用 `ContextStats.level_of` 分
@@ -712,7 +712,10 @@ DEFAULT_SYSTEM_PROMPT = f"""\
 ### 9.2 agent/hooks.py（M2）
 - `HookContext`：event_name / tool_name / arguments / result / state
 - `HookEngine.run_pre(...) -> None | (block, reason)`；`run_post(...)`；示例 hook：`require_tests_before_commit`（PreToolUse 包 Bash(git commit)，检查 `data/tests_pass.marker` 文件，不存在 → block 返回"先跑 python -m pytest 验证"）
-- 提供 mark_tests_pass() 工具/函数写 marker（可由 hook 自身或单独工具）
+- `mark_tests_pass(workspace_root)`：手动写 marker（测试/CLI 工具用）
+- `mark_tests_pass_on_success(workspace_root)`：PostToolUse —— **测试命令真跑成功（exit_code==0）才写 marker，失败则清除**，非测试命令不动。marker 必须由真实测试结果产生，否则模型不跑测试也能 `write` 出 marker 解锁，block-at-submit 就成了摆设。
+- `default_engine(workspace_root) -> HookEngine`：入口层标准治理链（pre=block-at-submit + post=marker 自动维护）。**CLI 与控制台共用这一处构造**，避免两个入口各接一套接出漂移（`app/cli.py` 曾整体漏接 hooks 层）。
+- 测试命令识别用 `TEST_COMMAND` 正则（pytest / npm test / cargo test / go test / mvn test …），要求前面是行首或分隔符，避免把 `git commit -m "add tests"` 误判成测试
 
 ### 9.3 agent/session.py（M3-4 已实现：JSONL 轨迹 + 检查点 + resume）
 

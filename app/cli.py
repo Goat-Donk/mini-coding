@@ -3,8 +3,8 @@
 M3 版：接入 ContextManager（记账/compact）+ Session（轨迹/检查点/--resume）。
 M6-6：事件实时流式打印（不必等任务结束才看到进度）。
 权限：所有工具调用统一过 PermissionsEngine（默认 allow，路径越界 deny，危险命令 ask；
-      CLI 无确认交互，故 ask 由 loop 按安全默认拒绝）。hooks 未接入 —— 默认 hook 会改变
-      正常流程，待定。
+      CLI 无确认交互，故 ask 由 loop 按安全默认拒绝）。hooks 走 default_engine()
+      （block-at-submit：git commit 前需 data/tests_pass.marker，由测试成功自动写入）。
 """
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ import typer
 from dotenv import load_dotenv
 
 from agent.context import ContextManager
+from agent.hooks import default_engine
 from agent.llm import BaseLLM, DeepSeekClient, LLMResult, MockLLM, ToolCall
 from agent.loop import QueryEngine
 from agent.mcp import MCPError, load_mcp_servers
@@ -141,6 +142,9 @@ def run(
     #   默认 allow（正常行为不变）· 路径越界 deny · 危险命令 ask
     #   （引擎不把 ask 转成 deny；是 loop 在「无确认交互」时按安全默认拒绝，理由回喂模型）
     permissions = PermissionsEngine(workspace_root)
+    # M2 hooks：标准治理链（block-at-submit + 测试结果维护 marker）。
+    # 与控制台共用 default_engine()，避免两个入口各接一套接出漂移。
+    hooks = default_engine(workspace_root)
     # M4-1 记忆：启动注入工作区记忆块；任务后提取约定（mock 模式不提取，保持脚本确定性）
     memory = MemoryManager(workspace_root, llm=None if mock else llm)
     memory_blocks = memory.blocks()
@@ -163,7 +167,7 @@ def run(
             engine = QueryEngine(
                 llm, registry, workspace_root=workspace_root, context=context,
                 session=session, memory_blocks=memory_blocks, on_event=printer,
-                permissions=permissions,
+                permissions=permissions, hooks=hooks,
             )
             typer.secho(
                 f"恢复会话 {sid}（step {restored.step}）→ 续跑", fg=typer.colors.CYAN, bold=True
@@ -174,7 +178,7 @@ def run(
             engine = QueryEngine(
                 llm, registry, workspace_root=workspace_root, context=context,
                 session=session, memory_blocks=memory_blocks, on_event=printer,
-                permissions=permissions,
+                permissions=permissions, hooks=hooks,
             )
             typer.secho(f"会话: {session.session_id}", fg=typer.colors.CYAN, bold=True)
             typer.secho(f"任务: {task}", fg=typer.colors.CYAN, bold=True)

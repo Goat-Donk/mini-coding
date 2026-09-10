@@ -243,8 +243,8 @@ def test_resume_branch_also_wires_permissions(tmp_path, monkeypatch):
     assert any("需要人工确认" in text for text in seen), seen
 
 
-def test_cli_does_not_wire_hooks(tmp_path, monkeypatch):
-    """本轮明确不接 hooks（默认 hook 会改变正常流程，需另行决定）。"""
+def test_cli_wires_both_governance_layers(tmp_path, monkeypatch):
+    """CLI 必须同时接权限引擎与 hooks —— 这两个都曾漏接过。"""
     monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
     monkeypatch.setattr(
         "app.cli._build_llm", lambda mock: MockLLM.script(LLMResult(content="完成"))
@@ -262,4 +262,4 @@ def test_cli_does_not_wire_hooks(tmp_path, monkeypatch):
 
     assert result.exit_code == 0
     assert captured.get("permissions") is not None, "CLI 必须接权限引擎"
-    assert captured.get("hooks") is None, "本轮不接 hooks"
+    assert captured.get("hooks") is not None, "CLI 必须接 hooks"

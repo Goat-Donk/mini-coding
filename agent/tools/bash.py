@@ -89,8 +89,12 @@ class BashTool(Tool):
             )
 
         # 3) 平台命令
+        # Windows 上必须传**字符串**而非列表：列表会走 subprocess.list2cmdline，
+        # 它把 command 里内嵌的双引号转义成 \" —— cmd 收到的是字面反斜杠+引号，
+        # 于是 `git commit -m "feat: x"` / `python -c "..."` 这类命令直接失败
+        # （git 会把消息后半段当成 pathspec）。传字符串则原样交给 CreateProcess。
         if sys.platform == "win32":
-            cmdline = ["cmd", "/c", args.command]
+            cmdline: list[str] | str = f"cmd /c {args.command}"
         else:
             cmdline = ["bash", "-lc", args.command]
 
