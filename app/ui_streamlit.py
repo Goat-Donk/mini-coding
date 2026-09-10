@@ -32,6 +32,12 @@ from agent.permissions import PermissionsEngine
 from agent.session import Session, new_session_id
 from agent.tools.base import ToolRegistry
 from agent.tools.subagent import SubagentTool
+from app.replay import (
+    list_checkpoint_sessions,
+    list_checkpoint_steps,
+    load_checkpoint,
+    render_message,
+)
 
 DEFAULT_WORKSPACE = Path(os.environ.get("WORKSPACE_ROOT", "workspace")).resolve()
 
@@ -264,6 +270,41 @@ if usage_pts:
             st.caption(f"会话 {session_id} · 检查点 " + "、".join(f"step-{s}" for s in cp_steps))
         else:
             st.caption(f"会话 {session_id} · 检查点写入中…")
+
+# ---------- M5-3 检查点回放视图 ----------
+replay_sessions = list_checkpoint_sessions(workspace)
+with st.expander(f"🎞 检查点回放（{len(replay_sessions)} 个会话）", expanded=False):
+    if not replay_sessions:
+        st.caption("暂无检查点。跑一个长任务（每 5 步落盘一次）后可在此回放每一步的完整对话。")
+    else:
+        c1, c2 = st.columns([2, 1])
+        replay_sid = c1.selectbox("会话", replay_sessions)
+        steps = list_checkpoint_steps(workspace, replay_sid)
+        replay_step = (
+            c2.selectbox("检查点", steps, format_func=lambda s: f"step-{s}")
+            if steps
+            else None
+        )
+        if replay_step is not None:
+            payload = load_checkpoint(workspace, replay_sid, replay_step)
+            if payload is None:
+                st.caption("检查点正在写入，稍后再试。")
+            else:
+                task = payload.get("task", "") or "（未知任务）"
+                term = payload.get("terminated_reason")
+                st.caption(
+                    f"任务：{task[:100]}" + (f" · 终止：{term}" if term else "")
+                )
+                for msg in payload.get("messages", []):
+                    role = msg.get("role", "?")
+                    label = {
+                        "system": "🖥 system",
+                        "user": "👤 user",
+                        "assistant": "🤖 assistant",
+                        "tool": "🔧 tool",
+                    }.get(role, role)
+                    st.markdown(f"**{label}**")
+                    st.code(render_message(msg), language=None)
 
 # ---------- 最终结果 ----------
 if st.session_state["done"]:
