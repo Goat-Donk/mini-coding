@@ -46,8 +46,8 @@
 
 ## M6 文档 + 打磨（Day 19–21）
 
-- [ ] M6-1 README 完善（mermaid 架构图）+ docs/architecture.md（逐层对应 CC 源码）
-- [ ] M6-2 docs/interview_guide.md（面试讲解稿）
+- [x] M6-1 README 完善（mermaid 架构图）+ docs/architecture.md（逐层对应 CC 源码）
+- [x] M6-2 docs/interview_guide.md（面试讲解稿）
 - [ ] M6-3 （有余力）MCP 客户端接入一个标准 MCP server
 - [ ] M6-4 录制演示视频（修 bug → 加功能 → 杀进程恢复 → 跨会话记忆）
 - [ ] M6-5 收尾：CLAUDE.md 精简为 Lean 约定版 + 最终 commit/push
@@ -56,6 +56,6 @@
 
 ## 进度快照
 
-- 当前里程碑：**M5 完成**（评估 + 控制台打磨；M5-1~M5-4 已全部 commit + push，156 测试绿）
-- 最近完成：M5-4 TECH_SPEC 同步（§9.6 golden_tasks / §9.6b runner / §9.7 回放视图对齐实现）
-- 下一步：**M6 文档 + 打磨**（M6-1 README + architecture.md mermaid → M6-2 interview_guide → 有余力 MCP）
+- 当前里程碑：**M6 进行中**（文档 + 打磨；M6-1/M6-2 已完成）
+- 最近完成：M6-2 面试讲解稿（含压力问题应答 + 5 分钟演示动线，演示命令均已实测）
+- 下一步：M6-3（有余力）MCP 客户端 → M6-4 演示视频 → M6-5 CLAUDE.md 收尾 + 最终 push
