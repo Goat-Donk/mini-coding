@@ -4,7 +4,7 @@
 **核心循环手写**（不套 LangGraph / Agent SDK），支撑层用成熟库（openai SDK / pydantic v2 / streamlit / typer / pytest）。
 
 > **一句话**：把 Claude Code 的架构用 Python 重写一遍——不是移植代码，是移植设计。
-> 4,158 行源码 / 19 个模块 / 184 个测试。真实跑分见[评估章节](#评估eval)。
+> 4,162 行源码 / 19 个模块 / 184 个测试。真实跑分见[评估章节](#评估eval)。
 
 📄 文档：[技术方案 `docs/TECH_SPEC.md`](docs/TECH_SPEC.md) · [架构详解 `docs/architecture.md`](docs/architecture.md) · [任务清单 `TASKS.md`](TASKS.md) · [参考笔记 `docs/reference/`](docs/reference/)
 
@@ -24,18 +24,24 @@
 | **research 子代理** | 把 `(X+Y)×N` 的探索外包，主上下文只收结论 `Z`；子代理只读、无 subagent 工具（天然禁递归） | SubAgent 上下文经济学 |
 | **MCP 客户端** | 手写 MCP stdio 客户端接入标准 MCP server；**第三方工具照样过权限与 hooks**（分层设计的回报） | MCP（工具接入标准） |
 
-### 实测：缓存命中率曲线（冷启动）
+### 实测：缓存命中率曲线（真·冷启动）
 
-cache-aware 布局不是设计推理，是**测出来的**。同一个 9 步修 bug 任务，逐步的缓存命中：
+cache-aware 布局不是设计推理，是**测出来的**。下面是 DeepSeek 官方通路（`deepseek-chat`）一次**真·冷启动**的逐步缓存命中——所谓冷启动是真的没命中：换个新的 workspace 目录，`{workspace_root}` 变了 → system prompt 前缀不同 → provider 侧缓存必然为空，所以 step 1 的命中率是 **0%**。
 
 ```
-step  1  prompt= 1248  命中 1024/1248 = 82%   ← 冷启动那轮此处为 0%
-step  4  prompt= 1670  命中 1536/1670 = 92%
-step  7  prompt= 2607  命中 2048/2607 = 79%
-step  9  prompt= 2973  命中 2560/2973 = 86%     累计 81%
+step  prompt   hit   miss   命中率
+   1    1376      0   1376    0%     ← 冷启动：整段前缀首次出现
+   2    1502   1280    222   85%
+   3    1939   1536    403   79%
+   4    2120   1920    200   91%
+   5    2294   2048    246   89%
+   6    2365   2176    189   92%
+                                 累计 77%（6 步修完 bug，12,064 token）
 ```
 
-冷启动那一轮的爬升更说明问题：**step1 0% → step2 66% → step3 78%** —— 稳定前缀（system + 任务 + 工具 schema）被缓存下来，后续步骤持续命中。命中量按 1024/1536/2048/2560 阶梯增长（provider 按块缓存）。
+这张表说明的就是 cache-aware 布局在做的事：**稳定前缀（system + 任务 + 工具 schema）一旦被缓存，后续每一步的 prompt 增量（新工具结果）只需付 miss 的钱**。命中量随步数单调增长（1280 → 1536 → 1920 → 2048 → 2176），因为每一步都在给已缓存的前缀续上新的一段。
+
+> 一个容易自欺的坑：同一条命令连着跑第二遍，step 1 就不再是 0% 了（前缀还在 provider 的磁盘缓存里，实测能到 85% 起步）。**那不是冷启动曲线**——要测冷启动必须换一个没跑过的工作目录。
 
 另外吸收了 [MiniCode](https://github.com/LiuMengxuan04/MiniCode) 的长会话治理经验：provider-usage-first token 记账、超大工具结果落盘+预览、确定性 snip 裁剪、空响应重试、细粒度权限决策。
 
@@ -206,14 +212,15 @@ dcf0a013  fix: correctly handle falsy values in LRUCache
 
 ### 实测结果（真实跑分，非预置）
 
-下面这组数字是**本机真实跑出来的**，不是写死在仓库里的：
+下面这组数字是**本机真实跑出来的**（DeepSeek 官方 API `https://api.deepseek.com` + `deepseek-chat`），不是写死在仓库里的：
 
 ```
-python -m eval.runner --limit 2
-完成率 50%（1/2 个有效任务） · token 269,767 · 估算成本 ¥0.2284 · 平均缓存命中率 89%
+$ python -m eval.runner --limit 2
+完成率 50%（1/2 个有效任务） · token 62,812 · 估算成本 ¥0.0625 · 平均缓存命中率 83%
 
-  ✗ 770486ff  fix: freeze unhashable args in Query.test…   12步 101287t ¥0.092  51.2s
-  ✓ e70f9b1d  fix: correct Table.update transform type hints  25步 168480t ¥0.136 164.0s
+  ✗ 770486ff  fix: freeze unhashable args in Query.test…    8步 30935t ¥0.030  22.5s
+  ✓ e70f9b1d  fix: correct Table.update transform type hints 8步 31877t ¥0.033  15.5s
+报告已存: data/eval/report-20260910-192731.json
 ```
 
 判定依据（judge 跑隐藏测试的真实输出，已落进报告）：
@@ -223,14 +230,15 @@ python -m eval.runner --limit 2
 | `770486ff` | `1 failed, 32 passed` — `TypeError: unhashable type: 'dict'` 仍在 | 没修好 |
 | `e70f9b1d` | `109 passed` | 真修好了 |
 
-> **口径说明（必读）**：下面这组数字是当初为了**先验证端到端能通**，临时借用 **DashScope（阿里百炼）的 OpenAI 兼容端点 + `deepseek-v4-flash`** 跑出来的。
-> 这是**临时验证手段，不是本项目的选定通路**：项目硬约束是「LLM 只用 DeepSeek 官方 API」（`https://api.deepseek.com` + `deepseek-chat`，见 [`.env.example`](.env.example)，代码默认值同）。
-> 因此命中率是 DashScope 的**前缀缓存**口径，与 DeepSeek 官方 `prompt_cache_hit_tokens` 机制同类但数值不等价。
-> **填好自己的官方 key 后，请重跑 `python -m eval.runner --limit 2` 取属于你的报告**——完成率、token、成本都会不一样。
->
-> 另：本机 agentrouter 的 key 走不通（它只放行 Claude Code 客户端，自写程序一律 `401 unauthorized client detected`，实测 6 种认证头组合 × 2 个端点全部 401）。要接自己的程序，用官方 API key。
+> **口径说明（必读）**：
+> - 本组数字来自**项目选定通路**（DeepSeek 官方，代码默认值即此），缓存命中率是官方 `usage.prompt_cache_hit_tokens` / `(hit+miss)` 的**原生口径**。
+> - 早期曾用 DashScope（阿里百炼）的 OpenAI 兼容端点 + `deepseek-v4-flash` 做过一次临时验证（同一批任务：1/2 完成、269,767 token、命中率 89%）。那是**临时手段、已弃用**，两组的命中率口径不同、数值不可直接比。同样的任务在官方 `deepseek-chat` 上步数与 token 都显著更低（12/25 步 → 8/8 步，269.8k → 62.8k token），但**样本只有 2 个任务，不足以支撑"某模型更强"的结论**，仅作记录。
+> - 本机 agentrouter 的 key 走不通（它只放行 Claude Code 客户端，自写程序一律 `401 unauthorized client detected`，实测 6 种认证头组合 × 2 个端点全部 401）。要接自己的程序，用官方 API key。
+> - **换自己的 key 重跑即可复现**：`python -m eval.runner --limit 2`。
 
 **一个真实踩过的坑（已修 + 已加回归测试）**：tinydb 的 `pytest.ini` 写死了 `--cov-append --cov-report term --cov tinydb`，本机没装 pytest-cov 时 pytest 会以 **usage error（退出码 4）直接退出**——测试一次都没跑。而 judge 原本只看 `returncode == 0`，于是把它算成"agent 没修好"，完成率被压成假的 **0%**。修法：judge 用 `-o addopts=` 清掉仓库自带 addopts，并把退出码 2/3/4/5（压根没跑成）识别为**无效判定**计入 `error`，不再污染完成率。同一个 bug 修前修后：`0/2` → `1/2`。
+
+**一条方法论上的自我更正**：M6-7 里我把「往 system prompt 注入工作目录」的 commit message 写成了「修 `--resume` 迷路的真根因」。后来用**同一任务、同一仓库、只换 system prompt** 做了 A/B，**步数收益没复现**（6 步 vs 6 步，两边都修好、都无瞎猜路径；`--resume` 续跑场景同样无差别）。因此如实改口径为**防御性健壮性改进**，并单独记录探针挖到的真差异：本机 `pwd` 被 Git for Windows 的 `pwd.exe` 抢占，返回 `/d/...` 这种 **POSIX 路径**（在 Windows 上不是合法路径），`cd` 才是对的——已写进平台提示。详见 [TASKS.md](TASKS.md) 与 [docs/interview_guide.md](docs/interview_guide.md) §10。
 
 报告字段：完成率（分母只算有效判定）/ 逐任务 steps / token / 耗时 / 成本（按 DeepSeek 公开定价 ¥0.5·¥2·¥8 每 M tokens 估算）/ 缓存命中率 / **judge 的 pytest 摘要**；agent 或 judge 抛异常会**如实记入 `error` 字段**，不会伪装成通过。
 
@@ -240,13 +248,13 @@ python -m eval.runner --limit 2
 
 | 层 | 文件 | 行数 |
 |---|---|---|
-| 核心循环 | `agent/loop.py` `llm.py` `state.py` `context.py` `tool_result.py` `session.py` | 1,270 |
+| 核心循环 | `agent/loop.py` `llm.py` `state.py` `context.py` `tool_result.py` `session.py` | 1,273 |
 | 治理 | `agent/permissions.py` `hooks.py` `memory.py` | 688 |
 | 工具 | `agent/tools/base.py` `bash.py` `files.py` `subagent.py` | 740 |
 | MCP | `agent/mcp.py` | 350 |
-| 入口 | `app/cli.py` `ui_streamlit.py` `replay.py` | 620 |
+| 入口 | `app/cli.py` `ui_streamlit.py` `replay.py` | 621 |
 | 评估 | `eval/golden_tasks.py` `runner.py` | 490 |
-| **源码合计** | **19 个模块** | **4,158** |
+| **源码合计** | **19 个模块** | **4,162** |
 | 测试 | `tests/` | 2,858（184 个用例） |
 
 ---

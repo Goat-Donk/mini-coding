@@ -59,8 +59,8 @@
 ## 进度快照
 
 - 当前里程碑：**M6 完成**（M6-1~M6-7 全部完成；M6-4 演示视频脚本见 docs/interview_guide.md §12）
-- 最近完成：M6-7 —— 修掉 M6-6 暴露的两个体验问题
-- 代码状态：4,158 行源码 / 19 模块 / 184 测试全绿
+- 最近完成：官方通路真实重跑 + M6-7 过度声称的更正（详见下方"验证中发现并修复的真 bug"第 3 条）
+- 代码状态：4,162 行源码 / 19 模块 / 184 测试全绿
 - 验证中发现并修复的真 bug：
   1. **judge 假阴性**：tinydb 的 `pytest.ini` 写死 `--cov*`，本机无 pytest-cov → pytest 以 usage error（退出码 4）退出，**测试一次没跑**，却被判成"没修好"，完成率被压成假的 0%。修法：`-o addopts=` + 把退出码 2/3/4/5 识别为无效判定（记入 error，不污染完成率）。修前 `0/2` → 修后 `1/2`
   2. **`--resume` 文档与实现不一致**：README/CLAUDE.md 写 `python -m app.cli --resume`，但 `task` 是必填位置参数 → 直接报 `Missing argument 'TASK'`。修法：`task` 改为可选 + 非 resume 时空任务报错
@@ -73,7 +73,7 @@
   4. **`pwd` 在 Windows 上返回无效路径**（本次 A/B 顺带挖出的真问题）：本机 `pwd` 被 Git for Windows 的 `D:\Git\usr\bin\pwd.exe` 抢占 → 返回 MSYS 风格 POSIX 路径 `/d/RAG项目/...`，**在 Windows 上不是合法路径**；`cd`（不带参数）返回的才是 `D:\RAG项目\...`。B 组就是这么写错的。修法：platform hint 里明确"确认当前目录用 `cd`，不要用 `pwd`"
   5. **CLI 跑完才一次性打印事件**：长任务中途零反馈。修法：`QueryEngine(on_event=...)` 实时回调 + `app/cli.py` 的 `EventPrinter`（**带锁** —— 只读工具并发执行时 `record_event` 会从多个工作线程回调，不加锁两行会交错）。顺带给 `Session.emit` 的 JSONL 写入加锁，让"append-only 不交错"成为真保证
 - 已知待改进（未修）：
-  - **真实跑分用的是临时通路，待换官方口径重跑**：README/M6-6 的数字来自当初临时借用的 DashScope（阿里百炼）端点 + `deepseek-v4-flash`（且用的是 vision MCP 那个 key，额度已跑光、现账号欠费）。项目选定通路是 DeepSeek 官方 API（`https://api.deepseek.com` + `deepseek-chat`，代码默认值即此，无需改代码）。`.env` 已改回官方，**填好官方 key 后必须重跑 `python -m eval.runner --limit 2` 换掉 README 里的数字**
+  - ~~**真实跑分用的是临时通路，待换官方口径重跑**~~ ✅ **已完成（2026-09-10）**：用 DeepSeek 官方 `deepseek-chat` 重跑 `python -m eval.runner --limit 2` → 完成率 50%（1/2）、62,812 token、¥0.0625、缓存命中 83%；README 的跑分与缓存曲线已全部换成官方口径（曲线为真·冷启动：step1 0% → 累计 77%）。历史 DashScope 数字只作为口径说明里的对照保留，并注明不可直接比。
   - **M6-7 的真实模型验证已补跑**（2026-09-10，DeepSeek 官方 `deepseek-chat`）：修 bug 任务 **5 步**修好（10,112 token / 缓存命中 73%）；kill → `--resume` 恢复后**第 4 步直接 `edit(path=calc.py)`**，无重新探路、无磁盘遍历，续跑至 11 步完成（缓存命中 90%）。轨迹扫描「瞎猜路径」4 类模式（`/workspace`、`C:\Users\<字母>`、`dir C:\Users`、全盘搜索）**无命中**
   - CLI 流式输出这条**已真实可见**（事件随步实时打印）；system prompt 注入工作目录这条的收益**见上条第 3 点的更正口径**
   - Streamlit 控制台只跑过 AppTest，没在浏览器里真开过
