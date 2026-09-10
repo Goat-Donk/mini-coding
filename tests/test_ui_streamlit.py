@@ -21,6 +21,10 @@ def app(tmp_path, monkeypatch):
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)  # 强制 mock 默认
     at = AppTest.from_file(APP_FILE, default_timeout=60)
     at.run()
+    # 本机若存在 .env，has_api_key() 里那次 load_dotenv() 会把它读回来，
+    # 勾选框默认就不是 mock 了 —— 这里显式勾上，保证测试永远不打真实网络。
+    at.checkbox[0].set_value(True)
+    at.run()
     return at
 
 
