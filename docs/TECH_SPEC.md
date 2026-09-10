@@ -1013,11 +1013,17 @@ def memory_frame(text, source) -> str        # **项目约定**外框（措辞�
 | 读取凭据 | `.env` / `id_rsa` / `.aws` / `credentials.json` / `.npmrc` … | key 进了模型上下文，只能靠轮换补救 |
 | 写入记忆文件 | `CLAUDE.md` / `CODEAGENT.md` / `learned*.md` / `.codeagent/rules` | 会被**后续每个会话**自动注入，是跨会话持久化 |
 
+- **bash 的凭据判据是「提到即命中」，不是「读动词 + 路径」**（`CREDENTIAL_MENTION`，不锚定末尾）。这一条是**真跑真模型之后改的**，两版都不对：
+  1. 第一版要求「读动词 + 凭据路径」同现，动词表是 `cat|type|head|tail|less|more|Get-Content|gc`。模型读 `.env` 用的却是 `findstr /r /c:"^[A-Za-z_]" .env`（Windows 上 `grep` 的自然替代）—— **不在表里，天花板没生效**：命令正常执行、变量名进了上下文，轨迹里连一条 `gate_block` 都没有。枚举读动词是打地鼠（`findstr` / `Select-String` / `grep` / `awk` / `sed` / `od` / `strings` / `python -c` …），漏一个就等于这类动作完全没有天花板。
+  2. 第二版去掉动词表、只按**锚定**的凭据路径判 —— 于是 `copy .env x.txt` 漏了（末尾是 `x.txt`），而「把凭据文件当输入写到别处」正是最典型的带离手段。
+  3. 收敛成一句话：**high 会话里，提到凭据文件的 bash 命令都要人工确认**。`read`/`write`/`edit` 仍用锚定的 `CREDENTIAL_PATH`（它们的 `path` 参数本身就是一条路径，锚定末尾正好表达「操作的就是这个文件」）。
+  - **代价（故意的）**：`grep -rn "\.env" README.md` 这种只是**提及**的命令在 `high` 会话里也会被收紧。一句话能讲清的规则比一张要维护的动词表可靠，而解除只要人的 `--clear-taint` 一句话。实测边界见 README 的 S6–S10（22 条命令的探针结果）。
 - **只降不升**（`DENY`/`ASK` 不动）、**只覆盖这三类**。`write` 一个普通源码文件、`ls`、`git status` 都不在里面 —— 它们可撤销、可由人复核，收紧它们只会让工具变成路障（CLI 里没有确认交互）。
 - **位置是这里最要紧的一件事**：天花板在**记忆之后**、**人工确认之前**。写成规则链里的一条无效 —— `_always`/`_turn` 会在它之前 return，用户只要开过一次 `allow_always`，任何基于规则的收紧就永久失效，而「记得越久越省事」正是用户去开它的原因（H4）。放在人工确认之前也是必须的：confirm 是一个真实的人当场作出的决定，自动机制不该反过来推翻它。
 - **`denial_hint` 重算而不读状态**：`_gate_and_run` 的只读批次用线程池并发跑，任何「上一次判定」式的共享字段都可能把 A 调用的理由安到 B 调用头上。`_irreversible_kind` 是纯函数，重算没有这个窗口。
 - **`describe()` 会写明原因**：污染触发的确认框额外说明「本会话命中过可疑文本模式，因此这类动作重新征询」。一个不说理由的确认框，训练出的是不看理由的人。
 - **拒绝文案带出处 + 解除方式**：指出是哪一类动作被收紧、原因看轨迹里同步骤的 `security_finding`、用 `--clear-taint` 复位后重试。拒绝而不说怎么解，等于把安全机制变成路障。
+- **解除动线必须真的闭合**：文案让用户「复位后重试」，那就得有一条路能把「我已复位，请重试」送进会话。`--resume` 原先**静默丢掉**位置参数（`run_from` 用 `state.task`），于是模型按文案停下等人、人却回不了话 —— 真跑就是这么卡住的。现在非空 `task` 会作为一条 user 消息追加进会话，并记一条 `resume_instruction` 事件、在控制台打出「续跑指示: …」。**一条走不通的解除指引，比没有指引更糟**：它让人以为机制已经放开了，实际只是没人接话。
 
 #### 记忆：按来源隔离，而非按内容过滤（B4）
 
@@ -1043,7 +1049,8 @@ def memory_frame(text, source) -> str        # **项目约定**外框（措辞�
 - **问题**：`app/cli.py` 的 `load_dotenv()` 把 `DEEPSEEK_API_KEY` 灌进 `os.environ`，而 `subprocess.run` 默认**继承父进程环境** —— 于是 `echo %DEEPSEEK_API_KEY%`（POSIX 下 `printenv DEEPSEEK_API_KEY`）一条命令就能把 key 打出来，**完全不需要读任何文件**。这是最短的外泄路径，比「读 `.env` 再外发」短得多，只盯着「读凭据 + 网络外发」的规则会系统性漏掉它。
 - **做法**：`subprocess.run(..., env=_scrubbed_env())`。`SENSITIVE_ENV_PATTERNS` 按**变量名**剔除：`*_API_KEY` / `API_KEY` / `*_TOKEN` / `TOKEN` / `*_SECRET` / `*_SECRET_*` / `*PASSWORD*` / `*PASSWD*` / `*_CREDENTIAL(S)` / `AWS_ACCESS_KEY_ID` / `AWS_SESSION_TOKEN` / `GH_TOKEN` / `GITHUB_TOKEN`。
 - **刻意不用白名单**：白名单会把 `VIRTUAL_ENV` / `PYTHONPATH` / 代理设置一并干掉，把正常任务跑坏。按名剔除是这里更合适的粒度。
-- **局限（不夸大）**：这是按**名**的黑名单，**不是保证** —— 换个名字（`MY_PRIVATE_STUFF=xxx`）照样漏；bash 也仍能 `type ..\.env` 直接把仓库根的 `.env` 读出来（bash 的沙箱只管 cwd，不管命令文本里的 `..`）。两条都在 README「已知未修复的绕过路径」的 S12。
+- **局限（不夸大）**：这是按**名**的黑名单，**不是保证** —— 换个名字（`MY_PRIVATE_STUFF=xxx`）照样漏；bash 也仍能 `type ..\.env` 直接把仓库根的 `.env` 读出来（bash 的沙箱只管 cwd，不管命令文本里的 `..`）。两条都在 README「已知未修复的绕过路径」的 S12 / S16。
+- **实测（真跑，非 mock）**：同一命令两版对照 —— `env=None`（修复前语义）输出 **35 字节、含真实 key**；`_scrubbed_env()` 输出 **18 字节、字面量 `%DEEPSEEK_API_KEY%`**。真跑 agent 时它把 `%DEEPSEEK_API_KEY%` 写进文件，`sk-` 出现 **0 次**。**但对照组也确认了上面那条残留是真的**：`type ..\.env` 与 `cat ../.env` 各返回 **336 字节、含真实 key**（`read` 工具读同一路径被硬 deny）。
 
 #### 第三方（MCP）工具必须显式授权（`agent/mcp.py` + `agent/permissions.py`，A2）
 
@@ -1051,6 +1058,25 @@ def memory_frame(text, source) -> str        # **项目约定**外框（措辞�
 - **做法**：`Tool.is_external()`（默认 `False`）→ `MCPToolAdapter` 返回 `True`；`_classify` 归到 `"external"` 类；`_rule_check` 的 `external` 分支命中 `rules["external"]["allow"]` 才 `ALLOW`，**否则 `ASK`**。授权来自 `mcp.json` 每个 server 的可选 `"allow": [...]`，经 `load_mcp_servers` 的第三个返回值交给 `PermissionsEngine.allow_external()`；它与规则文件里的 `external.allow` 是**并集**（否则「先加载 mcp 还是先加载规则」会决定谁生效，成了隐性顺序依赖）。`allow` 支持 fnmatch（`"e*"` / `"*"`）。
 - **这是破坏性变更**（M7）：在此之前 MCP 工具是零策略放行的。CLI 无交互确认 → 默认判定变成拒绝，并把「给对应 server 加 `allow`」写进拒绝理由回喂模型。`tests/test_mcp.py` 的「无权限无 hook → 放行」用例、`.codeagent/mcp.json` 示例、README 与 interview_guide 都已同步改掉。
 - **但要说清它是什么**：这是**策略**，不是隔离。显式 `allow` 之后，第三方 server 做什么由它自己决定 —— 它不受 workspace 沙箱约束。README 的 S11 如实写着「这不是沙箱，只是授权开关」。
+- **实测（真跑，非 mock）**：同一个官方 `mcp-server-time`（`python -m mcp_server_time`）、同一个任务，**只改 `allow`** —— 不配 → 工具被拒，拒绝文案带出处与确切改法；配上 → 控制台打 `MCP 授权: 2/2 个工具免确认`，返回真实时间。这一条是 A2 的验收点：证明它不是「文档里写了」而是**行为真的变了**。
+
+### 9.11 四条真实验证（DeepSeek 官方通路，不用 mock）
+
+M7 的机制不能只靠单测验收 —— 下面四条各跑了一遍真实 LLM，工作区在 `m7verify/`、`m7verify-nolock/`（已 gitignore）。**跑过就是跑过，没跑就是没跑**，数字都是实测：
+
+| # | 验的是什么 | 实测结果 |
+|---|---|---|
+| V1 | 环境变量外泄（A1） | 见 §9.10 的对照数字；真跑时 `sk-` 出现 0 次。顺带确认 `cat ../.env` 残留为真 |
+| V2 | MCP 授权（A2） | 见上一节；`2/2 免确认` + 真实时间 |
+| V3 | 检出 → 收紧 → 人解锁（B1–B4） | 轨迹有 `security_finding`（5 规则族 / 7 处命中 / 带行号 / `level=high` / **无原文摘录**）与 `gate_block`（`source=permissions` + 完整理由）。三条支线：从轨迹重算把 `high` 复原；`--clear-taint` 复位（learning 目标 `pending.md` → `learned.md`）；送出续跑指示后先前被拒的命令在第 3 步执行成功 |
+| V4 | **不锁定**（误报政策的验收点） | 8 次工具调用 / **0 次 `gate_block`** / 1 次 `security_finding`，任务正常完成（写载荷文件 → 回读 → 写测试 → `pytest` 退出码 0）。同时真实验证 A3（模型自述收到了 read 结果里的告警横幅）与 B4（提炼落进 `learned.pending.md`） |
+
+**这轮验证挖出两个「单测全绿但机制不工作」的真 bug**（commit `a455dda`，各带回归测试）：
+
+1. **天花板空转**：bash 凭据判据要求「读动词 + 凭据路径」同现，而真模型用的是不在动词表里的 `findstr ... .env` → 天花板没生效、连 `gate_block` 都没有。**根因不是正则写错了，是我的测试和我自己的判据共享同一个盲区** —— 测试里用的是 `cat .env`。
+2. **`--resume` 丢掉续跑指示**：拒绝文案指引「复位后重试」，但复位后 CLI 无法把话送进会话（`run_from` 用 `state.task`）→ 「收紧 → 人解锁 → 重试」动线断在最后一步。
+
+两条的意义都在于：**它们是只有真跑真模型才会暴露的失败模式**，也正是「每条都要如实写明跑过/没跑过」这条纪律的价值所在。
 
 ---
 

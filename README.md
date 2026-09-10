@@ -4,7 +4,7 @@
 **核心循环手写**（不套 LangGraph / Agent SDK），支撑层用成熟库（openai SDK / pydantic v2 / streamlit / typer / pytest）。
 
 > **一句话**：把 Claude Code 的架构用 Python 重写一遍——不是移植代码，是移植设计。
-> 5,191 行源码 / 20 个模块 / 266 个测试。真实跑分见[评估章节](#评估eval)。
+> 5,237 行源码 / 20 个模块 / 268 个测试。真实跑分见[评估章节](#评估eval)。
 
 📄 文档：[技术方案 `docs/TECH_SPEC.md`](docs/TECH_SPEC.md) · [架构详解 `docs/architecture.md`](docs/architecture.md) · [任务清单 `TASKS.md`](TASKS.md) · [参考笔记 `docs/reference/`](docs/reference/)
 
@@ -204,7 +204,7 @@ python -m eval.runner --limit 2 --mock           # 无 key 冒烟：只验证管
 **测试**：
 
 ```bash
-python -m pytest tests/                  # 266 passed
+python -m pytest tests/                  # 268 passed
 ```
 
 ---
@@ -271,13 +271,13 @@ $ python -m eval.runner --limit 2
 | 层 | 文件 | 行数 |
 |---|---|---|
 | 核心循环 | `agent/loop.py` `llm.py` `state.py` `context.py` `tool_result.py` `session.py` | 1,447 |
-| 治理 | `agent/permissions.py` `hooks.py` `memory.py` `security.py` | 1,376 |
+| 治理 | `agent/permissions.py` `hooks.py` `memory.py` `security.py` | 1,408 |
 | 工具 | `agent/tools/base.py` `bash.py` `files.py` `subagent.py` | 796 |
 | MCP | `agent/mcp.py` | 386 |
-| 入口 | `app/cli.py` `ui_streamlit.py` `replay.py` | 696 |
+| 入口 | `app/cli.py` `ui_streamlit.py` `replay.py` | 710 |
 | 评估 | `eval/golden_tasks.py` `runner.py` | 490 |
-| **源码合计** | **20 个模块** | **5,191** |
-| 测试 | `tests/` | 4,501（266 个用例） |
+| **源码合计** | **20 个模块** | **5,237** |
+| 测试 | `tests/` | 4,584（268 个用例） |
 
 ---
 
@@ -330,13 +330,19 @@ coding_agent/
 
 ### 二、门禁（确定性，但判据是词法的）
 
+下面每条的「实测」都是我写了个只打印判定结果、不改动任何东西的探针（22 条命令）跑出来的真实结果，不是推演。
+
 | # | 绕过路径 | 说明 |
 |---|---|---|
-| S6 | **`curl` 换成脚本就绕过网络外发判据** | `_irreversible_kind` 认的是 `curl/wget/nc/scp/...` 与 `requests.`/`httpx.` 等词。写个 python 脚本用 `http.client` 发包，不在判据里 |
-| S7 | **`.env` 改名即绕过凭据判据** | 认的是文件名。`config.txt` 里放 key 就不在判据里 |
-| S8 | **bash 仍能读写记忆文件** | 三类动作里「写记忆文件」覆盖 `write`/`edit` 与部分命令写法，但 `python -c "open('CLAUDE.md','w')"` 这类绕道不在判据内 |
+| S6 | **`curl` 换成脚本就绕过网络外发判据** | `_irreversible_kind` 认的是 `curl/wget/nc/scp/...` 与 `requests.`/`httpx.` 等词。实测：`python upload.py`、`python -c "import http.client"` 均不命中。另有一个**词法前缀**导致的漏判：`powershell -c "Invoke-WebRequest -Uri http://x -Method POST"` 也不命中 —— 判据要求动词前是 `^`/空白/`;&|(`，而这里前面是引号 |
+| S7 | **`.env` 改名即绕过凭据判据** | 认的是文件名。实测：`cat config.txt`、`cat secret.txt`、`cat ENV~1`（Windows 短名）均不命中；`python -c "print(open(chr(46)+'env').read())"`（运行时拼文件名）也不命中 |
+| S8 | **bash 部分写法仍能写记忆文件** | 「写记忆文件」这条判据**末尾锚定**，所以 `echo hi > CLAUDE.md`（`CLAUDE.md` 前是空格不是 `^`/分隔符）实测**不命中**；`python -c "open('CLAUDE.md','w')"` 同样不命中。命中的是 `.codeagent/rules/` 那半边（实测 `echo hi >> .codeagent/rules/learned.md` 命中）——因为它不以 `$` 锚定 |
 | S9 | **`high` 只在**当前**会话生效** | 标记随会话结束而结束。新会话是干净的 —— 这对可用性是必要的，但也意味着攻击可以「一个会话投毒，下个会话收割」，只要中间没有人类的复位动作参与 |
-| S10 | **判定用的是原始参数字符串** | 没做路径规范化后再匹配（`./.env`、`sub/../.env`、Windows 短名等变体未逐一验证） |
+| S10 | **判定用的是原始参数字符串** | 没做路径规范化后再匹配。**但凭据这一类已经不受影响了**：bash 的判据在 M7 验证后改成了「只要**提到**凭据文件即命中、不锚定末尾」，实测 `cat ./.env`、`cat sub/../.env`、`cat .env.local`、`type "C:\proj\.env"`、`cat $HOME/.env`、`cp .env /tmp/x`、`certutil -encode .env out.txt` 全部命中。剩下的规范化缺口在 Windows 短名（`ENV~1`，见 S7）与未列入文件名清单的凭据文件 |
+
+**S10 的代价是故意的收紧**，一并写在这里免得被当成 bug：因为判据从「读动词 + 凭据路径」放宽成「提到凭据文件」，`grep -rn "\.env" README.md` 这种**只是提及**这个词的命令，在 `high` 会话里也会被收紧成「需人工确认」。取舍理由是：一句话能讲清的规则（「high 会话里提到凭据文件的 bash 命令都要人工确认」）比一张要不断补的读动词表可靠 —— 动词表是打地鼠（`cat`/`type`/`findstr`/`Select-String`/`grep`/`awk`/`sed`/`od`/`strings`/`python -c` …），漏一个就等于这类动作**完全没有**天花板；而多收紧一条的代价，人的 `--clear-taint` 一句话就能解除。
+
+顺带说明一处**不属于本表**的命中：`git push origin main` 的 `_irreversible_kind` 是 `None`，但它本来就由 bash 工具自带的危险模式判成 `ask` —— 走的是另一层，不是污染天花板。
 
 ### 三、结构性（未做完整覆盖）
 
@@ -347,8 +353,25 @@ coding_agent/
 | S13 | **记忆文件仍会原样进 system prompt** | 只加了来源标注与框架声明，没有内容审查。克隆一个仓库，它自带的 `CLAUDE.md` 依然会被注入 —— 门槛从「无声注入」抬到「声明了来源、模型被要求报告越界要求」，但**没有阻断** |
 | S14 | **`@include` 的目录黑名单是枚举的** | 只拒了 `data/tool-results/`。agent 自己写出的其它目录（如 `data/sessions/`）没在名单里 |
 | S15 | **没有子代理/工具层的隔离** | 子代理是「受限只读工具集」，不是沙箱。它跑在同一进程、同一 workspace、同一份环境变量下 |
+| S16 | **bash 子进程根本不经过路径沙箱** | 这是 M7 验证时实测到的、也是这份清单里最该先修的一条：`read`/`write`/`edit` 的越界检查走 `_resolve`（第一优先级硬 deny），但 **bash 的 `command` 参数没有任何路径越界判据** —— 沙箱是「工具层的路径解析」，而 bash 把它整个绕过去了。实测：工作区里 `type ..\.env` 与 `cat ../.env` 各自返回 336 字节、内容含**真实 key**（对照组：`read` 工具读同一路径被硬 deny）。环境变量清洗（S12）挡住了最短的那条路，但挡不住这一条 |
 
-**这份清单会过时**：它不是「设计上不允许」，是「截至 `d03f413` 还没做」。逐条修掉其中任何一条，都应该同时改这张表。
+**这份清单会过时**：它不是「设计上不允许」，是「截至 `a455dda` 还没做」。逐条修掉其中任何一条，都应该同时改这张表。
+
+### 四、这四条是**真跑过真实 LLM** 验出来的（不是单测）
+
+上面这些边界里，有几条不是读代码推出来的，是拿 DeepSeek 官方通路真跑出来的（不是 mock）：
+
+| 验证 | 做法 | 真实结果 |
+|---|---|---|
+| 环境变量外泄 | 同一命令跑两次：一次传 `env=None`（修复前语义），一次传 `_scrubbed_env()` | 前一次输出 35 字节、**含真实 key**；后一次输出 18 字节、字面量 `%DEEPSEEK_API_KEY%`。真跑 agent 时它把 `%DEEPSEEK_API_KEY%` 写进了文件，`sk-` 出现 0 次 |
+| MCP 授权 | 同一个 server（`mcp-server-time`）、同一个任务，只改 `allow` | 不配 `allow` → 工具被拒，拒绝文案带出处与**确切改法**；配上 → `MCP 授权: 2/2 个工具免确认`，真实时间返回 |
+| 注入检出 → 收紧 → 人解锁 | 工作区放一个含载荷的文件，让 agent 读到 | 轨迹里有 `security_finding`（5 个规则族 / 7 处命中 / 行号 / `level=high`，**不含原文摘录**）与 `gate_block`（带 `source` 与完整理由）；`--clear-taint` 复位后重试成功 |
+| **不锁定** | agent 自己写含载荷的测试文件、再读回、再跑 `pytest` | 8 次工具调用、**0 次 `gate_block`**、任务正常完成 —— 这是「只收紧不可逆动作」这条误报政策的验收点 |
+
+**这轮验证挖出并修掉了两个真 bug**（都在 `a455dda`，各带一条回归测试）：
+
+1. **天花板在实践中是空转的。** 原先 bash 的凭据分支要求「读动词 + 凭据路径」同现，动词表是 `cat|type|head|tail|less|more|Get-Content|gc`；模型读 `.env` 用的却是 `findstr ... .env`（Windows 上 `grep` 的自然替代）—— 不在表里，于是**天花板没生效**：命令正常执行，变量名进了上下文。这是「单测全绿但机制实际不工作」的典型样本。
+2. **`--resume "补充说明"` 会静默丢掉这个参数。** 拒绝文案让用户「用 `--clear-taint` 复位后再重试」，但复位之后 CLI 没有办法把「我已复位，请重试」送进会话（`run_from` 用的是 `state.task`）。模型按文案指引停下等人，人却回不了话 —— 整条「收紧 → 人解锁 → 重试」的动线断在最后一步。真跑时就是这么卡住的。
 
 ---
 

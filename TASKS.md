@@ -75,7 +75,7 @@
 - [x] B3 `AgentState.taint` 会话级粗粒度标记：只升不降、**没有 `set_taint`**、唯一复位者是人的动作（CLI `--clear-taint`）
 - [x] B4 记忆按**来源**隔离而非按内容过滤：`memory_frame` 来源框架 + `high` 会话写入 `learned.pending.md`（不自动注入）+ `@include` 拒 `data/tool-results/` 与深度上限
 - [x] B5 `tests/test_security.py`：25 例（payload 必命中 / 良性必不误报 / 文档讲注入不判 high / **自建样例集如实报实测数** / 天花板位置 / 端到端 / 场景 B 不锁死 / resume 往返 / fail-open）
-- [x] B6 README「已知未修复的绕过路径」S1–S15 —— **本项可信度最高的部分**，写「已知绕过」比写「实现了注入防御」强得多
+- [x] B6 README「已知未修复的绕过路径」S1–S16 —— **本项可信度最高的部分**，写「已知绕过」比写「实现了注入防御」强得多。S6–S10 每条都配了探针实测结果，S16 是最该先修的那条
 
 ### Part C 文档
 
@@ -87,18 +87,23 @@
 
 ### 真实 LLM 端到端验证（DeepSeek 官方通路，不用 mock）
 
-- [ ] V1 H1 外泄拦截：让 agent 跑 `echo %DEEPSEEK_API_KEY%`，确认输出不含真实 key
-- [ ] V2 H2 MCP 授权：不配 `allow` → 被拒；配上 → 放行
-- [ ] V3 注入检出：workspace 放含 payload 的文件 → agent 读到 → 轨迹出现 `security_finding` + `gate_block`（带出处）→ `--clear-taint` 后恢复
-- [ ] V4 不锁定验证：agent 自己写含 payload 的测试文件再回读 → **普通编辑/跑测试全程不受影响**（用户选的误报政策的验收点）
+四条**全部跑完**（2026-09-10），工作区在 `m7verify/` 与 `m7verify-nolock/`（**已 gitignore**：里面是真实轨迹/检查点与刻意放置的载荷样本，载荷进仓库会给本项目自己的检测器添一条已知误报）。实测数字如下，未跑过的不写。
+
+- [x] V1 H1 外泄拦截：同一命令跑两次对照 —— `env=None`（修复前语义）输出 **35 字节、含真实 key**；`_scrubbed_env()` 输出 **18 字节、字面量 `%DEEPSEEK_API_KEY%`**。真跑 agent 时它把 `%DEEPSEEK_API_KEY%` 写进文件，`sk-` 出现 **0 次**。
+      **顺带挖出一条更严重的残留**：环境变量挡的是最短路径，但 bash **根本不经过路径沙箱** —— 实测 `type ..\.env` 与 `cat ../.env` 各返回 **336 字节、含真实 key**（对照：`read` 工具读同一路径被硬 deny）。已补进 README 的 S16。
+- [x] V2 H2 MCP 授权：同一个官方 `mcp-server-time`、同一个任务，只改 `allow` —— 不配 → 被拒且理由带出处与确切改法；配上 → `MCP 授权: 2/2 个工具免确认`，返回真实时间（2026-09-10 22:05:12）
+- [x] V3 注入检出：轨迹里有 `security_finding`（**5 个规则族 / 7 处命中 / 带行号 / `level=high` / 不含原文摘录**）与 `gate_block`（带 `source=permissions` 与完整理由）。三条支线：X 从轨迹重算把 `high` 复原；Y `--clear-taint` 复位（learning 目标从 `pending.md` 翻回 `learned.md`）；Z 送出续跑指示后，先前被拒的 `findstr .env` 在第 3 步执行成功
+- [x] V4 不锁定验证：**8 次工具调用 / 0 次 `gate_block` / 1 次 `security_finding`**，任务正常完成（写载荷文件 → 回读 → 写测试 → `python -m pytest -q` 退出码 0）。这一轮同时真实验证了 A3（模型自述收到了 read 结果里的**安全告警横幅**）与 B4（提炼结果落进 `learned.pending.md`）
+
+**另外跑了一个边界探针**（`m7verify/boundary_probe.py`，22 条命令，只打印判定不改动任何东西），用来把 README 的 S 表从「推演」变成「实测」：凭据类 10 种写法（含 `./.env`、`sub/../.env`、`cat $HOME/.env`、`cp .env /tmp/x`、`certutil -encode .env`）**全部命中**；改名/短名/运行时拼名（`config.txt`、`ENV~1`、`chr(46)+'env'`）**全部不命中**；`echo hi > CLAUDE.md` **不命中**（末尾锚定）而 `echo hi >> .codeagent/rules/learned.md` 命中；`python upload.py` 与 `powershell -c "Invoke-WebRequest ..."` 不命中。
 
 ---
 
 ## 进度快照
 
-- 当前里程碑：**M7 完成**（M7-1~M7-6 + Part C 全部完成；四条真实 LLM 端到端验证 V1–V4 待在官方通路跑）
-- 最近完成：M7 安全机制加固（结构性 A1–A7 + 检测器 B1–B6 + 文档 C1–C5）
-- 代码状态：5,191 行源码 / 20 模块 / 266 测试全绿
+- 当前里程碑：**M7 完成**（M7-1~M7-6 + Part C 全部完成；四条真实 LLM 端到端验证 V1–V4 已全跑，工作区 `m7verify/`、`m7verify-nolock/` 已 gitignore）
+- 最近完成：M7 安全机制加固（结构性 A1–A7 + 检测器 B1–B6 + 文档 C1–C5 + 真实验证 V1–V4 及其发现的两个真 bug）
+- 代码状态：5,237 行源码 / 20 模块 / 268 测试全绿
 - 验证中发现并修复的真 bug：
   1. **judge 假阴性**：tinydb 的 `pytest.ini` 写死 `--cov*`，本机无 pytest-cov → pytest 以 usage error（退出码 4）退出，**测试一次没跑**，却被判成"没修好"，完成率被压成假的 0%。修法：`-o addopts=` + 把退出码 2/3/4/5 识别为无效判定（记入 error，不污染完成率）。修前 `0/2` → 修后 `1/2`
   2. **`--resume` 文档与实现不一致**：README/CLAUDE.md 写 `python -m app.cli --resume`，但 `task` 是必填位置参数 → 直接报 `Missing argument 'TASK'`。修法：`task` 改为可选 + 非 resume 时空任务报错
@@ -132,4 +137,11 @@
     - **测试**：`tests/test_hooks.py` 新增 6 例（marker 写入/清除/非测试命令不碰/多种 test runner 识别/`default_engine` 一条链走完/真 pytest 端到端）；`tests/test_cli.py` 6 例（真跑 CLI + 引擎替身：危险命令 `ask` 且模型收到「权限拒绝」、普通工具 `ALLOW`、路径越界 `DENY`、`--resume` 分支同样接线、权限与 hooks 两层都接上）。
     - 沙箱本身没漏（`files.py` 每个路径都 `_resolve` 校验、`bash.py` 的 cwd 校验无条件生效）——漏的是规则引擎与 hooks 这两层，现已补上。
   - **Windows 上 bash 工具把双引号转义坏掉**（2026-09-10 接 hooks 时顺带挖出，**已修**）：`subprocess.run(["cmd", "/c", command])` 是列表参数 → Windows 上走 `subprocess.list2cmdline`，它把 command 里内嵌的 `"` 转义成 `\"`，cmd 收到的是字面反斜杠+引号。后果不是显示乱码而是**命令直接失败**：`git commit -m "feat: x"` 实测报 `error: pathspec '…"' did not match any file(s)`（git 把消息后半段当成 pathspec），`python -c "..."` 同理。修法：win32 上传**字符串** `f"cmd /c {command}"`（不经 list2cmdline，原样交给 CreateProcess）。回归测试 `tests/test_tools.py::test_bash_preserves_double_quotes`。这个 bug 正是接 hooks 才暴露的——block-at-submit 的演示动线就是 `git commit -m "..."`。
+  - **污染天花板在实践中是空转的**（2026-09-10 真跑 V3 时挖出，**已修**，commit `a455dda`）：`_irreversible_kind` 的 bash 凭据分支要求「读动词 + 凭据路径」同现，动词表是 `cat|type|head|tail|less|more|Get-Content|gc`。模型读 `.env` 用的却是 `findstr /r /c:"^[A-Za-z_]" .env`（Windows 上 `grep` 的自然替代）——**不在表里**，于是天花板没生效：命令正常执行、变量名进了上下文，轨迹里连一条 `gate_block` 都没有。
+    - 第一版修法是「去掉动词表、只按锚定的凭据路径判」，结果 `copy .env x.txt` 漏了（末尾是 `x.txt`）——而「把凭据文件当输入写到别处」正是最典型的带离手段。
+    - 最终判据收敛成一句话：**high 会话里，提到凭据文件的 bash 命令都要人工确认**（新增 `CREDENTIAL_MENTION`，不锚定末尾；read/write/edit 仍用锚定的 `CREDENTIAL_PATH`）。
+    - **这条的意义不在于修了一个正则，而在于它是一个「单测全绿但机制实际不工作」的样本**：原有的权限测试全部通过，因为测试里用的是 `cat .env` —— 我自己写的测试和我自己的判据共享同一个盲区。只有真跑真模型才会用出 `findstr`。回归测试 `tests/test_security.py::test_ceiling_catches_credential_read_whatever_the_verb` 钉住了 15 种写法（含真跑出现的那条 `findstr`）。
+  - **`--resume "补充说明"` 静默丢掉这个参数**（2026-09-10 真跑 V3 支线 Y/Z 时挖出，**已修**，commit `a455dda`）：拒绝文案让用户「用 `--clear-taint` 复位标记再重试」，但 `run_from` 用的是 `state.task`，位置参数被直接忽略 —— 复位之后 CLI 没有任何办法把「我已复位，请重试」送进会话。真跑时就是这么卡住的：模型按拒绝文案的指引停下等人，人却回不了话，整条「收紧 → 人解锁 → 重试」的动线断在最后一步（轨迹显示标记确实翻过来了，但模型永远没重试）。
+    - 修法：`task` 非空时作为一条 user 消息追加进会话 + 记一条 `resume_instruction` 事件 + 控制台打印「续跑指示: …」，并把参数 help 改成「`--resume` 时作为**续跑指示**追加进会话」。回归测试 `tests/test_cli.py::test_resume_instruction_is_delivered_not_dropped`。
+    - **同类教训**：这两个 bug 都是「机制写了、单测过了、真跑才发现没生效」——诚实记录它们的价值高于多写十条单测。
 
