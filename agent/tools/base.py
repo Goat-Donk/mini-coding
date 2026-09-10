@@ -11,9 +11,12 @@ import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, ClassVar, Iterable, Type
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, Iterable, Type
 
 from pydantic import BaseModel, ValidationError
+
+if TYPE_CHECKING:
+    from agent.state import AgentState
 
 
 @dataclass
@@ -54,10 +57,14 @@ class ToolContext:
 
     workspace_root: Path
     cwd: Path | None = None
-    settings: dict = field(default_factory=dict)
-    emitter: Callable[[dict], None] | None = None   # 轨迹事件回调（M3 接 session）
+    emitter: Callable[[dict], None] | None = None   # 轨迹事件回调（= state.emitter）
     permissions: object | None = None               # M2 接入
     hooks: object | None = None                     # M2 接入
+    # M8：会话状态（`AgentState`）。工具要写"跨回合的状态"（当前只有
+    # `update_plan` 写 `state.plan`）时经由它，而不是各自去摸全局。
+    # 用字符串注解 + TYPE_CHECKING：base 是 tools 包的底座，不该在运行期
+    # 依赖 agent.state（虽然目前没有环，但底座依赖上层是反的）。
+    state: "AgentState | None" = None
 
     def __post_init__(self) -> None:
         if self.cwd is None:
@@ -173,14 +180,23 @@ class ToolRegistry:
 
     @classmethod
     def default(cls, workspace_root: Path) -> "ToolRegistry":
-        """默认工具集：bash + read/write/edit/glob/grep（M4 加 subagent）。
+        """默认工具集：bash + read/write/edit/glob/grep（M4 加 subagent，M8 加 plan）。
 
         延迟导入避免循环依赖（base 是 tools 包的底座）。
+
+        `update_plan` 在这里而不是按入口注册：它只依赖 `ctx.state`（引擎总会填），
+        零副作用（不碰工作区、不需要外部配置、不需要人），符合「进 default()」的
+        判据。副作用要说清楚：`eval/runner.py` 用 `default()`，所以评测里的 agent
+        也会拿到它 —— 那是能力不是负担（eval 是单发任务，写不写计划都不失真），
+        而且它**不需要**任何外部配合，不存在 `ask_user` 那种"没人在就挂住"的问题。
         """
         from agent.tools.bash import BashTool
         from agent.tools.files import EditTool, GlobTool, GrepTool, ReadTool, WriteTool
+        from agent.tools.plan import UpdatePlanTool
 
         registry = cls()
-        for tool_cls in (BashTool, ReadTool, WriteTool, EditTool, GlobTool, GrepTool):
+        for tool_cls in (
+            BashTool, ReadTool, WriteTool, EditTool, GlobTool, GrepTool, UpdatePlanTool,
+        ):
             registry.register(tool_cls())
         return registry

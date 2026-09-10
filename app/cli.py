@@ -29,6 +29,7 @@ from agent.session import Session, latest_session, new_session_id
 from agent.state import user as user_message
 from agent.tools.ask import build_ask_tool
 from agent.tools.base import ToolRegistry
+from agent.tools.plan import render_plan
 from agent.tools.skills import build_skill_tools
 from agent.tools.subagent import SubagentTool
 
@@ -99,6 +100,29 @@ def _build_llm(mock: bool) -> BaseLLM:
     return DeepSeekClient()
 
 
+def _print_plan(workspace_root: Path, session_id: str | None, step: int | None) -> None:
+    """打印某个会话的计划清单（`--plan`）。
+
+    计划是**检查点里的一个字段**，读它就够了 —— 所以这条路径不需要 API key、
+    不建会话、不跑任务（也因此它在 `_build_llm` 之前处理）。
+    """
+    sid = session_id or latest_session(workspace_root)
+    if sid is None:
+        typer.secho(
+            "没有可读的会话检查点（data/checkpoints/ 为空）", fg=typer.colors.YELLOW
+        )
+        raise typer.Exit(1)
+    try:
+        _, state = Session.from_checkpoint(workspace_root, sid, step=step)
+    except FileNotFoundError as exc:
+        typer.secho(f"读不到检查点: {exc}", fg=typer.colors.YELLOW)
+        raise typer.Exit(1)
+    typer.secho(f"会话 {sid} 的计划:", fg=typer.colors.CYAN, bold=True)
+    # 空清单不要复用 render_plan 的"已清空"文案：那是 update_plan 清空动作的说法，
+    # 而这里只是"这个会话没排过计划"。
+    typer.echo(render_plan(state.plan) if state.plan else "（该会话没有计划清单）")
+
+
 @app.command()
 def run(
     task: str = typer.Argument(
@@ -106,6 +130,10 @@ def run(
     ),
     mock: bool = typer.Option(False, "--mock", help="无 key 演示"),
     resume: bool = typer.Option(False, "--resume", help="从检查点续跑（不新建会话）"),
+    plan: bool = typer.Option(
+        False, "--plan",
+        help="只打印最近会话的**任务计划清单**后退出（agent 自己排的，不是 TASKS.md）",
+    ),
     session_id: str | None = typer.Option(
         None, "--session-id", help="会话 id（--resume 时指定；默认取最近 session）"
     ),
@@ -124,13 +152,17 @@ def run(
     ),
 ):
     """在 workspace 内执行一个任务（或从检查点续跑）。"""
+    workspace_root = _default_workspace()
+    if plan:
+        # 放在"任务不能为空"检查之前：--plan 本来就不带任务
+        _print_plan(workspace_root, session_id, step)
+        raise typer.Exit()
     if not resume and not task.strip():
         typer.secho(
             '请提供任务描述，例如：python -m app.cli "读 README 并总结项目结构"',
             fg=typer.colors.YELLOW,
         )
         raise typer.Exit(1)
-    workspace_root = _default_workspace()
     workspace_root.mkdir(parents=True, exist_ok=True)
 
     llm = _build_llm(mock)
@@ -229,6 +261,21 @@ def run(
                 # 所以这次复位在下次 resume 重算时同样有效（不会被旧事件抬回去）。
                 restored.clear_taint(reason="cli:--clear-taint")
                 typer.secho("污染标记已复位为 none", fg=typer.colors.GREEN)
+            if restored.plan:
+                # 恢复时**补一次**计划：它很可能已经被 compact（snip/摘要）裁掉了
+                # —— 那样模型就失去了"我排到哪了"，而计划正是为跨回合准备的。
+                # 只在恢复时补、而不是每轮都贴：每轮贴等于把"计划有没有变"变成
+                # "消息有没有变"，一变就破坏 `_PREFIX_LEN` 之后的前缀缓存。
+                # 用 user 角色 + 说明来源：计划是 agent 自己产出的，不加以说明地
+                # 当成"用户说的话"塞进去，模型会以为是人给的指令。
+                restored.messages.append(
+                    user_message(
+                        "（会话恢复：这是你之前列的计划清单，继续按它推进）\n"
+                        + render_plan(restored.plan)
+                    )
+                )
+                restored.record_event("plan_resumed", items=len(restored.plan))
+                typer.secho(f"计划恢复: {len(restored.plan)} 条", fg=typer.colors.CYAN)
             if task.strip():
                 # 续跑指示：`--resume "..."` 曾经**静默丢掉**这个参数（run_from 用的是
                 # state.task），于是「拒绝文案让你 --clear-taint 复位后重试」这条动线

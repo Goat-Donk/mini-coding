@@ -131,9 +131,9 @@ def test_toolresult_ok():
 
 def test_registry_default_tools(tmp_path):
     registry = ToolRegistry.default(tmp_path)
-    assert set(registry.names()) == {"bash", "read", "write", "edit", "glob", "grep"}
+    assert set(registry.names()) == {"bash", "read", "write", "edit", "glob", "grep", "update_plan"}
     assert {t.name for t in registry.read_only()} == {"read", "glob", "grep"}
-    assert {t.name for t in registry.writable()} == {"bash", "write", "edit"}
+    assert {t.name for t in registry.writable()} == {"bash", "write", "edit", "update_plan"}
 
 
 def test_default_registry_excludes_ask_user(tmp_path):

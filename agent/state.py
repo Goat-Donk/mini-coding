@@ -78,6 +78,12 @@ class AgentState:
     terminated_reason: Optional[str] = None
     memory_blocks: list[str] = field(default_factory=list)   # M4 注入的 repo 记忆
 
+    # M8 agent 自己的任务计划（`update_plan` 工具写它）。**不是**仓库根的
+    # TASKS.md（那是人类开发者的清单），两者只是中文都叫"计划"。
+    # 就是权威状态本身，不是从事件派生的值 —— 所以**没有** `derive_plan` 这类
+    # 对应物（对比下面的 `taint`，那个是从事件重放的）。
+    plan: list[dict] = field(default_factory=list)           # [{"text": str, "status": str}]
+
     # M3 上下文记账：最近一次 llm.chat 的 usage（provider 锚点）；compact 后置 stale
     last_usage: Optional[Usage] = None
     usage_stale_reason: Optional[str] = None                 # "tool_output_truncated" | "snip_compact" | "llm_compact"

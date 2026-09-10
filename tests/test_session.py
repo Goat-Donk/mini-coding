@@ -180,6 +180,7 @@ def test_checkpoint_round_trips_every_state_field(tmp_path):
         "events": [{"type": "tool_call", "step": 1, "name": "read"}],
         "terminated_reason": "completed",
         "memory_blocks": ["记忆块 A"],
+        "plan": [{"text": "读 README", "status": "done"}],
         "last_usage": Usage(prompt_tokens=3, completion_tokens=4),
         "usage_stale_reason": "snip_compact",
         "taint": "high",

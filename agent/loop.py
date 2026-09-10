@@ -176,6 +176,11 @@ class QueryEngine:
             cwd=cwd,
             permissions=self.permissions,
             hooks=self.hooks,
+            # state/emitter 这两个槽位曾经"声明了但没有任何入口填" —— 工具作者照
+            # 声明去读会拿到 None，而且不报错。现在填上：`state` 是 update_plan
+            # 写 plan 的通道，`emitter` 与 `state.emitter` 是同一个回调。
+            state=state,
+            emitter=state.emitter,
         )
         signatures_window: deque[list[str]] = deque(maxlen=self.loop_detection_window)
         empty_retry_count = 0
