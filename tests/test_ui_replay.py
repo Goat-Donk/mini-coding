@@ -9,7 +9,7 @@ import pytest
 from streamlit.testing.v1 import AppTest
 
 from agent.llm import ToolCall
-from agent.session import Session, new_session_id
+from agent.session import Session, new_session_id, state_dict
 from agent.state import AgentState, assistant_tool_calls, tool_result, user
 from app.replay import (
     list_checkpoint_sessions,
@@ -100,13 +100,14 @@ def test_list_checkpoint_sessions_orders_newest_first(tmp_path):
 
 
 def test_list_checkpoint_steps_and_load(tmp_path):
-    """步骤升序；读 payload；缺文件返回 None。"""
+    """步骤升序；读 state；缺文件返回 None。"""
     ws, sid = _make_checkpoint_session(tmp_path)
     assert list_checkpoint_steps(ws, sid) == [5, 10]
     payload = load_checkpoint(ws, sid, 10)
-    assert payload["task"] == "修 bug"
-    assert payload["terminated_reason"] == "done"
-    assert len(payload["messages"]) == 3
+    state = state_dict(payload)
+    assert state["task"] == "修 bug"
+    assert state["terminated_reason"] == "done"
+    assert len(state["messages"]) == 3
     assert load_checkpoint(ws, sid, 99) is None
 
 

@@ -317,6 +317,22 @@ class QueryEngine:
         for tool_call_id, output in results:
             state.messages.append(tool_result(tool_call_id, output))
 
+    def _gate_block(
+        self, state: AgentState, call: ToolCall, source: str, message: str, **extra
+    ) -> ToolResult:
+        """门禁阻断：**先记事件，再返回失败**。
+
+        原先这几处只 `return ToolResult.fail(...)`，于是轨迹里只剩 `success=False`
+        —— 事后翻轨迹只看到「工具没成」，分不清是权限拒绝、hook 阻断、工具自己报错
+        还是模型编了个不存在的工具名。`gate_block` 把 `source`（哪一层拦的）与
+        `reason`（为什么）写进事件，让拒绝**第一次在轨迹里可见**，也能与
+        `security_finding` 这类上游事件串成因果链。
+        """
+        state.record_event(
+            "gate_block", tool=call.name, source=source, reason=message, **extra
+        )
+        return ToolResult.fail(message)
+
     def _gate_and_run(
         self, call: ToolCall, state: AgentState, ctx: ToolContext
     ) -> ToolResult:
@@ -324,7 +340,9 @@ class QueryEngine:
         tool = self.registry.get(call.name) if call.name in self.registry else None
         if tool is None:
             available = ", ".join(self.registry.names())
-            return ToolResult.fail(f"未知工具 {call.name}，可用工具: {available}")
+            return self._gate_block(
+                state, call, "registry", f"未知工具 {call.name}，可用工具: {available}"
+            )
 
         # 1) PreToolUse hooks：阻断则拦截（信息回喂模型自修复）
         if self.hooks is not None:
@@ -333,14 +351,18 @@ class QueryEngine:
                 msg = f"[hook 阻断] {block.reason}"
                 if block.hint:
                     msg += f"\n提示: {block.hint}"
-                return ToolResult.fail(msg)
+                return self._gate_block(state, call, "hooks", msg)
 
         # 2) 权限：deny 拒绝；ask 无确认交互时安全默认拒绝（M2-3 起控制台接入）
         if self.permissions is not None:
             decision = self.permissions.check(call.name, call.arguments, ctx)
             if decision is Decision.DENY:
-                return ToolResult.fail(
-                    f"权限拒绝: 未获允许执行 {call.name}（{self.permissions.describe(call.name, call.arguments)}）"
+                return self._gate_block(
+                    state,
+                    call,
+                    "permissions",
+                    f"权限拒绝: 未获允许执行 {call.name}"
+                    f"（{self.permissions.describe(call.name, call.arguments)}）",
                 )
             if decision is Decision.ASK:
                 # 拒绝必须带**出处与解除方式**：只说"没权限"会让 agent 反复重试
@@ -353,7 +375,7 @@ class QueryEngine:
                 msg = f"权限拒绝: {call.name} 需要人工确认，当前无确认交互，已按拒绝处理"
                 if hint:
                     msg += f"\n出处: {hint}"
-                return ToolResult.fail(msg)
+                return self._gate_block(state, call, "permissions", msg)
 
         # 3) 执行
         result = tool.run(call.arguments, ctx)

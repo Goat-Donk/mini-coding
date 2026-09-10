@@ -29,7 +29,7 @@ from agent.hooks import default_engine
 from agent.llm import BaseLLM, DeepSeekClient, MockLLM, LLMResult, ToolCall
 from agent.loop import QueryEngine
 from agent.permissions import PermissionsEngine
-from agent.session import Session, new_session_id
+from agent.session import Session, new_session_id, state_dict
 from agent.tools.base import ToolRegistry
 from agent.tools.subagent import SubagentTool
 from app.replay import (
@@ -297,12 +297,15 @@ with st.expander(f"🎞 检查点回放（{len(replay_sessions)} 个会话）", 
             if payload is None:
                 st.caption("检查点正在写入，稍后再试。")
             else:
-                task = payload.get("task", "") or "（未知任务）"
-                term = payload.get("terminated_reason")
+                # 用 state_dict 取字段，不直接翻 payload —— 落盘格式换过一版
+                # （M7 从平铺改成 state 子对象），读者不该跟着格式走
+                state = state_dict(payload)
+                task = state.get("task", "") or "（未知任务）"
+                term = state.get("terminated_reason")
                 st.caption(
                     f"任务：{task[:100]}" + (f" · 终止：{term}" if term else "")
                 )
-                for msg in payload.get("messages", []):
+                for msg in state.get("messages", []):
                     role = msg.get("role", "?")
                     label = {
                         "system": "🖥 system",

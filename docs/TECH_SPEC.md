@@ -610,12 +610,20 @@ class QueryEngine:
         # 3) 循环外：terminated_reason = "max_steps"（或 loop_detected）
         #     final_text = "已达到最大步数 / 检测到重复循环，任务中止"
 
+    def _gate_and_run(self, call, state, ctx) -> ToolResult:
+        # 门禁链：hooks.run_pre（可阻断）→ permissions.check → tool.run → hooks.run_post
+        # 每一处「阻断」都走 _gate_block()：先记事件再返回失败
+        #   state.record_event("gate_block", tool, source, reason)
+        #   source ∈ {"registry"(未知工具), "hooks", "permissions"（含第三方未授权）}
+        # 原先这几处只 return ToolResult.fail(...)：轨迹里只剩 success=False，
+        # 事后翻轨迹分不清是权限拒绝、hook 阻断、工具自己报错还是模型编了个工具名。
+        # gate_block 让「拒绝的原因 + 是哪一层拒的」第一次在轨迹里可见。
+
     def _execute_tool_calls(self, calls: list[ToolCall], state: AgentState, ctx: ToolContext):
         # ★ 只读并发：若 calls 全部是只读工具 → ThreadPoolExecutor(max_workers=min(4,len)) 并发
         #   否则串行（保持顺序）
-        # 每条：tool = registry.get(name)（未知 → ToolResult.fail(可用工具列表)）
-        #       result = tool.run(arguments, ctx)
-        #       state.record_event("tool_call", name, arguments, result 摘要, duration)
+        # 每条：result = self._gate_and_run(call, state, ctx)
+        #       state.record_event("tool_call", name, arguments, success, duration_ms, exit_code)
         # 结果消息：assistant_tool_calls(calls) 一条 + 每个 tool_result(call.id, result.output) 一条（顺序与 calls 对应）
 ```
 
@@ -733,12 +741,31 @@ class Session:
                         checkpoint_every=5) -> tuple[Session, AgentState]  # step=None → 最近
     def list_checkpoints(self) -> list[int]
     def latest_checkpoint(self) -> Path | None
+
+_SKIP_FIELDS = frozenset({"emitter"})        # 运行时对象，不落盘
+_FIELD_DECODERS = {"usage": ..., "last_usage": ...}   # JSON dict → Usage
+_LEGACY_FLAT_KEYS: tuple[str, ...]           # M7 之前的平铺格式（冻结，只读老文件）
+
+def dump_state(state: AgentState) -> dict    # 全字段快照；不可序列化→报字段名
+def load_state(payload: dict, session_id: str) -> AgentState   # 新旧格式都吃
+def state_dict(payload: dict) -> dict        # 读者入口：兼容两种格式取 state
 def latest_session(workspace_root: Path) -> str | None  # 按检查点 mtime 选最近会话
 ```
 
 - 轨迹文件 `data/sessions/{id}.jsonl`（append-only；M3-3 compact 裁掉的中段消息仍完整保留，
-  snip/摘要标记都指向这里）；检查点 `data/checkpoints/{id}/step-{N}.json` 含
-  messages / events / usage / last_usage / usage_stale_reason / terminated_reason / memory_blocks。
+  snip/摘要标记都指向这里）；检查点 `data/checkpoints/{id}/step-{N}.json` 形如
+  `{"session_id", "step", "ts", "state": {...}}`，`state` 是 **AgentState 全字段快照**。
+- **全字段往返（M7）**：state 的落盘/恢复按 `dataclasses.fields()` 自动推导，
+  **不手写字段白名单**。原先 `_write` 与 `from_checkpoint` 各有一份手写字段表，
+  给 AgentState 加字段**不会落盘且没有任何提示**（已有先例：`cli.py` 重算
+  `memory_blocks`，`restored.memory_blocks` 被静默忽略）。现在只有
+  `_SKIP_FIELDS`（默认仅 `emitter`，运行时回调）需要显式排除；
+  不可序列化的字段会在落盘时**报出字段名**（响失败 > 哑丢失）。
+  `dump_state()` / `load_state()` / `state_dict()` 三个函数是唯一的格式入口：
+  **读检查点的地方都走 `state_dict()`**（回放 UI、测试），不自己翻 payload 的键——
+  否则每换一次格式，所有读者都得跟着改一遍（回放 UI 与测试就踩过）。
+  旧格式（字段平铺在顶层）由 `_LEGACY_FLAT_KEYS` 这段**冻结的**兼容代码解，
+  磁盘上的老检查点照样能 resume。
 - **resume 不重置 step 计数**：恢复的 state.step 延续 → 续跑产生的检查点不会覆盖恢复前的同名文件。
 - loop 接入：`QueryEngine(session=...)`；`run()` 建 state 时
   `session_id = getattr(self.session, "session_id", "m1")`；每轮 `_execute_tool_calls` 后

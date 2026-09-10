@@ -1,4 +1,5 @@
 """M2-2 tests: agent/hooks.py（Pre/PostToolUse 分发 + block-at-submit）。"""
+import json
 import sys
 from pathlib import Path
 
@@ -182,6 +183,99 @@ def test_loop_hook_allows_after_marker(tmp_path):
     result = engine.run("提交代码")
     calls = [e for e in result.events if e["type"] == "tool_call"]
     assert calls[0]["success"] is True  # 命令真的执行（非 git 仓库会 exit 非 0，但执行本身算成功）
+
+
+# ---------- 门禁阻断进轨迹（gate_block 事件） ----------
+
+def test_gate_block_event_from_hook(tmp_path):
+    """hook 阻断 → 轨迹里留下 `gate_block`，写明**是哪一层拦的**。
+
+    原先只 `return ToolResult.fail(...)`：轨迹里只剩 `success=False`，事后翻
+    只看到「工具没成」，分不清是权限拒绝、hook 阻断、还是工具自己报错。
+    """
+    engine = make_engine(
+        tmp_path,
+        MockLLM.script(
+            MockLLM.tool("bash", {"command": "git commit -m 'feat: x'"}).responses[0],
+            LLMResult(content="先跑测试"),
+        ),
+        hooks=HookEngine([require_tests_before_commit(tmp_path)], workspace_root=tmp_path),
+    )
+    result = engine.run("提交代码")
+    blocks = [e for e in result.events if e["type"] == "gate_block"]
+    assert len(blocks) == 1
+    assert blocks[0]["source"] == "hooks"
+    assert blocks[0]["tool"] == "bash"
+    assert "pytest" in blocks[0]["reason"]
+
+
+def test_gate_block_event_from_permissions(tmp_path):
+    """权限拒绝 → `gate_block` 带 source="permissions"；未知工具带 source="registry"。"""
+    from agent.permissions import PermissionsEngine
+
+    engine = make_engine(
+        tmp_path,
+        MockLLM.script(
+            MockLLM.tool("bash", {"command": "rm -rf x"}).responses[0],
+            LLMResult(content="换个办法"),
+        ),
+        permissions=PermissionsEngine(tmp_path),  # 无 confirm → 危险命令 ask → 拒绝
+    )
+    result = engine.run("清理")
+    blocks = [e for e in result.events if e["type"] == "gate_block"]
+    assert blocks[0]["source"] == "permissions"
+    assert "权限拒绝" in blocks[0]["reason"]
+
+
+def test_gate_block_event_from_registry(tmp_path):
+    """模型编了个不存在的工具名 → 也要有 gate_block（source="registry"）。"""
+    engine = make_engine(
+        tmp_path,
+        MockLLM.script(
+            MockLLM.tool("不存在的工具", {}).responses[0],
+            LLMResult(content="换用已有工具"),
+        ),
+    )
+    result = engine.run("随便做点什么")
+    blocks = [e for e in result.events if e["type"] == "gate_block"]
+    assert blocks[0]["source"] == "registry"
+    assert "未知工具" in blocks[0]["reason"]
+
+
+def test_successful_tool_has_no_gate_block(tmp_path):
+    """没被拦就别发事件 —— 否则 gate_block 会退化成噪音，没人再看它。"""
+    engine = make_engine(
+        tmp_path,
+        MockLLM.script(
+            MockLLM.tool("glob", {"pattern": "**/*"}).responses[0],
+            LLMResult(content="看完了"),
+        ),
+    )
+    result = engine.run("看看目录")
+    assert [e for e in result.events if e["type"] == "gate_block"] == []
+
+
+def test_gate_block_lands_in_trajectory_jsonl(tmp_path):
+    """gate_block 同时进 JSONL 轨迹（emitter 已接），不只是内存 events。"""
+    from agent.session import Session
+
+    session = Session(tmp_path, "gb1", checkpoint_every=99)
+    engine = make_engine(
+        tmp_path,
+        MockLLM.script(
+            MockLLM.tool("bash", {"command": "git commit -m 'x'"}).responses[0],
+            LLMResult(content="先跑测试"),
+        ),
+        hooks=HookEngine([require_tests_before_commit(tmp_path)], workspace_root=tmp_path),
+        session=session,
+    )
+    engine.run("提交")
+    lines = [
+        json.loads(line)
+        for line in session.trajectory_path.read_text(encoding="utf-8").strip().splitlines()
+    ]
+    blocks = [e for e in lines if e["type"] == "gate_block"]
+    assert blocks and blocks[0]["source"] == "hooks"
 
 
 # ---------- marker 由真实测试结果产生（PostToolUse） ----------

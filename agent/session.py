@@ -7,22 +7,102 @@
   （messages + 全 state 快照）。任务中途 kill 进程后，`--resume` 从最近
   检查点恢复，接着上次的 step 计数续跑（不重置，避免覆盖同名检查点）。
 - **原子写**：先写 `.tmp` 再 rename，kill 不会留下半个检查点文件。
+- **全字段往返（M7）**：state 的序列化/反序列化按 `dataclasses.fields()` 自动
+  推导，**不再手写字段白名单**。原先 `_write` 与 `from_checkpoint` 各有一份手写
+  字段表，给 AgentState 加字段**不会落盘**且**没有任何提示**——已有先例：
+  `cli.py` 重算 `memory_blocks`，`restored.memory_blocks` 被静默忽略。手写白名单
+  是那种「加了新东西看起来对、实际悄悄不生效」的坑，所以这里改成结构性修法：
+  新增字段自动进检查点，只有**确实是运行时对象**的字段才需要显式排除。
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import threading
 import time
-from dataclasses import asdict
+from dataclasses import asdict, is_dataclass
 from pathlib import Path
 
 from agent.llm import Usage
 from agent.state import AgentState
 
+# 不落盘的字段：运行时对象（回调、句柄），不是状态。**这份名单应该保持短**——
+# 每加一项都意味着「这个字段跨会话会丢」，需要有理由。
+_SKIP_FIELDS = frozenset({"emitter"})
+
+# 需要反序列化回类型的字段（JSON 里是 dict，dataclass 要的是对象）。
+# 其余字段按 JSON 原样传回 `AgentState(**raw)`。
+_FIELD_DECODERS: dict[str, object] = {
+    "usage": lambda raw: Usage(**raw),
+    "last_usage": lambda raw: Usage(**raw) if raw else None,
+}
+
+# M7 之前的落盘格式：state 字段平铺在 payload 顶层。这份名单是**冻结的**——
+# 它只用来解已经写在磁盘上的老检查点，不会再跟着 AgentState 演进（新字段一律
+# 走 `state` 子对象那条路）。所以它不会重复 H5 那个「白名单忘记更新」的坑。
+_LEGACY_FLAT_KEYS: tuple[str, ...] = (
+    "task", "system_prompt", "messages", "step", "usage", "events",
+    "terminated_reason", "last_usage", "usage_stale_reason", "memory_blocks",
+)
+
 
 def new_session_id() -> str:
     """生成会话 id（秒级时间戳，够区分一次演示/任务的连续运行）。"""
     return time.strftime("s%Y%m%d-%H%M%S")
+
+
+# ---------- state 序列化（全字段，不手写白名单） ----------
+
+def dump_state(state: AgentState) -> dict:
+    """AgentState → 可 JSON 序列化的 dict（全字段，排除运行时对象）。
+
+    非 JSON 可序列化的字段会被**明确指出字段名**地报错，而不是让
+    `json.dumps` 抛一句看不出是哪个字段的 `TypeError`，也不是静默丢掉它。
+    检查点写失败是响的、看得见的；字段悄悄丢失是哑的——这一条改动就是为了
+    把哑失败变成响失败。
+    """
+    data: dict = {}
+    for f in dataclasses.fields(state):
+        if f.name in _SKIP_FIELDS:
+            continue
+        value = getattr(state, f.name)
+        data[f.name] = asdict(value) if is_dataclass(value) else value
+    try:
+        json.dumps(data, ensure_ascii=False)
+    except TypeError as exc:
+        for name, value in data.items():
+            try:
+                json.dumps(value, ensure_ascii=False)
+            except TypeError:
+                raise TypeError(
+                    f"检查点无法序列化 AgentState.{name}"
+                    f"（类型 {type(value).__name__}）：{exc}。"
+                    f"若它是运行时对象而非状态，加进 session._SKIP_FIELDS。"
+                ) from exc
+        raise
+    return data
+
+
+def state_dict(payload: dict) -> dict:
+    """从检查点 payload 里取出 state 字段字典（兼容 M7 之前的扁平格式）。
+
+    **读检查点的地方都应该用这个**，而不是自己去 payload 里翻 `"task"` /
+    `"messages"`——那样每换一次落盘格式，所有读者都得跟着改一遍（回放 UI 与
+    测试就踩过这个）。格式知识集中在 session.py 这一处。
+    """
+    if "state" in payload:
+        return payload["state"]
+    return {k: payload[k] for k in _LEGACY_FLAT_KEYS if k in payload}
+
+
+def load_state(payload: dict, session_id: str) -> AgentState:
+    """检查点 payload → AgentState（兼容旧的扁平格式）。"""
+    raw = dict(state_dict(payload))
+    for name, decode in _FIELD_DECODERS.items():
+        if name in raw and raw[name] is not None:
+            raw[name] = decode(raw[name])  # type: ignore[operator]
+    raw.pop("session_id", None)  # 用调用方给的那个（payload 里的可能是旧值）
+    return AgentState(session_id=session_id, **raw)
 
 
 class Session:
@@ -77,15 +157,7 @@ class Session:
             "session_id": self.session_id,
             "step": state.step,
             "ts": time.time(),
-            "task": state.task,
-            "system_prompt": state.system_prompt,
-            "messages": state.messages,
-            "events": state.events,
-            "usage": asdict(state.usage),
-            "last_usage": asdict(state.last_usage) if state.last_usage else None,
-            "usage_stale_reason": state.usage_stale_reason,
-            "terminated_reason": state.terminated_reason,
-            "memory_blocks": state.memory_blocks,
+            "state": dump_state(state),   # 全字段快照（见模块 docstring）
         }
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         path = self.checkpoint_dir / f"step-{state.step}.json"
@@ -114,22 +186,7 @@ class Session:
         """
         session = cls(workspace_root, session_id, checkpoint_every=checkpoint_every)
         payload = session._load_payload(step)
-        state = AgentState(
-            session_id=session_id,
-            task=payload["task"],
-            system_prompt=payload["system_prompt"],
-            messages=payload["messages"],
-            step=payload["step"],
-            usage=Usage(**payload["usage"]),
-            events=payload.get("events", []),
-            terminated_reason=payload.get("terminated_reason"),
-            last_usage=(
-                Usage(**payload["last_usage"]) if payload.get("last_usage") else None
-            ),
-            usage_stale_reason=payload.get("usage_stale_reason"),
-            memory_blocks=payload.get("memory_blocks", []),
-        )
-        return session, state
+        return session, load_state(payload, session_id)
 
     def _load_payload(self, step: int | None) -> dict:
         path = (
