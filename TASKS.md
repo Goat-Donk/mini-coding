@@ -42,7 +42,7 @@
 - [x] M5-1 `eval/golden_tasks.py`：黄金任务集（clone tinydb，从 git history 构造修 bug 任务 + 隐藏测试）
 - [x] M5-2 `eval/runner.py`：跑任务→测试判定→完成率/成本指标→回归报告（验收：`python -m eval.runner` 出报告）
 - [x] M5-3 控制台检查点回放视图
-- [ ] M5-4 更新 TECH_SPEC + commit + push
+- [x] M5-4 更新 TECH_SPEC + commit + push
 
 ## M6 文档 + 打磨（Day 19–21）
 
@@ -56,6 +56,6 @@
 
 ## 进度快照
 
-- 当前里程碑：**M5 进行中**（评估 + 控制台打磨；M5-1~M5-3 已完成，M5-4 TECH_SPEC 同步待做）
-- 最近完成：M5-3 控制台检查点回放视图（`app/replay.py` 纯函数 + Streamlit 视图 + AppTest 离线测试，156 测试绿）
-- 下一步：M5-4 把 golden_tasks / runner / 回放视图同步进 docs/TECH_SPEC.md，然后 commit + push
+- 当前里程碑：**M5 完成**（评估 + 控制台打磨；M5-1~M5-4 已全部 commit + push，156 测试绿）
+- 最近完成：M5-4 TECH_SPEC 同步（§9.6 golden_tasks / §9.6b runner / §9.7 回放视图对齐实现）
+- 下一步：**M6 文档 + 打磨**（M6-1 README + architecture.md mermaid → M6-2 interview_guide → 有余力 MCP）

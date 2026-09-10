@@ -800,9 +800,73 @@ class SubagentTool(Tool):
 - 测试：tests/test_subagent.py（6 个：跑通回报告/只读白名单+不改文件/max_steps 兜底/
   system prompt 定位/禁止递归/串行注册）。
 
-### 9.6 eval/（M5）
-- golden_tasks.py：从 tinydb 的 git history 找真实 bug 修复 commit → 任务 = "修复 <commit前> 的 bug"，隐藏判定 = 该 commit 的测试
-- runner.py：每任务起新会话（git checkout 干净工作区）→ 跑 agent → 跑测试判分 → 报告（完成率 + token/耗时/缓存成本 + 与基线 diff）
+### 9.6 eval/golden_tasks.py（M5-1 已实现：SWE-bench 思路的黄金任务集）
+
+```python
+TINYDB_REPO = "https://github.com/msiemens/tinydb.git"
+DEFAULT_REPO = Path("eval/repos/tinydb")
+FIX_KEYWORDS = ("fix","fixes","fixed","bug","error","crash","issue","regression","broken","incorrect")
+
+def git(repo_dir: Path, *args) -> str                          # 包装 subprocess git
+def ensure_repo(repo_dir=DEFAULT_REPO, *, clone_url=TINYDB_REPO) -> Path  # clone（3 次重试）
+def discover_fix_commits(repo_dir, *, limit=20, keywords=FIX_KEYWORDS) -> list[dict]
+def render_task_text(commit: dict) -> str                      # 真实 bug 报告（subject+body，不造假）
+@dataclass GoldenTask: id, base_sha, title, task_text, changed_sources, hidden_tests
+def build_task(repo_dir, commit) -> GoldenTask                 # base_sha = commit^
+def materialize(task, target_dir, repo_dir) -> Path            # git worktree add --detach
+def remove_worktree(repo_dir, target_dir)
+@dataclass JudgeResult: passed, returncode, summary
+def judge(task, workspace) -> JudgeResult                      # hidden tests 覆盖写回 → pytest
+```
+
+- **任务构造**：从 tinydb git history 找 subject 含 fix 关键字的提交，且**同时改源码与 tests/**。
+  `base_sha = fix 提交的父提交`（= bug 存在状态）；`task_text` = 该提交的 subject+body
+  （真实 bug 报告，绝不编造）；`hidden_tests` = fix 提交里 tests/ 的新内容——agent 全程看不到，
+  判定用。避免 SWE-bench 两个陷阱：测试泄漏（隐藏测试只在 judge 时覆盖写回）与任务描述失真。
+- **物化**：`git worktree add --detach base_sha` 出干净工作区（不污染主仓库）；
+  完成后 `remove_worktree`。judge：hidden_tests 写回 `tests/` → `subprocess pytest` 判定。
+- 测试：tests/test_golden_tasks.py（5 个）+ conftest `fixture_repo`（本地迷你仓库离线造
+  buggy → fix → 非 fix 提交，不联网）。
+
+### 9.6b eval/runner.py（M5-2 已实现：回归报告）
+
+```python
+PRICE_INPUT_HIT_CNY = 0.5;  PRICE_INPUT_MISS_CNY = 2.0;  PRICE_OUTPUT_CNY = 8.0  # DeepSeek 元/M
+DEFAULT_WS_ROOT = Path("data/eval/ws")
+
+@dataclass TaskResult: task, passed, run, error, duration_s, cost_cny
+def estimate_cost_cny(prompt_hit, prompt_miss, completion) -> float
+def _build_llm(mock) -> BaseLLM        # mock → MockLLM.text（无 key 冒烟验证管线）
+def run_single(task, repo_dir, *, ws_root, mock) -> TaskResult
+def run_eval(repo_dir=DEFAULT_REPO, *, ws_root, limit=5, mock=False) -> dict
+def main()                              # CLI: --repo / --ws-root / --limit / --mock / --keep
+```
+
+- **流程**：物化 → QueryEngine 跑 task_text 修 bug → judge 隐藏测试 → remove_worktree。
+  agent 异常 / judge 异常**如实记入 `error` 字段**（不假装成功），工作区 always 清理。
+- **成本**：按 DeepSeek 公开定价估算，用量取 provider 实测
+  `prompt_cache_hit / prompt_cache_miss / completion` tokens（provider-usage-first）。
+- **报告**：ts / mode(mock|deepseek) / tasks / passed / completion_rate / total_tokens /
+  total_cost_cny / avg_cache_hit_ratio / per_task[]（id/title/passed/error/duration_s/steps/
+  tokens/cost_cny），落 `data/eval/report-*.json`。
+- 测试：tests/test_eval_runner.py（3 个：定价函数 / mock 冒烟整管线 / 报告字段可 JSON 落盘）。
+
+### 9.7 app/replay.py（M5-3 已实现：控制台检查点回放视图）
+
+```python
+def list_checkpoint_sessions(workspace_root: Path) -> list[str]  # 有检查点的会话，新→旧
+def list_checkpoint_steps(workspace_root, session_id) -> list[int]
+def load_checkpoint(workspace_root, session_id, step) -> dict | None
+def render_message(message: dict) -> str    # tool 结果截断 500；tool_calls 压缩一行；多模态兜底
+```
+
+- **回放数据** = §9.3 Session 检查点 `data/checkpoints/{session_id}/step-{N}.json` 的
+  `messages`（OpenAI 格式）+ `task`/`terminated_reason`。纯函数层不依赖 streamlit runtime。
+- **视图**（ui_streamlit.py）：expander 内「选会话 → 选 step → 逐条渲染」，role 标签
+  system/user/assistant/tool。复用了 M3-3 compact 的"轨迹完整保留"设计：回放看到的是
+  compact 前完整消息。
+- 测试：tests/test_ui_replay.py（6 个：消息渲染/tool 截断/多模态兜底/会话排序/步骤读取/
+  AppTest 无异常 + 回放区出现该会话）。
 
 ---
 
@@ -812,4 +876,8 @@ class SubagentTool(Tool):
 python -m pytest tests/                       # 全部测试
 python -m app.cli --mock "读 README 并总结项目结构"   # 无 key 演示（M1 末可用）
 python -m app.cli "给 README 加一行说明并验证"     # 真实 DeepSeek（需 .env 配 key）
+python -m eval.golden_tasks --clone --limit 10   # M5-1：拉 tinydb 并列出真实 fix 提交
+python -m eval.runner --limit 3                  # M5-2：真实跑 3 个黄金任务出回归报告
+python -m eval.runner --limit 2 --mock           # M5-2 无 key 冒烟（judge 会如实失败）
+streamlit run app/ui_streamlit.py               # M2-3 控制台（含 M5-3 检查点回放）
 ```
