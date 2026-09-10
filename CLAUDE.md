@@ -34,7 +34,7 @@
 ```bash
 python -m pytest tests/                      # 跑全部测试（每模块完成后必须过）
 python -m pytest tests/test_xxx.py -k 用例    # 单模块/单用例
-python -m app.cli mock "任务"                 # 无 key 演示
+python -m app.cli --mock "任务"               # 无 key 演示
 python -m app.cli "任务"                      # 真实 DeepSeek（需 .env 配 DEEPSEEK_API_KEY）
 streamlit run app/ui_streamlit.py            # 控制台（M2 起）
 ```

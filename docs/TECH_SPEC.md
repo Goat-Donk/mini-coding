@@ -577,7 +577,7 @@ DEFAULT_SYSTEM_PROMPT = f"""\
 ## 8. app/cli.py（◐M1 最小版 → 后续增强）
 
 **文件**：`app/cli.py`
-**M1 目标**：`python -m app.cli "任务"` 能用真实 DeepSeek 跑通；`python -m app.cli mock "任务"` 无 key 演示。
+**M1 目标**：`python -m app.cli "任务"` 能用真实 DeepSeek 跑通；`python -m app.cli --mock "任务"` 无 key 演示。
 - `load_dotenv()`；构建 DeepSeekClient / MockLLM（--mock 或自动降级提示）
 - ToolRegistry.default(workspace_root)；QueryEngine 组装
 - 打印：每步事件（工具调用名+参数摘要+结果截断）+ 最终结论 + 总 token/步骤
@@ -624,6 +624,6 @@ DEFAULT_SYSTEM_PROMPT = f"""\
 
 ```bash
 python -m pytest tests/                       # 全部测试
-python -m app.cli mock "读 README 并总结项目结构"   # 无 key 演示（M1 末可用）
+python -m app.cli --mock "读 README 并总结项目结构"   # 无 key 演示（M1 末可用）
 python -m app.cli "给 README 加一行说明并验证"     # 真实 DeepSeek（需 .env 配 key）
 ```

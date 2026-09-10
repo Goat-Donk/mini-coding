@@ -10,8 +10,8 @@
 - [x] M1-3 `agent/llm.py`：DeepSeek client（function calling + usage/cache 采集）+ MockLLM（验收：`python -m pytest tests/test_llm.py`）
 - [x] M1-4 `agent/tools/base.py`：Tool 基类 + pydantic schema 自动生成 + ToolRegistry（验收：`pytest tests/test_tools.py::test_schema`）
 - [x] M1-5 `agent/tools/bash.py` + `files.py`：bash（超时/危险过滤）+ read/write/edit(唯一匹配+diff)/glob/grep(截断)（验收：`pytest tests/test_tools.py`）
-- [ ] M1-6 `agent/state.py` + `agent/loop.py`：QueryEngine 循环 + 只读并发（验收：`pytest tests/test_loop.py`；`python -m app.cli "读 README 并总结"`）
-- [ ] M1-7 测试全部跑通（验收：`python -m pytest tests/` 全绿）
+- [x] M1-6 `agent/state.py` + `agent/loop.py`：QueryEngine 循环 + 只读并发（验收：`pytest tests/test_loop.py`；`python -m app.cli "读 README 并总结"`）
+- [x] M1-7 测试全部跑通 + `app/cli.py` 最小版（验收：`python -m pytest tests/` 全绿；`python -m app.cli --mock "任务"` 演示）
 - [ ] M1-8 首次 commit + push（验收：`git log` 有记录、`git push` 成功）
 
 ## M2 权限 + hooks + 控制台 v1（Day 4–6）
@@ -53,6 +53,6 @@
 
 ## 进度快照
 
-- 当前里程碑：**M1**（进行中）
-- 最近完成：M1-1 脚手架、M1-2 交接文档
-- 下一步：M1-3 `agent/llm.py`
+- 当前里程碑：**M1**（接近完成，待 push）
+- 最近完成：M1-6 循环、M1-7 测试全绿（59/59）+ cli 最小版
+- 下一步：M1-8 commit + push；然后 M2-1 permissions
