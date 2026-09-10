@@ -121,17 +121,18 @@ class SpyPermissions(PermissionsEngine):
         return decision
 
 
-def _invoke(tmp_path, monkeypatch, llm, extra_args: tuple[str, ...] = ()):
+def _invoke(tmp_path, monkeypatch, llm, extra_args: tuple[str, ...] = (), task: str = "占位任务"):
     """在 tmp_path 里真跑一次 CLI（--mock），并让权限引擎变成可观测的替身。
 
-    task 是必填位置参数（非 --resume 时为空会 Exit(1)）；--resume 时它被忽略
-    （任务从检查点恢复），传一个占位串不影响断言。
+    task 是位置参数：非 --resume 时就是任务描述（为空会 Exit(1)）；
+    --resume 时它会被当作**续跑指示**追加进会话（见
+    test_resume_instruction_is_delivered_not_dropped）。
     """
     SpyPermissions.last = None
     monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
     monkeypatch.setattr("app.cli._build_llm", lambda mock: llm)
     monkeypatch.setattr("app.cli.PermissionsEngine", SpyPermissions)
-    return runner.invoke(app, ["占位任务", *extra_args, "--mock"])
+    return runner.invoke(app, [task, *extra_args, "--mock"])
 
 
 def _capture_tool_messages() -> tuple[list[str], object]:
@@ -241,6 +242,44 @@ def test_resume_branch_also_wires_permissions(tmp_path, monkeypatch):
     assert spy is not None and spy.checks, "resume 分支没有把调用送进权限引擎"
     assert spy.checks[0][2] is Decision.ASK
     assert any("需要人工确认" in text for text in seen), seen
+
+
+def test_resume_instruction_is_delivered_not_dropped(tmp_path, monkeypatch):
+    """`--resume "补充说明"` 必须真的进会话，不能被静默丢掉。
+
+    这条是**真实 LLM 端到端验证挖出来的**：拒绝文案让用户
+    「用 --clear-taint 复位标记再重试」，但复位之后 CLI 没有任何办法把
+    「我已复位，请重试」这句话送进会话 —— `run_from` 用的是 `state.task`，
+    位置参数被直接忽略。于是模型按拒绝文案的指引停下来等人，人却回不了话，
+    整条「收紧 → 人解锁 → 重试」的动线断在最后一步。
+    """
+    llm = MockLLM.script(
+        LLMResult(
+            content=None,
+            tool_calls=[ToolCall(id="c1", name="glob", arguments={"pattern": "**/*"})],
+        ),
+        LLMResult(content="第一轮结束"),
+    )
+    assert _invoke(tmp_path, monkeypatch, llm, extra_args=("--checkpoint-every", "1")).exit_code == 0
+
+    seen_users: list[str] = []
+
+    def responder(messages, tools):  # noqa: ANN001 - MockLLM 回调签名
+        seen_users.extend(
+            m["content"] for m in messages
+            if m.get("role") == "user" and isinstance(m.get("content"), str)
+        )
+        return LLMResult(content="收到，重试第 2 步")
+
+    second = _invoke(
+        tmp_path, monkeypatch, MockLLM.script(responder),
+        extra_args=("--resume", "--clear-taint"),
+        task="我已复位污染标记，请重试第 2 步",
+    )
+
+    assert second.exit_code == 0
+    assert "续跑指示" in second.output
+    assert any("我已复位污染标记，请重试第 2 步" in t for t in seen_users), seen_users
 
 
 def test_cli_wires_both_governance_layers(tmp_path, monkeypatch):

@@ -25,6 +25,7 @@ from agent.memory import MemoryManager
 from agent.security import TAINT_HIGH, TAINT_NONE
 from agent.permissions import PermissionsEngine
 from agent.session import Session, latest_session, new_session_id
+from agent.state import user as user_message
 from agent.tools.base import ToolRegistry
 from agent.tools.subagent import SubagentTool
 
@@ -97,7 +98,9 @@ def _build_llm(mock: bool) -> BaseLLM:
 
 @app.command()
 def run(
-    task: str = typer.Argument("", help="任务描述（--resume 时可省略，任务从检查点恢复）"),
+    task: str = typer.Argument(
+        "", help="任务描述；--resume 时作为**续跑指示**追加进会话（可省略）"
+    ),
     mock: bool = typer.Option(False, "--mock", help="无 key 演示"),
     resume: bool = typer.Option(False, "--resume", help="从检查点续跑（不新建会话）"),
     session_id: str | None = typer.Option(
@@ -201,6 +204,17 @@ def run(
                 # 所以这次复位在下次 resume 重算时同样有效（不会被旧事件抬回去）。
                 restored.clear_taint(reason="cli:--clear-taint")
                 typer.secho("污染标记已复位为 none", fg=typer.colors.GREEN)
+            if task.strip():
+                # 续跑指示：`--resume "..."` 曾经**静默丢掉**这个参数（run_from 用的是
+                # state.task），于是「拒绝文案让你 --clear-taint 复位后重试」这条动线
+                # 断在这里 —— 复位之后你没有任何办法告诉 agent「再试一次」。
+                # 真人验证时就是这么卡住的：模型按拒绝文案的指引停下等人，而 CLI
+                # 送不进去人的回复。现在把它作为一条 user 消息追加进会话。
+                restored.messages.append(user_message(task))
+                restored.record_event("resume_instruction", text=task[:200])
+                typer.secho(
+                    f"续跑指示: {task[:80]}", fg=typer.colors.CYAN
+                )
             result = engine.run_from(restored)
         else:
             session = Session(workspace_root, new_session_id(), checkpoint_every=checkpoint_every)

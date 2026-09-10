@@ -408,6 +408,50 @@ def test_ceiling_covers_exactly_three_action_classes(tmp_path):
         assert engine.check(name, args, ctx) is Decision.ALLOW, (name, args)
 
 
+def test_ceiling_catches_credential_read_whatever_the_verb(tmp_path):
+    """回归 —— 由**真实 LLM 端到端验证**挖出的天花板缺口（不是设计推演出来的）。
+
+    当时的判据要求「读动词 + 凭据路径」同现，动词表是
+    `cat|type|head|tail|less|more|Get-Content|gc`。真实跑的时候模型读 `.env`
+    用的是 `findstr /r /c:"^[A-Za-z_]" .env` —— Windows 上 grep 的自然替代，
+    不在表里，于是 high 会话下这条命令**照常执行**：轨迹里既没有 gate_block，
+    变量名也确实进了模型上下文（模型还自己补了一句「该命令的输出仍会带出值」）。
+    天花板当时等于不存在。
+
+    修法是不再枚举动词、也不锚定路径末尾。这个测试用一组「读/带走凭据文件的
+    常见写法」钉住它，免得以后有人好心把动词表加回来。
+    """
+    ctx = make_ctx(tmp_path)
+    engine = PermissionsEngine(tmp_path)
+    engine.note_taint(TAINT_HIGH)
+
+    for command in (
+        "cat .env", "type .env", "Get-Content .env", "gc .env",
+        'findstr /r /c:"^[A-Za-z_]" .env',          # ← 真实跑出来的那一条
+        "Select-String -Path .env -Pattern .",
+        "grep -o '^[A-Z_]*' .env",
+        "awk -F= '{print $1}' .env",
+        "sed -n 1p .env",
+        "od -c .env", "strings .env",
+        """python -c "print(open('.env').read())" """,
+        "copy .env x.txt",                          # ← 锚定末尾会漏掉这一类
+        "cp .env /tmp/x",
+        "tar -cf - .env",
+        "cat sub/id_rsa",
+    ):
+        assert engine.check("bash", {"command": command}, ctx) is Decision.ASK, command
+
+    # 反向：命令里**没有**凭据文件的，一条都不许动 —— 否则 high 会话会变成
+    # 处处受阻，而 CLI 里没有确认交互可以纠正
+    for command in (
+        "python -m pytest tests/ -q",
+        "git status",
+        "pip install python-dotenv",   # 名字里有 dotenv，但没有 `.env` 这个文件名
+        "ls -la",
+    ):
+        assert engine.check("bash", {"command": command}, ctx) is Decision.ALLOW, command
+
+
 def test_ceiling_is_inactive_below_high(tmp_path):
     """medium 只出横幅、不动权限 —— 这是误报政策的可执行形式。"""
     ctx = make_ctx(tmp_path)

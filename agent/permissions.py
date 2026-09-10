@@ -80,6 +80,23 @@ CREDENTIAL_PATH = re.compile(
     r"|\.docker[\\/]config\.json|\.pypirc|\.pgpass)$",
     re.IGNORECASE,
 )
+#: bash **命令串**用的凭据判据：只要命令里**提到**凭据文件即可，不锚定路径末尾。
+#:
+#: 为什么不复用上面的锚定版：那个是给 read/write/edit 用的 —— 那些工具的
+#: `path` 参数本身就是一条路径，锚定末尾正好表达「操作的就是这个文件」。
+#: 但 bash 的 `command` 是一整条命令行，锚定末尾会漏掉**任何把凭据文件当输入
+#: 再写到别处**的写法（`copy .env x.txt` / `cp .env /tmp/x` / `tar -cf - .env`），
+#: 而这类恰恰是最典型的带离手段。
+#:
+#: 代价说清楚：`grep -rn "\.env" README.md` 这种只是**提到**这个词的命令，
+#: 在 high 会话里也会被收紧。这是**故意的**取舍 —— 一句话能讲清的规则
+#: （「high 会话里提到凭据文件的 bash 命令都要人工确认」）比一张要维护的
+#: 动词表可靠，而解除只要人的 `--clear-taint` 一句话。
+CREDENTIAL_MENTION = re.compile(
+    r"\.env\b|\.npmrc|\.netrc|\.git-credentials|id_rsa|id_dsa|id_ed25519"
+    r"|credentials(\.json)?\b|\.aws\b|\.ssh\b|\.kube\b|\.pypirc|\.pgpass",
+    re.IGNORECASE,
+)
 MEMORY_PATH = re.compile(
     r"(^|[\\/])(CLAUDE\.md|CODEAGENT\.md|MINI\.md|AGENTS\.md|learned(\.[\w-]+)*\.md)$"
     r"|(^|[\\/])\.codeagent[\\/]rules",
@@ -106,9 +123,24 @@ def _irreversible_kind(tool_name: str, arguments: dict) -> str | None:
             return "网络外发"
         if MEMORY_PATH.search(raw):
             return "写入记忆文件"
-        # bash 读凭据：`cat .env` / `type .env` / `Get-Content .env`
-        if re.search(r"(^|[\s;&|(])(cat|type|head|tail|less|more|Get-Content|gc)\b",
-                     raw, re.IGNORECASE) and CREDENTIAL_PATH.search(raw):
+        # bash 碰凭据：**只看命令里有没有提到凭据文件，不枚举读动词、不锚定路径末尾**。
+        #
+        # 两处都是真实 LLM 端到端验证时发现后改的：
+        #
+        # ① 原先要求「读动词 + 凭据路径」同现，动词表是
+        #    `cat|type|head|tail|less|more|Get-Content|gc`。模型读 .env 用的却是
+        #    `findstr ... .env`（Windows 上 grep 的自然替代）—— 不在表里，天花板
+        #    **没生效**（轨迹里没有 gate_block，命令正常执行，变量名进了上下文）。
+        #    枚举读动词是打地鼠：findstr / Select-String / grep / awk / sed / od /
+        #    python -c … 无穷无尽，漏一个就等于这类动作完全没有天花板。
+        # ② 改成锚定路径末尾也还不够：`copy .env x.txt` 的末尾是 `x.txt`，不命中 ——
+        #    而「把凭据文件当输入写到别处」正是最典型的带离手段。
+        #
+        # 所以判据收敛成一句话：**high 会话里，提到凭据文件的 bash 命令都要人工确认**。
+        # 代价是 `grep -rn "\.env" README.md` 这种只是提及的也会被收紧 —— 接受，
+        # 因为它只在 high 会话生效，且人的 `--clear-taint` 一句话就能解除；
+        # 相比之下「换个命令就把 key 读走」不可接受。
+        if CREDENTIAL_MENTION.search(raw):
             return "读取凭据文件"
         return None
     if tool_name == "read" and CREDENTIAL_PATH.search(raw):
