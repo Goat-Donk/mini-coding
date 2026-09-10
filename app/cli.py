@@ -16,6 +16,7 @@ from agent.loop import QueryEngine
 from agent.memory import MemoryManager
 from agent.session import Session, latest_session, new_session_id
 from agent.tools.base import ToolRegistry
+from agent.tools.subagent import SubagentTool
 
 app = typer.Typer(no_args_is_help=True)
 
@@ -63,6 +64,7 @@ def run(
 
     llm = _build_llm(mock)
     registry = ToolRegistry.default(workspace_root)
+    registry.register(SubagentTool(llm, workspace_root))  # M4-2 research 子代理
     context = ContextManager(llm)  # M3-1 provider-usage-first 记账
     # M4-1 记忆：启动注入工作区记忆块；任务后提取约定（mock 模式不提取，保持脚本确定性）
     memory = MemoryManager(workspace_root, llm=None if mock else llm)

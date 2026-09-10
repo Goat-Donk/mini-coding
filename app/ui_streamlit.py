@@ -31,6 +31,7 @@ from agent.loop import QueryEngine
 from agent.permissions import PermissionsEngine
 from agent.session import Session, new_session_id
 from agent.tools.base import ToolRegistry
+from agent.tools.subagent import SubagentTool
 
 DEFAULT_WORKSPACE = Path(os.environ.get("WORKSPACE_ROOT", "workspace")).resolve()
 
@@ -95,6 +96,7 @@ def run_task(
     try:
         llm = build_llm(mock)
         registry = ToolRegistry.default(workspace)
+        registry.register(SubagentTool(llm, workspace))  # M4-2 research 子代理
         permissions = PermissionsEngine(workspace, confirm=confirm.ask)
         hooks = HookEngine([require_tests_before_commit(workspace)], workspace_root=workspace)
         session = Session(workspace, new_session_id(), on_event=events_q.put)
