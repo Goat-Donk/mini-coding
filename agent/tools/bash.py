@@ -79,8 +79,8 @@ class BashTool(Tool):
                 f"cwd 越界沙箱: {raw_cwd}（仅允许 {ctx.workspace_root} 内路径）"
             )
 
-        # 2) 危险命令拒绝（M1 兜底；M2 起转权限 ask）
-        if self._is_dangerous(args.command):
+        # 2) 危险命令拒绝（权限引擎在场时由引擎决策 ask/allow，此处仅兜底）
+        if self._is_dangerous(args.command) and ctx.permissions is None:
             return ToolResult.fail(
                 "命令命中危险模式，被拒绝执行：\n"
                 f"  {args.command}\n"

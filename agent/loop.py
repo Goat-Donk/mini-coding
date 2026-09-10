@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from agent.llm import BaseLLM, ToolCall, Usage
+from agent.permissions import Decision, PermissionsEngine
 from agent.state import AgentState, assistant_tool_calls, system, tool_result, user
 from agent.tools.base import ToolContext, ToolRegistry, ToolResult
 
@@ -60,6 +61,7 @@ class QueryEngine:
         max_steps: int = 25,
         loop_detection_window: int = 4,            # 最近 N 步工具签名相同即停
         empty_response_retries: int = 2,           # 空响应重试上限（M1-9）
+        permissions: PermissionsEngine | None = None,  # M2 权限引擎
         memory_blocks: list[str] | None = None,    # M4 注入
         context: object | None = None,             # M3 接 ContextManager
         session: object | None = None,             # M3 接 session（轨迹/检查点）
@@ -70,6 +72,7 @@ class QueryEngine:
         self.max_steps = max_steps
         self.loop_detection_window = max(1, loop_detection_window)
         self.empty_response_retries = max(0, empty_response_retries)
+        self.permissions = permissions
         self.memory_blocks = list(memory_blocks or [])
         self.context = context
         self.session = session
@@ -95,7 +98,9 @@ class QueryEngine:
         if self.session is not None:
             state.emitter = getattr(self.session, "emit", None)
 
-        ctx = ToolContext(workspace_root=self.workspace_root, cwd=cwd)
+        ctx = ToolContext(
+            workspace_root=self.workspace_root, cwd=cwd, permissions=self.permissions
+        )
         signatures_window: deque[list[str]] = deque(maxlen=self.loop_detection_window)
         empty_retry_count = 0
 
@@ -205,6 +210,19 @@ class QueryEngine:
             if tool is None:
                 available = ", ".join(self.registry.names())
                 result = ToolResult.fail(f"未知工具 {call.name}，可用工具: {available}")
+            elif self.permissions is not None:
+                decision = self.permissions.check(call.name, call.arguments, ctx)
+                if decision is Decision.DENY:
+                    result = ToolResult.fail(
+                        f"权限拒绝: 未获允许执行 {call.name}（{self.permissions.describe(call.name, call.arguments)}）"
+                    )
+                elif decision is Decision.ASK:
+                    # headless 无确认回调 → 安全默认拒绝（M2-3 控制台接入交互后走 ask）
+                    result = ToolResult.fail(
+                        f"权限拒绝: {call.name} 需要人工确认，当前无确认交互，已按拒绝处理"
+                    )
+                else:
+                    result = tool.run(call.arguments, ctx)
             else:
                 result = tool.run(call.arguments, ctx)
             state.record_event(
