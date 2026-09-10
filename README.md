@@ -4,7 +4,7 @@
 **核心循环手写**（不套 LangGraph / Agent SDK），支撑层用成熟库（openai SDK / pydantic v2 / streamlit / typer / pytest）。
 
 > **一句话**：把 Claude Code 的架构用 Python 重写一遍——不是移植代码，是移植设计。
-> 4,017 行源码 / 19 个模块 / 168 个测试。
+> 4,061 行源码 / 19 个模块 / 170 个测试。真实跑分见[评估章节](#评估eval)。
 
 📄 文档：[技术方案 `docs/TECH_SPEC.md`](docs/TECH_SPEC.md) · [架构详解 `docs/architecture.md`](docs/architecture.md) · [任务清单 `TASKS.md`](TASKS.md) · [参考笔记 `docs/reference/`](docs/reference/)
 
@@ -23,6 +23,19 @@
 | **分层记忆 + 自进化** | `CODEAGENT.md` / `CLAUDE.md` / `.codeagent/rules/*.md` 分层 + `@include` + hash 去重 + 预算；任务后提取约定写回，**下次会话自动生效** | CLAUDE.md 机制 |
 | **research 子代理** | 把 `(X+Y)×N` 的探索外包，主上下文只收结论 `Z`；子代理只读、无 subagent 工具（天然禁递归） | SubAgent 上下文经济学 |
 | **MCP 客户端** | 手写 MCP stdio 客户端接入标准 MCP server；**第三方工具照样过权限与 hooks**（分层设计的回报） | MCP（工具接入标准） |
+
+### 实测：缓存命中率曲线（冷启动）
+
+cache-aware 布局不是设计推理，是**测出来的**。同一个 9 步修 bug 任务，逐步的缓存命中：
+
+```
+step  1  prompt= 1248  命中 1024/1248 = 82%   ← 冷启动那轮此处为 0%
+step  4  prompt= 1670  命中 1536/1670 = 92%
+step  7  prompt= 2607  命中 2048/2607 = 79%
+step  9  prompt= 2973  命中 2560/2973 = 86%     累计 81%
+```
+
+冷启动那一轮的爬升更说明问题：**step1 0% → step2 66% → step3 78%** —— 稳定前缀（system + 任务 + 工具 schema）被缓存下来，后续步骤持续命中。命中量按 1024/1536/2048/2560 阶梯增长（provider 按块缓存）。
 
 另外吸收了 [MiniCode](https://github.com/LiuMengxuan04/MiniCode) 的长会话治理经验：provider-usage-first token 记账、超大工具结果落盘+预览、确定性 snip 裁剪、空响应重试、细粒度权限决策。
 
@@ -160,7 +173,7 @@ python -m eval.runner --limit 2 --mock           # 无 key 冒烟：只验证管
 **测试**：
 
 ```bash
-python -m pytest tests/                  # 168 passed
+python -m pytest tests/                  # 170 passed
 ```
 
 ---
@@ -186,9 +199,32 @@ dcf0a013  fix: correctly handle falsy values in LRUCache
 1fa99fb3  fix: make query callables work again
 ```
 
-> ⚠️ **诚实的说明**：mock 冒烟只验证管线连通（MockLLM 不修 bug，所以完成率必然是 0——这是**正确**的判定结果，不是 bug）。真实跑分需要 `DEEPSEEK_API_KEY`，本仓库**不预置任何跑分数字**，请自行运行 `python -m eval.runner --limit N` 得到属于你的报告（落 `data/eval/report-*.json`）。
+> ⚠️ **关于 mock 冒烟**：`--mock` 只验证管线连通。MockLLM 不修 bug，所以完成率必然是 0 —— 那是**正确**的判定结果（测试真的跑了并且真的失败），不是 bug。
 
-报告字段：完成率 / 逐任务 steps / token / 耗时 / 成本（按 DeepSeek 公开定价 ¥0.5·¥2·¥8 每 M tokens 估算）/ 缓存命中率；agent 或 judge 抛异常会**如实记入 `error` 字段**，不会伪装成通过。
+### 实测结果（真实跑分，非预置）
+
+下面这组数字是**本机真实跑出来的**，不是写死在仓库里的：
+
+```
+python -m eval.runner --limit 2
+完成率 50%（1/2 个有效任务） · token 269,767 · 估算成本 ¥0.2284 · 平均缓存命中率 89%
+
+  ✗ 770486ff  fix: freeze unhashable args in Query.test…   12步 101287t ¥0.092  51.2s
+  ✓ e70f9b1d  fix: correct Table.update transform type hints  25步 168480t ¥0.136 164.0s
+```
+
+判定依据（judge 跑隐藏测试的真实输出，已落进报告）：
+
+| 任务 | judge 输出 | 结论 |
+|---|---|---|
+| `770486ff` | `1 failed, 32 passed` — `TypeError: unhashable type: 'dict'` 仍在 | 没修好 |
+| `e70f9b1d` | `109 passed` | 真修好了 |
+
+> **口径说明**：本轮用的是 **DashScope 的 OpenAI 兼容端点 + `deepseek-v4-flash`**（本机 agentrouter 的 key 被客户端指纹锁死，非 Claude Code 客户端一律 401）。缓存命中率因此是 **DashScope 的前缀缓存**口径，与 DeepSeek 官方 `prompt_cache_hit_tokens` 机制同类但数值不等价。换官方 `deepseek-chat` 重跑会得到不同数字 —— 请自行跑 `--limit N` 取属于你的报告。
+
+**一个真实踩过的坑（已修 + 已加回归测试）**：tinydb 的 `pytest.ini` 写死了 `--cov-append --cov-report term --cov tinydb`，本机没装 pytest-cov 时 pytest 会以 **usage error（退出码 4）直接退出**——测试一次都没跑。而 judge 原本只看 `returncode == 0`，于是把它算成"agent 没修好"，完成率被压成假的 **0%**。修法：judge 用 `-o addopts=` 清掉仓库自带 addopts，并把退出码 2/3/4/5（压根没跑成）识别为**无效判定**计入 `error`，不再污染完成率。同一个 bug 修前修后：`0/2` → `1/2`。
+
+报告字段：完成率（分母只算有效判定）/ 逐任务 steps / token / 耗时 / 成本（按 DeepSeek 公开定价 ¥0.5·¥2·¥8 每 M tokens 估算）/ 缓存命中率 / **judge 的 pytest 摘要**；agent 或 judge 抛异常会**如实记入 `error` 字段**，不会伪装成通过。
 
 ---
 
@@ -200,10 +236,10 @@ dcf0a013  fix: correctly handle falsy values in LRUCache
 | 治理 | `agent/permissions.py` `hooks.py` `memory.py` | 688 |
 | 工具 | `agent/tools/base.py` `bash.py` `files.py` `subagent.py` | 740 |
 | MCP | `agent/mcp.py` | 350 |
-| 入口 | `app/cli.py` `ui_streamlit.py` `replay.py` | 577 |
-| 评估 | `eval/golden_tasks.py` `runner.py` | 452 |
-| **源码合计** | **19 个模块** | **4,017** |
-| 测试 | `tests/` | 2,586（168 个用例） |
+| 入口 | `app/cli.py` `ui_streamlit.py` `replay.py` | 583 |
+| 评估 | `eval/golden_tasks.py` `runner.py` | 490 |
+| **源码合计** | **19 个模块** | **4,061** |
+| 测试 | `tests/` | 2,631（170 个用例） |
 
 ---
 

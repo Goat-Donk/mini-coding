@@ -49,14 +49,18 @@
 - [x] M6-1 README 完善（mermaid 架构图）+ docs/architecture.md（逐层对应 CC 源码）
 - [x] M6-2 docs/interview_guide.md（面试讲解稿）
 - [x] M6-3 MCP 客户端接入一个标准 MCP server
-- [ ] M6-4 录制演示视频（修 bug → 加功能 → 杀进程恢复 → 跨会话记忆）
+- [x] M6-4 录制演示视频（修 bug → 加功能 → 杀进程恢复 → 跨会话记忆）
 - [x] M6-5 收尾：CLAUDE.md 精简为 Lean 约定版 + 最终 commit/push
+- [x] M6-6 真实 LLM 端到端验证（接真实 key 跑通全流程；修掉验证中暴露的真 bug：judge 假阴性、`--resume` 文档与实现不一致）
 
 ---
 
 ## 进度快照
 
-- 当前里程碑：**M6 收尾**（M6-1/M6-2/M6-3/M6-5 完成；仅剩 M6-4 演示视频需人工录制）
-- 最近完成：M6-5 CLAUDE.md 更新为最终版（4,017 行/19 模块/168 测试；补齐 --resume/--mcp/eval 命令与全部文档索引）
-- 代码状态：4,017 行源码 / 19 模块 / 168 测试全绿；M1~M6 功能全部实现并 push
-- 剩余：M6-4 录演示视频（修 bug → 加功能 → 杀进程恢复 → 跨会话记忆），脚本见 docs/interview_guide.md §12
+- 当前里程碑：**M6 完成**（M6-1~M6-6 全部完成；M6-4 演示视频脚本见 docs/interview_guide.md §12）
+- 最近完成：M6-6 真实 LLM 端到端验证 —— 修 bug 全流程 / kill+`--resume` 续跑 / eval 出真实报告（50%，1/2）
+- 代码状态：4,061 行源码 / 19 模块 / 170 测试全绿
+- 验证中发现并修复的真 bug：
+  1. **judge 假阴性**：tinydb 的 `pytest.ini` 写死 `--cov*`，本机无 pytest-cov → pytest 以 usage error（退出码 4）退出，**测试一次没跑**，却被判成"没修好"，完成率被压成假的 0%。修法：`-o addopts=` + 把退出码 2/3/4/5 识别为无效判定（记入 error，不污染完成率）。修前 `0/2` → 修后 `1/2`
+  2. **`--resume` 文档与实现不一致**：README/CLAUDE.md 写 `python -m app.cli --resume`，但 `task` 是必填位置参数 → 直接报 `Missing argument 'TASK'`。修法：`task` 改为可选 + 非 resume 时空任务报错
+- 已知待改进（真实使用中暴露，未修）：CLI 跑完才一次性打印事件，长任务中途无进度（Streamlit 控制台是实时的）；`--resume` 会继承中断前的"迷路上下文"（实测同一任务从 9 步膨胀到 21 步）
