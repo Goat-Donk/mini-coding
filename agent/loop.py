@@ -118,6 +118,9 @@ class QueryEngine:
         self.permissions = permissions
         self.hooks = hooks
         self.tool_result_store = tool_result_store
+        # 按 session_id 缓存的落盘 store（见 _store_for）；只有显式传了
+        # tool_result_store 之外的情况才用它，避免同引擎跑多会话时串目录
+        self._stores: dict[str, ToolResultStore] = {}
         self.memory_blocks = list(memory_blocks or [])
         self.context = context
         self.session = session
@@ -290,6 +293,34 @@ class QueryEngine:
             return self.context.prepare(state)
         return state.messages
 
+    def _store_for(self, state: AgentState) -> ToolResultStore | None:
+        """解析本次运行该用的工具结果落盘 store（M3-2 的接线兜底）。
+
+        **为什么要有这个方法**：`tool_result_store` 是构造参数，而三个入口
+        （`app/cli.py`、`app/ui_streamlit.py`、`eval/runner.py`）**全都没传它**
+        —— 于是 `compact_batch` 在生产路径上从未执行过：机制写完、文档写了、
+        测试绿了，但没人接上。这与项目已经修过两次的接线漂移（hooks 曾整体
+        漏接 CLI、CLI 曾漏接 permissions）是同一个形状的第三次。
+
+        所以把「谁来构造 store」收进引擎自己：显式传入优先（测试与将来需要
+        自定义目录的调用方），否则**有 session 就自动按 session 落盘**。构造点
+        只有一处，不会再出现"一个入口接了、另一个没接"。
+
+        `eval/runner.py` 不建 Session → 这里返回 None → eval 不落盘，
+        行为与既有的完成率/token 数字**保持不变**（这是刻意的，不是遗漏）。
+
+        按 session_id 缓存而不是每次新建：`ToolResultStore._written` 记住
+        「同 id 同内容不重复写盘」，跨步复用才有意义；每步新建会退化成每步重写。
+        """
+        if self.tool_result_store is not None:
+            return self.tool_result_store
+        if self.session is None:
+            return None
+        sid = state.session_id
+        if sid not in self._stores:
+            self._stores[sid] = ToolResultStore(self.workspace_root, sid)
+        return self._stores[sid]
+
     def _execute_tool_calls(
         self, calls: list[ToolCall], state: AgentState, ctx: ToolContext
     ) -> None:
@@ -322,8 +353,9 @@ class QueryEngine:
             results = [invoke(call) for call in calls]
 
         # M3-2：超大工具结果落盘（上下文替换为预览+路径，避免截断丢信息）
-        if self.tool_result_store is not None:
-            results = compact_batch(results, self.tool_result_store)
+        store = self._store_for(state)
+        if store is not None:
+            results = compact_batch(results, store)
 
         # 消息追加：一条 assistant tool_calls + N 条 tool 结果（顺序与 calls 对应）
         state.messages.append(assistant_tool_calls(calls))

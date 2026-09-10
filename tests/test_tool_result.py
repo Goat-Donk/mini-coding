@@ -3,6 +3,7 @@ from pathlib import Path
 
 from agent.llm import LLMResult, MockLLM
 from agent.loop import QueryEngine
+from agent.session import Session
 from agent.tool_result import (
     BATCH_BUDGET,
     PERSIST_THRESHOLD,
@@ -133,3 +134,84 @@ def test_loop_persists_big_read(tmp_path):
     files = list((tmp_path / "data" / "tool-results" / "sess_loop").glob("*.txt"))
     assert len(files) == 1
     assert len(files[0].read_text(encoding="utf-8")) > PERSIST_THRESHOLD
+
+
+# ---------- 接线回归（第三个「机制写了但没人接」的实例） ----------
+
+def _run_big_read(tmp_path: Path, **kwargs) -> tuple[str, list[str]]:
+    """按给定接线方式跑一次「读大文件」，返回 (terminated_reason, 所有 tool 消息)。
+
+    kwargs 决定入口怎么接线 —— 这正是被测变量。
+    """
+    (tmp_path / "big.txt").write_text("x" * 60_000, encoding="utf-8")
+    captured: list[dict] = []
+
+    def then_answer(messages, tools):
+        captured.extend(messages)
+        return LLMResult(content="读完")
+
+    engine = make_engine(
+        tmp_path,
+        MockLLM.script(
+            MockLLM.tool("read", {"path": "big.txt"}).responses[0], then_answer
+        ),
+        **kwargs,
+    )
+    result = engine.run("读大文件")
+    return result.terminated_reason, [m["content"] for m in captured if m["role"] == "tool"]
+
+
+def test_store_is_wired_when_entry_passes_only_a_session(tmp_path):
+    """入口只给 session、不传 tool_result_store 时，落盘必须照样发生。
+
+    **这条测试的形状是有意的。** 上面那条 `test_loop_persists_big_read` 是
+    **手工**把 store 传进去的，所以它只能证明「store 好用」，证明不了
+    「有人接上它」—— 而真实缺陷恰好就落在这一格：`app/cli.py`、
+    `app/ui_streamlit.py`、`eval/runner.py` 三处 `QueryEngine` 构造
+    **全都没传 `tool_result_store`**，于是 `compact_batch` 在生产路径上
+    从未执行过。机制写完、文档写了、单测全绿，只有真跑才看得出来。
+
+    所以这里**不加 `tool_result_store=`**，按入口的构造方式建引擎。
+    它与「hooks 曾整体漏接 CLI」「CLI 曾漏接 permissions」是同一形状的
+    第三次，这条测试就是钉住它不再有第四次。
+    """
+    reason, tool_msgs = _run_big_read(tmp_path, session=Session(tmp_path, "sess_wired"))
+
+    assert reason == "completed"
+    assert any(TAG_OPEN in text for text in tool_msgs), "工具结果没被替换 → 接线断了"
+    files = list((tmp_path / "data" / "tool-results" / "sess_wired").glob("*.txt"))
+    assert len(files) == 1, "session 在场却没落盘 → 接线又断了"
+    assert len(files[0].read_text(encoding="utf-8")) > PERSIST_THRESHOLD
+
+
+def test_no_session_means_no_persist(tmp_path):
+    """无 session（eval/runner 的构造方式）→ 不落盘。
+
+    这是**刻意**的：eval 不建 Session，所以它的行为与既有完成率/token
+    数字保持不变。这条测试把「刻意」钉成可执行的断言，免得将来有人
+    「顺手」把它也接上、悄悄改掉 README 的实测数字。
+    """
+    reason, tool_msgs = _run_big_read(tmp_path)  # 无 session
+
+    assert reason == "completed"
+    assert all(TAG_OPEN not in text for text in tool_msgs)
+    assert not (tmp_path / "data" / "tool-results").exists()
+
+
+def test_store_reused_across_steps_not_rebuilt(tmp_path):
+    """store 必须跨步复用：`_written` 记住同 id 同内容不重复写盘。
+
+    每步新建 store 会退化成每步重写同一个文件 —— 功能看起来一样，
+    但磁盘行为不同，而这类差异只会在长会话里显形。
+    """
+    session = Session(tmp_path, "sess_reuse")
+    engine = make_engine(
+        tmp_path,
+        MockLLM.script(MockLLM.tool("read", {"path": "big.txt"}).responses[0]),
+        session=session,
+    )
+    engine.run("第一次")
+    snapshot = dict(engine._stores)
+    engine.run("第二次")
+    assert engine._stores == snapshot, "同一 session 的 store 被重建了"
+    assert list(snapshot) == ["sess_reuse"]  # 键是 session_id，不是别的
