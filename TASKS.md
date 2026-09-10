@@ -52,15 +52,21 @@
 - [x] M6-4 录制演示视频（修 bug → 加功能 → 杀进程恢复 → 跨会话记忆）
 - [x] M6-5 收尾：CLAUDE.md 精简为 Lean 约定版 + 最终 commit/push
 - [x] M6-6 真实 LLM 端到端验证（接真实 key 跑通全流程；修掉验证中暴露的真 bug：judge 假阴性、`--resume` 文档与实现不一致）
+- [x] M6-7 修 M6-6 暴露的两个体验问题：CLI 事件实时流式打印 + agent 不知道工作目录（system prompt 注入 `workspace_root`/平台提示）
 
 ---
 
 ## 进度快照
 
-- 当前里程碑：**M6 完成**（M6-1~M6-6 全部完成；M6-4 演示视频脚本见 docs/interview_guide.md §12）
-- 最近完成：M6-6 真实 LLM 端到端验证 —— 修 bug 全流程 / kill+`--resume` 续跑 / eval 出真实报告（50%，1/2）
-- 代码状态：4,061 行源码 / 19 模块 / 170 测试全绿
+- 当前里程碑：**M6 完成**（M6-1~M6-7 全部完成；M6-4 演示视频脚本见 docs/interview_guide.md §12）
+- 最近完成：M6-7 —— 修掉 M6-6 暴露的两个体验问题
+- 代码状态：4,158 行源码 / 19 模块 / 184 测试全绿
 - 验证中发现并修复的真 bug：
   1. **judge 假阴性**：tinydb 的 `pytest.ini` 写死 `--cov*`，本机无 pytest-cov → pytest 以 usage error（退出码 4）退出，**测试一次没跑**，却被判成"没修好"，完成率被压成假的 0%。修法：`-o addopts=` + 把退出码 2/3/4/5 识别为无效判定（记入 error，不污染完成率）。修前 `0/2` → 修后 `1/2`
   2. **`--resume` 文档与实现不一致**：README/CLAUDE.md 写 `python -m app.cli --resume`，但 `task` 是必填位置参数 → 直接报 `Missing argument 'TASK'`。修法：`task` 改为可选 + 非 resume 时空任务报错
-- 已知待改进（真实使用中暴露，未修）：CLI 跑完才一次性打印事件，长任务中途无进度（Streamlit 控制台是实时的）；`--resume` 会继承中断前的"迷路上下文"（实测同一任务从 9 步膨胀到 21 步）
+  3. **agent 不知道自己的工作目录**（`--resume` 迷路的真根因）：system prompt 只说"只能在工作目录（沙箱）内操作"，却从没告诉它这个目录**是什么** → 模型猜 `/workspace`、`dir C:\Users\<编造的用户名>\`，遍历磁盘 15 步才找到真路径。`--resume` 只是把它放大（恢复的状态里模型已认定错误路径）。修法：system prompt 新增"工作目录"段，注入 `{workspace_root}` 与 `{platform}` 槽位；注入用逐个 `str.replace` 而非 `str.format`（自定义 prompt 含花括号会抛 KeyError）
+  4. **CLI 跑完才一次性打印事件**：长任务中途零反馈。修法：`QueryEngine(on_event=...)` 实时回调 + `app/cli.py` 的 `EventPrinter`（**带锁** —— 只读工具并发执行时 `record_event` 会从多个工作线程回调，不加锁两行会交错）。顺带给 `Session.emit` 的 JSONL 写入加锁，让"append-only 不交错"成为真保证
+- 已知待改进（未修）：
+  - **真实 LLM 复跑被账号欠费阻断**（2026-09-10 晚：DashScope 所有模型 400 `Arrearage`）。M6-7 的两个修复目前只有 **MockLLM + 单测** 覆盖，**"步数是否下降 / `--resume` 是否不再迷路" 未用真实模型复跑过** —— 充值后必须补跑，别当已验证
+  - Streamlit 控制台只跑过 AppTest，没在浏览器里真开过
+  - 真实 token 压力下的两级 compact 从未触发（实测上下文只到 10%）

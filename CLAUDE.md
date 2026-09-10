@@ -4,9 +4,11 @@
 
 ## 项目定位
 
-求职作品集：**CodeAgent** —— 参考 [pengchengneo/Claude-Code](https://github.com/pengchengneo/Claude-Code) 源码架构，用 Python 从零实现的小型 AI Coding Agent（4,061 行 / 19 模块 / 170 测试）。核心循环手写（不套 Agent SDK），支撑层用成熟库（openai / pydantic / streamlit / typer / pytest）。差异化：cache-aware 上下文 + 缓存省钱指标、step 级检查点恢复、block-at-submit hooks、轨迹驱动评估（真实 tinydb 提交 + 隐藏测试）、记忆自进化、MCP 工具接入。
+求职作品集：**CodeAgent** —— 参考 [pengchengneo/Claude-Code](https://github.com/pengchengneo/Claude-Code) 源码架构，用 Python 从零实现的小型 AI Coding Agent（4,158 行 / 19 模块 / 184 测试）。核心循环手写（不套 Agent SDK），支撑层用成熟库（openai / pydantic / streamlit / typer / pytest）。差异化：cache-aware 上下文 + 缓存省钱指标、step 级检查点恢复、block-at-submit hooks、轨迹驱动评估（真实 tinydb 提交 + 隐藏测试）、记忆自进化、MCP 工具接入。
 
 **已验证状态**：真实 LLM 端到端跑通（修 bug 全流程、kill+`--resume` 续跑、eval 出真实报告 50% 1/2）。本机 `.env` 走 DashScope 的 OpenAI 兼容端点 + `deepseek-v4-flash`——因为 agentrouter 的 key 被客户端指纹锁死（非 Claude Code 客户端一律 401）。README「评估」章节有真实数字与口径说明。
+
+> ⚠️ **2026-09-10 晚：DashScope 账号欠费**（所有模型返回 400 `Arrearage`），真实 LLM 暂时跑不了，只能用 `--mock`。已跑过的真实数字是当时实测、不作废，但**不能再复现**；要重跑真实任务需先给账号充值。
 
 ## 硬约束（不可违反）
 
@@ -48,7 +50,7 @@ streamlit run app/ui_streamlit.py            # 控制台（指标 + 权限按钮
 ```
 
 > 本机跑真实任务前先 `export NO_PROXY="localhost,127.0.0.1,aliyuncs.com"` 并 unset `HTTPS_PROXY`（DashScope 是境内服务，走代理会绕远）。
-> CLI 目前**跑完才一次性打印事件**，长任务中途看不到进度（Streamlit 控制台是实时的）——录演示视频建议用控制台。
+> CLI 已支持**事件实时流式打印**（工具调用一发生就打，不用等任务结束）。
 
 ## 工程约定
 

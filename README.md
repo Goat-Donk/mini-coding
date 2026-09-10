@@ -4,7 +4,7 @@
 **核心循环手写**（不套 LangGraph / Agent SDK），支撑层用成熟库（openai SDK / pydantic v2 / streamlit / typer / pytest）。
 
 > **一句话**：把 Claude Code 的架构用 Python 重写一遍——不是移植代码，是移植设计。
-> 4,061 行源码 / 19 个模块 / 170 个测试。真实跑分见[评估章节](#评估eval)。
+> 4,158 行源码 / 19 个模块 / 184 个测试。真实跑分见[评估章节](#评估eval)。
 
 📄 文档：[技术方案 `docs/TECH_SPEC.md`](docs/TECH_SPEC.md) · [架构详解 `docs/architecture.md`](docs/architecture.md) · [任务清单 `TASKS.md`](TASKS.md) · [参考笔记 `docs/reference/`](docs/reference/)
 
@@ -153,6 +153,9 @@ python -m app.cli --resume               # 从最近检查点续跑（配合 Ctr
 python -m app.cli --mcp .codeagent/mcp.json "任务"   # 加载 MCP server（第三方工具）
 ```
 
+CLI 的事件日志是**实时流式**的：工具调用一发生就打一行（`[步 3] ✓ bash(command=python -m pytest -q) [1200ms]`），
+bash 退出码非 0 会额外标 `[exit code: N]`，不用等任务结束才看到进度。
+
 **接 MCP server**（复制 [`mcp.example.json`](mcp.example.json) 为 `.codeagent/mcp.json`）：
 
 ```json
@@ -173,7 +176,7 @@ python -m eval.runner --limit 2 --mock           # 无 key 冒烟：只验证管
 **测试**：
 
 ```bash
-python -m pytest tests/                  # 170 passed
+python -m pytest tests/                  # 184 passed
 ```
 
 ---
@@ -221,6 +224,10 @@ python -m eval.runner --limit 2
 | `e70f9b1d` | `109 passed` | 真修好了 |
 
 > **口径说明**：本轮用的是 **DashScope 的 OpenAI 兼容端点 + `deepseek-v4-flash`**（本机 agentrouter 的 key 被客户端指纹锁死，非 Claude Code 客户端一律 401）。缓存命中率因此是 **DashScope 的前缀缓存**口径，与 DeepSeek 官方 `prompt_cache_hit_tokens` 机制同类但数值不等价。换官方 `deepseek-chat` 重跑会得到不同数字 —— 请自行跑 `--limit N` 取属于你的报告。
+>
+> ⚠️ **可复现性说明**：上面这组数字是 2026-09-10 白天**实测**的。同日晚该 DashScope 账号进入欠费状态（所有模型返回 400 `Arrearage`），
+> 因此**这批数字现在无法复现**，需要先给账号充值。数字本身不作废（当时确实跑出来了），但请把它当「历史实测」而不是「你拉下来就能复现的基准」。
+> 同样地，此后做的两处修复（CLI 流式输出、system prompt 注入工作目录）目前**只有 MockLLM + 单测覆盖，未用真实模型复跑** —— 充值后应补跑 `--limit 2` 确认步数与完成率的变化。
 
 **一个真实踩过的坑（已修 + 已加回归测试）**：tinydb 的 `pytest.ini` 写死了 `--cov-append --cov-report term --cov tinydb`，本机没装 pytest-cov 时 pytest 会以 **usage error（退出码 4）直接退出**——测试一次都没跑。而 judge 原本只看 `returncode == 0`，于是把它算成"agent 没修好"，完成率被压成假的 **0%**。修法：judge 用 `-o addopts=` 清掉仓库自带 addopts，并把退出码 2/3/4/5（压根没跑成）识别为**无效判定**计入 `error`，不再污染完成率。同一个 bug 修前修后：`0/2` → `1/2`。
 
@@ -232,14 +239,14 @@ python -m eval.runner --limit 2
 
 | 层 | 文件 | 行数 |
 |---|---|---|
-| 核心循环 | `agent/loop.py` `llm.py` `state.py` `context.py` `tool_result.py` `session.py` | 1,210 |
+| 核心循环 | `agent/loop.py` `llm.py` `state.py` `context.py` `tool_result.py` `session.py` | 1,270 |
 | 治理 | `agent/permissions.py` `hooks.py` `memory.py` | 688 |
 | 工具 | `agent/tools/base.py` `bash.py` `files.py` `subagent.py` | 740 |
 | MCP | `agent/mcp.py` | 350 |
-| 入口 | `app/cli.py` `ui_streamlit.py` `replay.py` | 583 |
+| 入口 | `app/cli.py` `ui_streamlit.py` `replay.py` | 620 |
 | 评估 | `eval/golden_tasks.py` `runner.py` | 490 |
-| **源码合计** | **19 个模块** | **4,061** |
-| 测试 | `tests/` | 2,631（170 个用例） |
+| **源码合计** | **19 个模块** | **4,158** |
+| 测试 | `tests/` | 2,858（184 个用例） |
 
 ---
 
