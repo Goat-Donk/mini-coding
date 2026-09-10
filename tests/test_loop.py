@@ -148,3 +148,33 @@ def test_e2e_real_files(tmp_path):
 
 def test_default_system_prompt_has_placeholder():
     assert "{repo_memory_block}" in DEFAULT_SYSTEM_PROMPT
+
+
+def test_empty_response_recovered(tmp_path):
+    """M1-9：模型第一次返回空白文本 → push continuation prompt 重试 → 第二次正常回答。"""
+    engine = make_engine(
+        tmp_path,
+        MockLLM.script(
+            LLMResult(content="", usage=Usage(prompt_tokens=1, completion_tokens=0)),
+            LLMResult(content="完成", usage=Usage(prompt_tokens=1, completion_tokens=1)),
+        ),
+    )
+    result = engine.run("任务")
+    assert result.terminated_reason == "completed"
+    assert result.steps == 2
+    assert result.final_text == "完成"
+    retries = [e for e in result.events if e["type"] == "empty_response_retry"]
+    assert len(retries) == 1
+    assert retries[0]["attempt"] == 1
+
+
+def test_empty_response_gives_up(tmp_path):
+    """M1-9：空响应超过重试上限 → 按 completed（空结论）结束，不无限重试。"""
+    empty = LLMResult(content="", usage=Usage(prompt_tokens=1, completion_tokens=0))
+    engine = make_engine(tmp_path, MockLLM([empty] * 10), empty_response_retries=2)
+    result = engine.run("任务")
+    assert result.terminated_reason == "completed"
+    assert result.steps == 3  # 初始 1 次 + 2 次重试
+    retries = [e for e in result.events if e["type"] == "empty_response_retry"]
+    assert len(retries) == 2
+    assert result.final_text == ""

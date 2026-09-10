@@ -59,6 +59,7 @@ class QueryEngine:
         system_prompt: str | None = None,          # None → 内置默认
         max_steps: int = 25,
         loop_detection_window: int = 4,            # 最近 N 步工具签名相同即停
+        empty_response_retries: int = 2,           # 空响应重试上限（M1-9）
         memory_blocks: list[str] | None = None,    # M4 注入
         context: object | None = None,             # M3 接 ContextManager
         session: object | None = None,             # M3 接 session（轨迹/检查点）
@@ -68,6 +69,7 @@ class QueryEngine:
         self.workspace_root = Path(workspace_root).resolve()
         self.max_steps = max_steps
         self.loop_detection_window = max(1, loop_detection_window)
+        self.empty_response_retries = max(0, empty_response_retries)
         self.memory_blocks = list(memory_blocks or [])
         self.context = context
         self.session = session
@@ -95,6 +97,7 @@ class QueryEngine:
 
         ctx = ToolContext(workspace_root=self.workspace_root, cwd=cwd)
         signatures_window: deque[list[str]] = deque(maxlen=self.loop_detection_window)
+        empty_retry_count = 0
 
         try:
             while state.step < self.max_steps:
@@ -114,6 +117,18 @@ class QueryEngine:
                 )
 
                 if not result.tool_calls:
+                    # 空响应恢复（M1-9）：无工具调用且内容空白 → push continuation prompt 重试
+                    if not (result.content or "").strip() and empty_retry_count < self.empty_response_retries:
+                        empty_retry_count += 1
+                        state.record_event(
+                            "empty_response_retry",
+                            attempt=empty_retry_count,
+                            limit=self.empty_response_retries,
+                        )
+                        state.messages.append(
+                            user("上次返回为空，继续完成下一步或给出最终结论")
+                        )
+                        continue
                     state.terminated_reason = "completed"
                     return RunResult(
                         final_text=result.content,
