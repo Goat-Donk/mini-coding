@@ -471,15 +471,19 @@ class ContextStats:
 
 class ContextManager:
     def __init__(self, llm: BaseLLM, *, token_budget: int = 64000,
-                 snip_threshold: float = 0.70, compact_threshold: float = 0.85):
+                 snip_threshold: float = 0.70, compact_threshold: float = 0.85,
+                 keep_recent: int = 12, min_keep: int = 6, snip_target: float = 0.60):
         ...
-    def prepare(self, state: AgentState) -> list[dict]:
-        # M3 流水线（按序）：
-        # 1) token 记账（provider-usage-first + 尾部估算，见 6.2）
-        # 2) 超过预算 → compact（见 6.3）
-        # 3) cache-aware 布局（见 6.4）
-        raise NotImplementedError  # M3 实现后删除
+    def prepare(self, state: AgentState, tool_schemas: list[dict] | None = None) -> list[dict]:
+        # M3 流水线（按序）：记账(6.2) → 分级 compact(6.3) → 返回消息（前缀稳定，6.4）
+    # 内部：
+    def _snip(self, state, messages) -> bool           # 确定性裁剪（无 LLM）
+    def _compact_with_summary(self, state, messages) -> bool  # LLM 摘要（失败退化 snip）
+    def _find_cut(self, messages) -> int | None        # 轮次边界对齐的保留窗口起点
+    @staticmethod _is_round_boundary(messages, idx) -> bool
 ```
+
+**实现状态**：M3-1（记账+布局）/ M3-3（compact 流水线）已完成并测试。
 
 ### 6.2 provider-usage-first token 记账（MiniCode token-estimator 移植）
 
@@ -488,21 +492,37 @@ class ContextManager:
 - 分级告警：utilization = total/budget；`normal <0.5 ≤ warning <0.85 ≤ critical <0.95 ≤ blocked`。
 - **compact 后**：保留消息的 usage 标记 stale（state 里记 `usage_stale_reason`），避免旧 usage 计新上下文。
 
-### 6.3 compact 流水线（两级，先确定性后 LLM）
+### 6.3 compact 流水线（M3-3 已实现：warning 带 → 确定性 snip；critical → LLM 摘要 + snip 兜底）
 
-1. **确定性 snip compact**（无 LLM，成本≈0）：utilization ≥ snip_threshold(0.70) 触发。
-   - 从尾部扫描保留最近 N=12 条消息（至少 6 条），其余**中段**删除。
-   - 删除处插入 `snip_boundary` 标记消息（`[已裁剪的历史消息，见会话轨迹]`），让模型知道中间发生了什么。
-   - 对齐：boundary 必须落在完整 API 轮次边界（assistant tool_calls + 其 tool 结果整组），不能切开。
-   - 目标：裁剪后 utilization ≤ 0.60。
-2. **LLM 摘要 compact**（critical/blocked 才触发，M3-3）：用 `llm.complete` 把最早的中段对话压成 `context_summary` 消息。
-   - boundary 对齐 API 轮次；system 消息保留；保留最近消息的 usage 标记 stale。
-   - 摘要 prompt：`build_compact_summary_prompt(conversation_text)`（要求保留：任务目标、关键决策、错误与修复、未完成任务）。
+`prepare()` 实测触发逻辑（两级阈值带）：
+```python
+self.last_stats = self.account(state)
+if self.last_stats.utilization >= self.compact_threshold:   # ≥0.85 critical/blocked
+    self._compact_with_summary(state, state.messages)       # LLM 摘要，失败退化 snip
+elif self.last_stats.utilization >= self.snip_threshold:    # 0.70~0.85 warning
+    self._snip(state, state.messages)                       # 确定性裁剪（无 LLM，成本≈0）
+return state.messages
+```
+
+1. **确定性 snip compact**（warning 带，无 LLM）：`_find_cut` 从尾部往回保留最近
+   keep_recent=12 条（至少 min_keep=6）作"保留窗口"，窗口之前的中段删除。
+   - 窗口起点用 `_is_round_boundary(messages, idx)` 对齐：切点必须落在完整 API 轮次
+     边界（assistant tool_calls + 其 tool 结果整组），绝不切开工具组（孤儿 tool result
+     会破坏 OpenAI 消息格式）。
+   - 删除处插入 `SNIP_BOUNDARY_MARKER = "[已裁剪的历史消息，见会话轨迹 JSONL]"`。
+   - 目标：裁剪后 utilization ≤ snip_target(0.60)。
+2. **LLM 摘要 compact**（critical/blocked ≥0.85）：`llm.complete(build_compact_summary_prompt(text))`
+   把最早的中段对话压成 `context_summary` 消息（保留：任务目标、关键决策、错误与修复、未完成任务）。
+   - 插 `SUMMARY_MARKER = "[历史对话已摘要，完整轨迹见会话 JSONL]"`；稳定前缀
+     （`_PREFIX_LEN = 2`：system + task）永远保留。
+   - **LLM 摘要失败 → `except Exception: return self._snip(...)` 兜底**（绝不让 compact 因摘要失败而跳过）。
+   - 两种 compact 都会把保留消息的 usage 标记 stale：`state.usage_stale_reason = "snip_compact" | "llm_compact"`。
 
 ### 6.4 cache-aware 消息布局（我们的独家，叠加在其上）
 
 - **目标**：最大化 DeepSeek 磁盘缓存命中 → 稳定前缀（system + 全部工具 schema + 记忆块）永远在最前且不变。
-- **实现**：`prepare()` 返回的消息顺序 = `[system, 记忆, ...对话消息]`；**不允许** compact/插入把 system 与工具 schema 之间的顺序打乱（工具 schema 由 registry 传入）。
+- **实现**：`prepare()` 返回的消息顺序 = `[稳定前缀, ...对话消息]`，稳定前缀 `_PREFIX_LEN = 2`
+  （system + task）；**不允许** compact/插入把稳定前缀顺序打乱。
 - 命中度量：每次 llm 调用后把 `usage.prompt_cache_hit_tokens / prompt_cache_miss_tokens` 记入事件，控制台画"命中率×步骤"曲线 + 省钱估算（省省钱 = 命中 token × 单价差）。
 
 ### 6.5 测试（tests/test_context.py，M3）
@@ -511,6 +531,10 @@ class ContextManager:
 - snip：>70% 触发、保留最近 N 条、boundary 对齐不切工具组、裁剪后 ≤60%
 - LLM compact：critical 触发、stale usage 标记、system 保留
 - cache-aware：稳定前缀顺序不被 compact 破坏
+- **M3-3 追加**：warning 带(0.70≤u<0.85) 只 snip 不触发 LLM；critical(≥0.85) 触发 LLM 摘要；
+  LLM 摘要抛异常 → 退化 snip（不失败不卡死）；`_is_round_boundary` 拒绝切开
+  assistant(tool_calls)+tool 组；`_PREFIX_LEN` 前缀在 snip/摘要后保持；compact 后
+  `usage_stale_reason` 正确设置
 
 ---
 
@@ -531,12 +555,14 @@ class ContextManager:
   ```
 - 阈值：单条 >50K 字符落盘；**批内预算** 200K/轮（即使单条没超，批总量超限按最大优先落盘）。
 - 同一次运行内替换复用（`replacements: dict[id, str]`），不重复写盘。
-- **接入点**：loop 的 `_execute_tool_calls` 执行结果后调用 `maybe_persist(output) -> 替换文本`；M1 的 `_truncate` 保留给 read/edit 的 diff 展示（可读性），工具结果走落盘。
+- **接入点**：loop 的 `_execute_tool_calls` 执行结果后调用 `compact_batch(results, store) -> [(id, 替换文本)]`，再拼 tool_result 消息；M1 的 `_truncate` 保留给 read/edit 的 diff 展示（可读性），工具结果走落盘。
+- **force 路径（批内预算兜底）**：`persist(tool_call_id, text, *, force=False)` —— 单条 ≤ PERSIST_THRESHOLD 且非 force → 原样返回（`PersistResult(text, False, None)`）；超过阈值或 force=True → 落盘 + `<persisted-output>` 替换。`compact_batch` 第一轮单条超限落盘；第二轮把批总量压到 BATCH_BUDGET=200K 以内，按"最大优先"对余量 `persist(id, text, force=True)`（force：单条未超阈值也落盘），直到 ≤ 预算。替换文本 header **如实区分原因**（用户红线：不造假）：`"Output too large (N chars)"` vs `"Output batch-compacted (N chars)"`。
+- `_written: dict[str, tuple[Path, str]]`（tool_call_id → 落盘路径+已写内容）：同 id 同内容不重复写盘；同 id 内容变化才重写文件（MockLLM 固定 call_0001 跨轮复用时保证文件与预览一致）。
 
 ### 6b.2 测试（tests/test_tool_result.py）
 
 - 大输出落盘：内容写入正确路径，替换文本含预览+路径
-- 小输出不动；批内预算触发时最大优先落盘
+- 小输出不动；批内预算触发时最大优先落盘（force 路径：≤50K 单条被批预算强制落盘）
 - 同 id 二次出现复用替换不重复写盘
 - session_id 隔离目录
 
@@ -656,11 +682,19 @@ DEFAULT_SYSTEM_PROMPT = f"""\
 **文件**：`app/ui_streamlit.py`；运行 `streamlit run app/ui_streamlit.py`（无 key 自动 Mock 演示）。
 
 **架构（worker 线程 + 事件队列轮询）**：
-- QueryEngine 在后台线程跑（daemon）；`_EmitProxy` 实现 session.emit → 事件推入 `queue.Queue`（复用 record_event 的回调通道）
+- QueryEngine 在后台线程跑（daemon）；用真实 `Session(workspace, new_session_id(), on_event=events_q.put)` ——
+  `Session.emit` 同一通道双写：轨迹 JSONL 落盘 + on_event 回调推入 `queue.Queue`（UI 实时流式渲染），
+  监听器异常被 try/except 吞掉不影响轨迹落盘
 - 主线程每次脚本运行 `get_nowait()` 排空队列 → 追加到 `session_state["log"]` → 渲染；running 中 `sleep(0.3) + st.rerun()` 轮询；**空闲状态不 rerun**（AppTest 无头测试必需，否则初始渲染死循环）
 - **权限确认桥 ConfirmBridge**：worker 的 confirm 回调 `answers.get()` 阻塞等待；UI 读到 `confirm.current` 渲染 5 按钮（允许本次/本回合/总是/拒绝本次/总是），点击把粒度字符串 `answers.put` 并 rerun；新任务重置桥
 - hooks：内置 `require_tests_before_commit`（git commit 前检查 data/tests_pass.marker）
 - 最终展示：结论 + 终止原因/步骤/token/缓存命中率
+- **M3-5 运行指标**（始终可见，不折叠）：① 上下文用量分级进度条（最近一次 provider
+  `usage.prompt_tokens` / CONTEXT_BUDGET=64K，用 `ContextStats.level_of` 分
+  normal/warning/critical/blocked）；② 缓存累计命中率 + 省钱估算 caption
+  （`total_hit × (¥2/M − ¥0.5/M) / 1e6`，DeepSeek 输入缓存定价差；无流量时提示
+  "首次调用会把 prompt 写入磁盘缓存"）；③ 折叠的"📈 缓存命中率曲线"（≥2 次调用才画）；
+  ④ 检查点列表 caption（`data/checkpoints/{session_id}/step-*`，按 step 排序）
 
 **测试**：`tests/test_ui_streamlit.py`（AppTest 无头跑通 mock 任务；验收 `python -m pytest tests/test_ui_streamlit.py`）。
 
@@ -680,10 +714,33 @@ DEFAULT_SYSTEM_PROMPT = f"""\
 - `HookEngine.run_pre(...) -> None | (block, reason)`；`run_post(...)`；示例 hook：`require_tests_before_commit`（PreToolUse 包 Bash(git commit)，检查 `data/tests_pass.marker` 文件，不存在 → block 返回"先跑 python -m pytest 验证"）
 - 提供 mark_tests_pass() 工具/函数写 marker（可由 hook 自身或单独工具）
 
-### 9.3 agent/session.py（M3）
-- JSONL 轨迹：每事件一行 `{ts, type, step, ...}`；session 文件 `data/sessions/{session_id}.jsonl`
-- 检查点：每 N 步写 `data/checkpoints/{session_id}/{step}.json`（messages + state + 快照）
-- `resume(session_id, step)` 恢复状态继续 run；CLI `--resume`
+### 9.3 agent/session.py（M3-4 已实现：JSONL 轨迹 + 检查点 + resume）
+
+```python
+def new_session_id() -> str: ...                      # "s%Y%m%d-%H%M%S"
+
+class Session:
+    def __init__(self, workspace_root: Path, session_id: str, *,
+                 checkpoint_every: int = 5, on_event=None): ...
+    def emit(self, event: dict) -> None               # on_event 转发 + append JSONL
+    def checkpoint(self, state: AgentState) -> None   # 每 N 步写一次（_ticks 计数，恢复后重新数）
+    def _write(self, state: AgentState) -> Path       # 原子写：.json.tmp → replace
+    @classmethod
+    def from_checkpoint(cls, workspace_root, session_id, *, step=None,
+                        checkpoint_every=5) -> tuple[Session, AgentState]  # step=None → 最近
+    def list_checkpoints(self) -> list[int]
+    def latest_checkpoint(self) -> Path | None
+def latest_session(workspace_root: Path) -> str | None  # 按检查点 mtime 选最近会话
+```
+
+- 轨迹文件 `data/sessions/{id}.jsonl`（append-only；M3-3 compact 裁掉的中段消息仍完整保留，
+  snip/摘要标记都指向这里）；检查点 `data/checkpoints/{id}/step-{N}.json` 含
+  messages / events / usage / last_usage / usage_stale_reason / terminated_reason / memory_blocks。
+- **resume 不重置 step 计数**：恢复的 state.step 延续 → 续跑产生的检查点不会覆盖恢复前的同名文件。
+- loop 接入：`QueryEngine(session=...)`；`run()` 建 state 时
+  `session_id = getattr(self.session, "session_id", "m1")`；每轮 `_execute_tool_calls` 后
+  `session.checkpoint(state)`；`run_from(state)` 从恢复的 state 继续执行。
+- CLI：`--resume`（自动选最近会话）/ `--session-id` / `--step` / `--checkpoint-every`。
 
 ### 9.4 agent/memory.py（M4，分层指令文件 + 提取，MiniCode 简化移植）
 - **分层指令文件**：在工作区根（workspace_root）发现候选 `CODEAGENT.md` / `MINI.md` / `CLAUDE.md` + `.codeagent/rules/*.md`（不做全局 home 层，只做项目层）。

@@ -1,7 +1,7 @@
 # TASKS — 任务清单（勾选式，每写一部分代码就更新）
 
 > 续作流程：读本文件找第一个 `[ ]` → 读 `docs/TECH_SPEC.md` 对应模块规格 → 实现 → 跑验收命令/测试 → commit → 勾选 `[x]` → push。
-> 约定：commit message 用 conventional 格式并以 `Co-Authored-By: Claude Code <noreply@anthropic.com>` 结尾；remote = `git@github.com:tudfgfgvhjhb/mini-coding.git`。
+> 约定：commit message 用 conventional 格式并以 `Co-Authored-By: Claude Code <noreply@anthropic.com>` 结尾；remote = `git@github.com:Goat-Donk/mini-coding.git`。
 
 ## M1 交接文档 + 循环 + 核心工具（Day 1–3）
 
@@ -28,8 +28,8 @@
 - [x] M3-2 `agent/tool_result.py`：**超大工具结果落盘**（>50K 字符 → `data/tool-results/` + 预览替换 `<persisted-output>`；批内预算 200K 兜底）——替代纯截断（验收：`pytest tests/test_tool_result.py`）
 - [x] M3-3 `agent/context.py` compact 流水线：**确定性 snip compact**（70% 触发、保留最近 12 条、无 LLM）→ **LLM 摘要 compact**（critical 才触发、boundary 对齐 API 轮次、压缩前 usage 标记 stale）（验收：`pytest tests/test_context.py`）
 - [x] M3-4 `agent/session.py`：JSONL 轨迹 + 每 N 步检查点 + resume（验收：`pytest tests/test_session.py`；杀进程后 `--resume` 续跑）
-- [ ] M3-5 控制台加指标：缓存命中率/省钱曲线 + 检查点列表 + 上下文用量分级（验收：控制台可见指标）
-- [ ] M3-6 更新 TECH_SPEC + commit + push
+- [x] M3-5 控制台加指标：缓存命中率/省钱曲线 + 检查点列表 + 上下文用量分级（验收：控制台可见指标）
+- [x] M3-6 更新 TECH_SPEC + commit + push
 
 ## M4 记忆 + research 子 agent（Day 12–15）
 
@@ -56,6 +56,6 @@
 
 ## 进度快照
 
-- 当前里程碑：**M3 进行中**（上下文治理 + 检查点，差异化核心；M3-1/M3-2 已 push，M3-3/M3-4 本地已提交待推）
-- 最近完成：M3-3 compact 流水线（snip + LLM 摘要）；M3-4 session（JSONL 轨迹 + 检查点 + --resume）
-- 下一步：**M3-5 控制台指标**——缓存命中率/省钱曲线 + 检查点列表 + 上下文用量分级
+- 当前里程碑：**M3 完成**（上下文治理 + 检查点，差异化核心；M3-1~M3-6 已 push）
+- 最近完成：M3-6 TECH_SPEC 同步（§6.1/6.3/6.5/6b/8.2/9.3 对齐实现）
+- 下一步：**M4 记忆 + research 子代理**（M4-1 agent/memory.py 分层指令文件 + 提取 + consolidation）
