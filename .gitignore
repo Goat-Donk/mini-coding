@@ -28,3 +28,6 @@ workspace/*/
 *.swp
 .DS_Store
 Thumbs.db
+
+# --- eval 克隆的 OSS 仓库（M5） ---
+eval/repos/
