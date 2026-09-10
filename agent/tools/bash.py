@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
@@ -24,6 +25,39 @@ TRUNCATED_MESSAGE = (
     "（如需更多，请拆分命令或缩小输出范围）"
 )
 
+# ---------- 子进程环境清洗 ----------
+# `app/cli.py` 的 load_dotenv() 把 DEEPSEEK_API_KEY 灌进 os.environ，而
+# subprocess.run 默认**继承父进程环境** —— 于是 `echo %DEEPSEEK_API_KEY%`
+# （POSIX 下 `printenv DEEPSEEK_API_KEY`）一条命令就能把 key 打出来，
+# 完全不需要读任何文件。这是最短的外泄路径，比"读 .env 再外发"短得多，
+# 所以子进程环境必须清洗掉凭据类变量再启动。
+#
+# 局限（如实说明，不夸大）：这是按**变量名**的黑名单，不是保证 ——
+# 换个名字的私密变量（MY_PRIVATE_STUFF=xxx）照样漏；bash 也仍能
+# `type ..\.env` 直接把仓库根的 .env 读出来（bash 的沙箱只管 cwd，
+# 不管命令文本里的 `..`）。两条都列在 README「已知未修复的绕过路径」。
+SENSITIVE_ENV_PATTERNS: tuple[str, ...] = (
+    r".*_API_KEY$", r"^API_KEY$",
+    r".*_TOKEN$", r"^TOKEN$",
+    r".*_SECRET$", r"^SECRET$", r".*_SECRET_.*",
+    r".*PASSWORD.*", r".*PASSWD.*",
+    r".*_CREDENTIALS?$",
+    r"^AWS_ACCESS_KEY_ID$", r"^AWS_SESSION_TOKEN$",
+    r"^GH_TOKEN$", r"^GITHUB_TOKEN$",
+)
+_SENSITIVE_ENV_RE = re.compile(
+    "|".join(f"(?:{p})" for p in SENSITIVE_ENV_PATTERNS), re.IGNORECASE
+)
+
+
+def _scrubbed_env() -> dict[str, str]:
+    """剥掉凭据类环境变量的子进程环境（PATH 等运行必需项原样保留）。
+
+    刻意**不**用白名单：白名单会把 VIRTUAL_ENV / PYTHONPATH / 代理设置等
+    一并干掉，把正常任务跑坏。按名剔除是这里更合适的粒度。
+    """
+    return {k: v for k, v in os.environ.items() if not _SENSITIVE_ENV_RE.match(k)}
+
 
 class BashInput(BaseModel):
     command: str
@@ -39,17 +73,21 @@ class BashTool(Tool):
     )
     input_model = BashInput
 
+    # 危险模式必须锚定到**命令位置**（行首或分隔符之后），而不是"文本里出现这个词"。
+    # 旧版的 `r"eval\s"` 就踩了这个坑：`echo "medieval times"` 里的 "eval " 命中
+    # → 判定危险 → ASK → CLI 无确认交互 → 直接拒绝。同类宽匹配还有
+    # `mkfs` / `shutdown` 等：`grep -r shutdown src/` 只是**提到**这个词。
     DANGEROUS_PATTERNS: list[str] = [
         r"(^|[;&|]\s*)rm\s+(-[a-z]*[rf][a-z]*\s+)+",  # rm -rf
-        r"git\s+push",
-        r"git\s+reset\s+--hard",
-        r"mkfs", r"fdisk", r"shutdown", r"reboot",
-        r"format\s+[a-zA-Z]:",
-        r"del\s+/[sqf]",
-        r"rd\s+/[sq]",
+        r"(^|[;&|]\s*)git\s+push",
+        r"(^|[;&|]\s*)git\s+reset\s+--hard",
+        r"(^|[;&|]\s*)(mkfs|fdisk|shutdown|reboot)\b",
+        r"(^|[;&|]\s*)format\s+[a-zA-Z]:",
+        r"(^|[;&|]\s*)del\s+/[sqf]",
+        r"(^|[;&|]\s*)rd\s+/[sq]",
         r":\(\)\s*\{",          # fork 炸弹
-        r"eval\s",
-        r"curl\s+[^|;]*\|\s*(ba)?sh",  # curl|sh
+        r"(^|[;&|]\s*)eval\s",
+        r"(^|[;&|]\s*)curl\s+[^|;]*\|\s*(ba)?sh",  # curl|sh
     ]
 
     @classmethod
@@ -108,6 +146,7 @@ class BashTool(Tool):
                 encoding="utf-8",
                 errors="replace",
                 timeout=timeout,
+                env=_scrubbed_env(),  # 凭据类环境变量不进子进程（见上方说明）
             )
         except subprocess.TimeoutExpired:
             return ToolResult.fail(
