@@ -1,4 +1,4 @@
-"""Streamlit 控制台 v1（M2-3）：实时循环 / 工具调用 / 权限确认按钮。
+"""Streamlit 控制台（M2-3 + M3-5 指标）：实时循环 / 工具调用 / 权限确认 / 运行指标。
 
 运行：`streamlit run app/ui_streamlit.py`
 - 无 DEEPSEEK_API_KEY → 自动 Mock 演示（glob → 结论），有 key 用真实 DeepSeek
@@ -6,6 +6,8 @@
   选择写入线程安全队列后 worker 继续（决策粒度记忆进 PermissionsEngine）
 - hooks：内置 require_tests_before_commit（block-at-submit），git commit 前
   检查 data/tests_pass.marker
+- M3-5 指标：缓存命中率曲线 + 省钱估算（DeepSeek 输入缓存定价差）、上下文
+  用量分级（最近 prompt tokens / 预算）、检查点列表（Session 落盘）
 
 实现：QueryEngine 在后台线程跑，事件经 queue 流到主线程轮询渲染
 （`st.rerun()` 定期刷新）。确认桥 ConfirmBridge 用两个队列把引擎的
@@ -22,13 +24,21 @@ from pathlib import Path
 import streamlit as st
 from dotenv import load_dotenv
 
+from agent.context import ContextStats
 from agent.hooks import HookEngine, require_tests_before_commit
 from agent.llm import BaseLLM, DeepSeekClient, MockLLM, LLMResult, ToolCall
 from agent.loop import QueryEngine
 from agent.permissions import PermissionsEngine
+from agent.session import Session, new_session_id
 from agent.tools.base import ToolRegistry
 
 DEFAULT_WORKSPACE = Path(os.environ.get("WORKSPACE_ROOT", "workspace")).resolve()
+
+# DeepSeek 输入缓存定价（元/百万 tokens，公开价，2025）：命中 ¥0.5/M vs 未命中 ¥2/M
+CACHE_HIT_PRICE_CNY = 0.5
+CACHE_MISS_PRICE_CNY = 2.0
+# 上下文预算（与 ContextManager 默认一致，仅用于 UI 分级展示）
+CONTEXT_BUDGET = 64_000
 
 
 class ConfirmBridge:
@@ -41,13 +51,6 @@ class ConfirmBridge:
     def ask(self, question: str) -> str | None:
         self.current = question
         return self.answers.get()  # 阻塞 worker 直到 UI 调用 respond()
-
-
-class _EmitProxy:
-    """QueryEngine 期望 session 有 .emit 属性 → 事件推入队列。"""
-
-    def __init__(self, emit) -> None:
-        self.emit = emit
 
 
 def has_api_key() -> bool:
@@ -94,16 +97,18 @@ def run_task(
         registry = ToolRegistry.default(workspace)
         permissions = PermissionsEngine(workspace, confirm=confirm.ask)
         hooks = HookEngine([require_tests_before_commit(workspace)], workspace_root=workspace)
+        session = Session(workspace, new_session_id(), on_event=events_q.put)
+        events_q.put({"type": "session_start", "session_id": session.session_id})
         engine = QueryEngine(
             llm,
             registry,
             workspace_root=workspace,
             permissions=permissions,
             hooks=hooks,
-            session=_EmitProxy(events_q.put),
+            session=session,
         )
         result = engine.run(task)
-        events_q.put({"type": "__done__", "result": result})
+        events_q.put({"type": "__done__", "result": result, "session_id": session.session_id})
     except Exception as exc:
         events_q.put({"type": "__done__", "error": f"{type(exc).__name__}: {exc}"})
 
@@ -127,6 +132,7 @@ st.session_state.setdefault("result", None)
 st.session_state.setdefault("error", None)
 st.session_state.setdefault("running", False)
 st.session_state.setdefault("confirm", ConfirmBridge())
+st.session_state.setdefault("session_id", None)
 
 confirm: ConfirmBridge = st.session_state["confirm"]
 
@@ -140,6 +146,7 @@ if col_go.button("🚀 开始任务", use_container_width=True) and task.strip()
     st.session_state["error"] = None
     st.session_state["running"] = True
     st.session_state["confirm"] = ConfirmBridge()  # 新任务重置确认桥
+    st.session_state["session_id"] = None
     events_q = st.session_state["events_q"] = queue.Queue()
     st.session_state["task"] = task
     threading.Thread(
@@ -166,6 +173,9 @@ while True:
         st.session_state["done"] = True
         st.session_state["result"] = ev.get("result")
         st.session_state["error"] = ev.get("error")
+        st.session_state["session_id"] = ev.get("session_id") or st.session_state.get("session_id")
+    elif ev["type"] == "session_start":
+        st.session_state["session_id"] = ev.get("session_id")
     else:
         st.session_state["log"].append(ev)
 
@@ -197,6 +207,61 @@ with st.expander(f"事件日志（{len(log)} 条）", expanded=True):
         st.code(fmt_event(ev), language=None)
     if log and st.session_state["running"] and not st.session_state["done"]:
         st.caption("运行中…")
+
+# ---------- M3-5 运行指标（缓存命中率/省钱 + 上下文分级 + 检查点） ----------
+usage_pts = [
+    ev for ev in log
+    if ev["type"] == "llm_call" and (ev.get("usage") or {}).get("prompt_tokens") is not None
+]
+if usage_pts:
+    # 上下文用量分级：用最近一次 provider 实测 prompt tokens 作上下文大小代理
+    last_usage = usage_pts[-1]["usage"]
+    utilization = last_usage["prompt_tokens"] / CONTEXT_BUDGET
+    level = ContextStats.level_of(utilization)
+    st.progress(
+        min(1.0, utilization),
+        text=f"上下文用量 {level}（{utilization:.0%}，最近 prompt {last_usage['prompt_tokens']} tokens / {CONTEXT_BUDGET} 预算）",
+    )
+
+    # 缓存命中率累计 + 省钱估算（DeepSeek 输入缓存定价差）
+    total_hit = sum((ev.get("usage") or {}).get("cache_hit_tokens") or 0 for ev in usage_pts)
+    total_miss = sum((ev.get("usage") or {}).get("cache_miss_tokens") or 0 for ev in usage_pts)
+    if total_hit + total_miss:
+        overall = total_hit / (total_hit + total_miss)
+        saved_cny = total_hit * (CACHE_MISS_PRICE_CNY - CACHE_HIT_PRICE_CNY) / 1e6
+        st.caption(
+            f"累计缓存命中率 {overall:.0%} · 命中 {total_hit:,} tokens · "
+            f"估算省钱 ¥{saved_cny:.3f}（命中 ¥{CACHE_HIT_PRICE_CNY}/M vs 未命中 ¥{CACHE_MISS_PRICE_CNY}/M）"
+        )
+    else:
+        st.caption("本轮暂无缓存流量（DeepSeek 首次调用会把 prompt 写入磁盘缓存）")
+
+    with st.expander("📈 缓存命中率曲线", expanded=False):
+        steps = [ev.get("step") for ev in usage_pts]
+        ratios = []
+        for ev in usage_pts:
+            u = ev.get("usage") or {}
+            hit = u.get("cache_hit_tokens") or 0
+            miss = u.get("cache_miss_tokens") or 0
+            ratios.append(hit / (hit + miss) if (hit + miss) else 0.0)
+        if len(steps) > 1:
+            st.line_chart({"步骤": steps, "缓存命中率": ratios})
+        else:
+            st.caption("至少 2 次模型调用后才画命中率曲线")
+
+    # 检查点列表（Session 每 N 步落盘）
+    session_id = st.session_state.get("session_id")
+    if session_id:
+        cp_dir = workspace / "data" / "checkpoints" / session_id
+        if cp_dir.exists():
+            cp_steps = sorted(
+                int(p.stem.split("-")[1])
+                for p in cp_dir.glob("step-*.json")
+                if not p.name.endswith(".tmp")
+            )
+            st.caption(f"会话 {session_id} · 检查点 " + "、".join(f"step-{s}" for s in cp_steps))
+        else:
+            st.caption(f"会话 {session_id} · 检查点写入中…")
 
 # ---------- 最终结果 ----------
 if st.session_state["done"]:

@@ -46,3 +46,6 @@ def test_ui_mock_task_completes(app, tmp_path):
     # 事件日志渲染了 glob 工具调用
     codes = "\n".join(c.value for c in app.code)
     assert "glob" in codes
+    # M3-5 运行指标：Mock 模式无缓存流量也渲染分级/提示（不崩溃）
+    captions = " ".join(c.value for c in app.caption)
+    assert "缓存" in captions

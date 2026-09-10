@@ -31,6 +31,7 @@ class Session:
         session_id: str,
         *,
         checkpoint_every: int = 5,
+        on_event=None,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve()
         self.session_id = session_id
@@ -41,12 +42,18 @@ class Session:
         self.checkpoint_dir = (
             self.workspace_root / "data" / "checkpoints" / session_id
         )
+        self._on_event = on_event  # 可选监听器（UI 实时流式渲染用），失败不影响轨迹
         self._ticks = 0  # 恢复后重新计数：每 N 步（本段运行）写一个检查点
 
     # ---------- 轨迹 ----------
 
     def emit(self, event: dict) -> None:
         """追加一行事件到 JSONL（由 AgentState.record_event 回调）。"""
+        if self._on_event is not None:
+            try:
+                self._on_event(event)
+            except Exception:
+                pass  # 监听器失败不阻断轨迹落盘
         self.trajectory_path.parent.mkdir(parents=True, exist_ok=True)
         with self.trajectory_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(event, ensure_ascii=False) + "\n")
