@@ -1,10 +1,12 @@
 """CLI 入口：python -m app.cli "任务"（真实 DeepSeek）/ --mock（无 key 演示）。
 
 M3 版：接入 ContextManager（记账/compact）+ Session（轨迹/检查点/--resume）。
+M6-6：事件实时流式打印（不必等任务结束才看到进度）。
 """
 from __future__ import annotations
 
 import os
+import threading
 from pathlib import Path
 
 import typer
@@ -20,6 +22,47 @@ from agent.tools.base import ToolRegistry
 from agent.tools.subagent import SubagentTool
 
 app = typer.Typer(no_args_is_help=True)
+
+
+class EventPrinter:
+    """把 agent 事件实时打到终端（M6-6）。
+
+    只读工具是**并发**执行的，record_event 会从多个工作线程回调进来 ——
+    所以打印必须加锁，否则两行会交错成乱码。
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.tool_calls = 0
+
+    def __call__(self, event: dict) -> None:
+        etype = event.get("type")
+        if etype == "tool_call":
+            line = self._format_tool_call(event)
+        elif etype == "empty_response_retry":
+            line = (
+                f"  [{event.get('step')}] … 模型返回空响应，"
+                f"重试 {event.get('attempt')}/{event.get('limit')}"
+            )
+        else:
+            return  # llm_call 等事件太吵，不逐条打印（轨迹 JSONL 里都有）
+        with self._lock:
+            typer.echo(line)
+
+    def _format_tool_call(self, event: dict) -> str:
+        self.tool_calls += 1
+        args = event.get("arguments") or {}
+        summary = ", ".join(f"{k}={str(v)[:60]}" for k, v in list(args.items())[:3])
+        status = "✓" if event.get("success") else "✗"
+        line = (
+            f"  [{event.get('step')}] {status} {event.get('name')}({summary}) "
+            f"[{event.get('duration_ms')}ms]"
+        )
+        # success 只表示"工具跑完了"，bash 的退出码才反映命令本身成没成
+        exit_code = event.get("exit_code")
+        if exit_code not in (None, 0):
+            line += f" [exit code: {exit_code}]"
+        return line
 
 
 def _default_workspace() -> Path:
@@ -97,6 +140,10 @@ def run(
             f"记忆注入: {len(memory_blocks)} 个记忆块", fg=typer.colors.BRIGHT_BLACK
         )
 
+    printer = EventPrinter()
+    typer.secho(f"工作目录: {workspace_root}", fg=typer.colors.BRIGHT_BLACK)
+    typer.secho("---", fg=typer.colors.BRIGHT_BLACK)
+
     try:
         if resume:
             sid = session_id or latest_session(workspace_root)
@@ -106,7 +153,7 @@ def run(
             session, restored = Session.from_checkpoint(workspace_root, sid, step=step)
             engine = QueryEngine(
                 llm, registry, workspace_root=workspace_root, context=context,
-                session=session, memory_blocks=memory_blocks,
+                session=session, memory_blocks=memory_blocks, on_event=printer,
             )
             typer.secho(
                 f"恢复会话 {sid}（step {restored.step}）→ 续跑", fg=typer.colors.CYAN, bold=True
@@ -116,7 +163,7 @@ def run(
             session = Session(workspace_root, new_session_id(), checkpoint_every=checkpoint_every)
             engine = QueryEngine(
                 llm, registry, workspace_root=workspace_root, context=context,
-                session=session, memory_blocks=memory_blocks,
+                session=session, memory_blocks=memory_blocks, on_event=printer,
             )
             typer.secho(f"会话: {session.session_id}", fg=typer.colors.CYAN, bold=True)
             typer.secho(f"任务: {task}", fg=typer.colors.CYAN, bold=True)
@@ -125,6 +172,8 @@ def run(
         # MCP 连接是资源（子进程 + 管道），任务结束必须回收，不能等 GC
         for client in mcp_clients:
             client.close()
+
+    typer.secho("---", fg=typer.colors.BRIGHT_BLACK)
 
     # M4-1 任务后提取：把轨迹里可复用的约定写回 learned.md（跨会话生效）
     if not mock:
@@ -135,18 +184,6 @@ def run(
                 fg=typer.colors.GREEN,
             )
 
-    typer.secho(f"工作目录: {workspace_root}", fg=typer.colors.BRIGHT_BLACK)
-    typer.secho("---", fg=typer.colors.BRIGHT_BLACK)
-
-    for event in result.events:
-        if event["type"] == "tool_call":
-            args = event["arguments"]
-            summary = ", ".join(f"{k}={str(v)[:60]}" for k, v in list(args.items())[:3])
-            status = "✓" if event["success"] else "✗"
-            typer.echo(f"  [{event['step']}] {status} {event['name']}({summary}) "
-                       f"[{event['duration_ms']}ms]")
-
-    typer.secho("---", fg=typer.colors.BRIGHT_BLACK)
     typer.secho("最终结论:", fg=typer.colors.GREEN, bold=True)
     if result.final_text:
         typer.echo(result.final_text)

@@ -122,3 +122,29 @@ def test_from_checkpoint_missing_raises(tmp_path):
 
     with pytest.raises(FileNotFoundError):
         Session.from_checkpoint(tmp_path, "nope", step=1)
+
+
+def test_emit_is_thread_safe(tmp_path):
+    """只读工具并发执行时 emit 会被多线程同时调用 —— JSONL 必须一行一个完整事件。
+
+    没有锁的话，两行可能交错成半个 JSON（轨迹就没法逐行解析了）。
+    """
+    import threading
+
+    session = Session(tmp_path, "s-threads")
+    n_threads, per_thread = 8, 50
+
+    def worker(tid: int) -> None:
+        for i in range(per_thread):
+            session.emit({"type": "tool_call", "step": i, "tid": tid, "name": "read"})
+
+    threads = [threading.Thread(target=worker, args=(t,)) for t in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    lines = session.trajectory_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == n_threads * per_thread
+    for line in lines:  # 每行都必须是完整可解析的 JSON
+        json.loads(line)

@@ -14,6 +14,8 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
+import sys
+from typing import Callable
 
 from agent.hooks import HookEngine
 from agent.llm import BaseLLM, ToolCall, Usage
@@ -36,11 +38,20 @@ class RunResult:
 DEFAULT_SYSTEM_PROMPT = """\
 你是 CodeAgent，一个在代码仓库内工作的 AI 编程代理。你的目标是高效、正确地完成用户任务。
 
+工作目录（先读这段，能省掉大量试错）：
+- 你的工作目录（沙箱根）就是：{workspace_root}
+- 所有工具的相对路径都以它为基准 —— bash 的 cwd 已经设在里面，read/write/edit 的 path
+  也按它解析。所以直接用相对路径即可：`python -m pytest tests/ -q`、path="src/app.py"。
+- 不要猜工作目录叫什么，不要假设 /workspace、~/project 之类的路径存在，也不要为了找文件
+  去遍历磁盘。需要确认位置时用 `pwd`（Windows 用 `cd`）看一眼，一次就够。
+- 当前平台：{platform}
+
 工作方式：
 - 先用工具探索（glob/grep/read）理解代码，再动手修改；不要臆测文件内容。
 - 修改代码前，如果任务复杂，先用 3~6 步的简短计划（仅步骤与验证方式，不要冗长）。
 - 小改动用 edit（精确匹配），大改动用 write；完成后运行测试验证。
 - 每条消息最多做必要的工具调用；工具失败时根据错误信息自行修复后重试。
+- 工具返回里带 `[exit code: N]`，N≠0 表示命令没成功 —— 先看错误信息定位原因，不要重复同样的调用。
 
 硬性约束：
 - 只能在工作目录（沙箱）内操作，禁止访问沙箱外路径。
@@ -50,6 +61,17 @@ DEFAULT_SYSTEM_PROMPT = """\
 - 不要无意义重复同一操作；若连续多次得到相同失败，停下来向用户说明。
 
 {repo_memory_block}"""
+
+
+def _platform_hint() -> str:
+    """告诉模型当前平台的命令行语法，避免 Unix/Windows 命令混用。"""
+    if sys.platform == "win32":
+        return (
+            "Windows（bash 工具实际用 `cmd /c` 执行，请用 Windows 语法："
+            "dir /b、cd /d、type、findstr；不要用 ls / find / grep / cat）"
+        )
+    return "POSIX（bash 工具用 `bash -lc` 执行，可用 ls / find / grep / cat）"
+
 
 
 class QueryEngine:
@@ -69,6 +91,7 @@ class QueryEngine:
         memory_blocks: list[str] | None = None,    # M4 注入
         context: object | None = None,             # M3 接 ContextManager
         session: object | None = None,             # M3 接 session（轨迹/检查点）
+        on_event: Callable[[dict], None] | None = None,  # 实时事件回调（CLI 流式输出）
     ) -> None:
         self.llm = llm
         self.registry = registry
@@ -82,6 +105,7 @@ class QueryEngine:
         self.memory_blocks = list(memory_blocks or [])
         self.context = context
         self.session = session
+        self.on_event = on_event
         self.system_prompt = system_prompt or DEFAULT_SYSTEM_PROMPT
 
     def run(self, task: str, *, cwd: Path | None = None) -> RunResult:
@@ -90,11 +114,7 @@ class QueryEngine:
             memory_block = "\n".join(f"- {block}" for block in self.memory_blocks)
         else:
             memory_block = ""
-        # 自定义 system_prompt 里可能没有占位符 → 只在有占位符时注入
-        if "{repo_memory_block}" in self.system_prompt:
-            sys_prompt = self.system_prompt.format(repo_memory_block=memory_block)
-        else:
-            sys_prompt = self.system_prompt
+        sys_prompt = self._render_system_prompt(memory_block)
 
         # 有 session 时用其 session_id（轨迹/检查点归属）；_EmitProxy 之类
         # 只实现 emit 的轻量替身没有 session_id，兜底 "m1"
@@ -116,8 +136,7 @@ class QueryEngine:
 
     def _run_loop(self, state: AgentState, task: str, cwd: Path | None) -> RunResult:
         """共享主循环：think → 调工具 → 看结果 → ... → 完成。"""
-        if self.session is not None:
-            state.emitter = getattr(self.session, "emit", None)
+        state.emitter = self._make_emitter()
 
         ctx = ToolContext(
             workspace_root=self.workspace_root,
@@ -217,6 +236,38 @@ class QueryEngine:
 
     # ---------- 内部 ----------
 
+    def _make_emitter(self) -> Callable[[dict], None] | None:
+        """组合事件出口：session 落盘（JSONL） + 外部实时回调（CLI 流式）。
+
+        两者可以同时存在；都没有时返回 None（事件只留在 state.events 里）。
+        """
+        session_emit = getattr(self.session, "emit", None) if self.session is not None else None
+        on_event = self.on_event
+        if session_emit is not None and on_event is not None:
+            def emit_both(event: dict) -> None:
+                session_emit(event)
+                on_event(event)
+            return emit_both
+        return on_event if on_event is not None else session_emit
+
+    def _render_system_prompt(self, memory_block: str) -> str:
+        """注入运行期槽位（工作目录 / 平台 / 记忆块）。
+
+        用逐个 replace 而不是 str.format：自定义 system_prompt 里可能含其它花括号
+        （JSON 示例、代码片段），format 会直接抛 KeyError。
+        """
+        slots = {
+            "workspace_root": str(self.workspace_root),
+            "platform": _platform_hint(),
+            "repo_memory_block": memory_block,
+        }
+        prompt = self.system_prompt
+        for name, value in slots.items():
+            token = "{" + name + "}"
+            if token in prompt:
+                prompt = prompt.replace(token, value)
+        return prompt
+
     def _prepare_messages(self, state: AgentState) -> list[dict]:
         """M1：原样返回；M3 起由 ContextManager 做 cache-aware 布局 + compact。"""
         if self.context is not None:
@@ -241,6 +292,9 @@ class QueryEngine:
                 arguments=call.arguments,
                 success=result.success,
                 duration_ms=result.duration_ms,
+                # bash 等工具的进程退出码：success 只表示"工具跑完了"，
+                # 退出码才反映命令本身成没成（CLI 用它把 ✓ 显示得更诚实）
+                exit_code=result.data.get("exit_code") if isinstance(result.data, dict) else None,
             )
             return call.id, result.output
 

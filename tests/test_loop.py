@@ -178,3 +178,109 @@ def test_empty_response_gives_up(tmp_path):
     retries = [e for e in result.events if e["type"] == "empty_response_retry"]
     assert len(retries) == 2
     assert result.final_text == ""
+
+
+# ---------- M6-6：system prompt 槽位注入 + 实时事件回调 ----------
+
+def test_system_prompt_injects_workspace_root(tmp_path):
+    """工作目录必须写进 system prompt —— 否则模型会瞎猜 /workspace、遍历磁盘找路径。"""
+    seen = {}
+
+    def capture(messages, tools):
+        seen["system"] = messages[0]["content"]
+        return LLMResult(content="ok")
+
+    engine = make_engine(tmp_path, MockLLM([capture]))
+    engine.run("任务")
+    system_prompt = seen["system"]
+    assert str(tmp_path.resolve()) in system_prompt
+    assert "{workspace_root}" not in system_prompt      # 槽位已填
+    assert "{repo_memory_block}" not in system_prompt
+    assert "工作目录（沙箱根）就是" in system_prompt
+
+
+def test_system_prompt_fills_platform_hint(tmp_path):
+    """平台提示要按运行平台给出对应语法（避免 Windows 下用 ls/find/grep）。"""
+    seen = {}
+
+    def capture(messages, tools):
+        seen["system"] = messages[0]["content"]
+        return LLMResult(content="ok")
+
+    make_engine(tmp_path, MockLLM([capture])).run("任务")
+    assert ("cmd /c" in seen["system"]) or ("bash -lc" in seen["system"])
+
+
+def test_custom_system_prompt_with_braces_does_not_crash(tmp_path):
+    """自定义 prompt 含花括号（JSON 示例）时不能炸 —— 所以注入用 replace 而非 format。"""
+    custom = '你是助手。工作目录 {workspace_root}。输出格式示例：{"ok": true} 和 {未知槽位}'
+    seen = {}
+
+    def capture(messages, tools):
+        seen["system"] = messages[0]["content"]
+        return LLMResult(content="ok")
+
+    engine = make_engine(tmp_path, MockLLM([capture]), system_prompt=custom)
+    engine.run("任务")
+    assert str(tmp_path.resolve()) in seen["system"]
+    assert '{"ok": true}' in seen["system"]          # 无关花括号原样保留
+    assert "{未知槽位}" in seen["system"]             # 未知槽位不报错、不消失
+
+
+def test_on_event_receives_events_in_order(tmp_path):
+    """on_event 实时回调：按发生顺序收到每个事件（CLI 流式输出靠它）。"""
+    (tmp_path / "a.txt").write_text("hello\n", encoding="utf-8")
+    received: list[tuple[str, int]] = []
+    engine = make_engine(
+        tmp_path,
+        MockLLM.script(
+            MockLLM.tool("read", {"path": "a.txt"}).responses[0],
+            LLMResult(content="读到了"),
+        ),
+        on_event=lambda e: received.append((e["type"], e["step"])),
+    )
+    result = engine.run("读 a.txt")
+    assert received == [("llm_call", 1), ("tool_call", 1), ("llm_call", 2)]
+    assert received == [(e["type"], e["step"]) for e in result.events]
+
+
+def test_on_event_not_duplicated_with_session(tmp_path):
+    """session + on_event 同时存在时：JSONL 一份、回调一份，两者都不重复。"""
+    from agent.session import Session
+
+    (tmp_path / "a.txt").write_text("hello\n", encoding="utf-8")
+    session = Session(tmp_path, "s-test", checkpoint_every=5)
+    received = []
+    engine = make_engine(
+        tmp_path,
+        MockLLM.script(
+            MockLLM.tool("read", {"path": "a.txt"}).responses[0],
+            LLMResult(content="读到了"),
+        ),
+        session=session,
+        on_event=received.append,
+    )
+    result = engine.run("读 a.txt")
+    assert len(received) == len(result.events) == 3
+
+    import json
+    lines = [
+        json.loads(line)
+        for line in session.trajectory_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [line["type"] for line in lines] == [e["type"] for e in result.events]
+
+
+def test_tool_call_event_carries_exit_code(tmp_path):
+    """tool_call 事件要带 exit_code（success 只表示工具跑完，退出码才反映命令成没成）。"""
+    (tmp_path / "a.txt").write_text("hello\n", encoding="utf-8")
+    engine = make_engine(
+        tmp_path,
+        MockLLM.script(
+            MockLLM.tool("bash", {"command": "exit 3"}).responses[0],
+            LLMResult(content="命令失败了"),
+        ),
+    )
+    result = engine.run("跑个会失败的命令")
+    call = [e for e in result.events if e["type"] == "tool_call"][0]
+    assert call["exit_code"] == 3

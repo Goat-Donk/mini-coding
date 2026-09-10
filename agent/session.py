@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -44,6 +45,9 @@ class Session:
         )
         self._on_event = on_event  # 可选监听器（UI 实时流式渲染用），失败不影响轨迹
         self._ticks = 0  # 恢复后重新计数：每 N 步（本段运行）写一个检查点
+        # 只读工具是并发执行的，emit 会被多个线程同时调用；
+        # 加锁保证 JSONL 一行一个完整事件、不会两行交错（轨迹可被逐行解析）
+        self._write_lock = threading.Lock()
 
     # ---------- 轨迹 ----------
 
@@ -55,8 +59,10 @@ class Session:
             except Exception:
                 pass  # 监听器失败不阻断轨迹落盘
         self.trajectory_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.trajectory_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(event, ensure_ascii=False) + "\n")
+        line = json.dumps(event, ensure_ascii=False) + "\n"
+        with self._write_lock:
+            with self.trajectory_path.open("a", encoding="utf-8") as f:
+                f.write(line)
 
     # ---------- 检查点 ----------
 
