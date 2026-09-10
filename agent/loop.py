@@ -68,7 +68,10 @@ def _platform_hint() -> str:
     if sys.platform == "win32":
         return (
             "Windows（bash 工具实际用 `cmd /c` 执行，请用 Windows 语法："
-            "dir /b、cd /d、type、findstr；不要用 ls / find / grep / cat）"
+            "dir /b、cd /d、type、findstr；不要用 ls / find / grep / cat）。"
+            "注意：`pwd` 在 Windows 上会被解析成 Git for Windows 自带的 pwd.exe，"
+            "返回的是 `/d/xxx` 这种 POSIX 路径、不是有效的 Windows 路径 —— "
+            "要确认当前目录请用 `cd`（不带参数）"
         )
     return "POSIX（bash 工具用 `bash -lc` 执行，可用 ls / find / grep / cat）"
 
