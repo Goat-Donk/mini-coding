@@ -77,6 +77,10 @@ class AgentState:
     terminated_reason: Optional[str] = None
     memory_blocks: list[str] = field(default_factory=list)   # M4 注入的 repo 记忆
 
+    # M3 上下文记账：最近一次 llm.chat 的 usage（provider 锚点）；compact 后置 stale
+    last_usage: Optional[Usage] = None
+    usage_stale_reason: Optional[str] = None                 # "snip_compact" | "llm_compact"
+
     # M3 接入 session 后设为回调；None 时事件只进内存列表
     emitter: Optional[Callable[[dict], None]] = None
 

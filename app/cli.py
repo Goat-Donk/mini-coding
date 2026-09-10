@@ -11,6 +11,7 @@ from pathlib import Path
 import typer
 from dotenv import load_dotenv
 
+from agent.context import ContextManager
 from agent.llm import BaseLLM, DeepSeekClient, LLMResult, MockLLM, ToolCall
 from agent.loop import QueryEngine
 from agent.tools.base import ToolRegistry
@@ -48,7 +49,8 @@ def run(task: str, mock: bool = typer.Option(False, "--mock", help="无 key 演�
 
     llm = _build_llm(mock)
     registry = ToolRegistry.default(workspace_root)
-    engine = QueryEngine(llm, registry, workspace_root=workspace_root)
+    context = ContextManager(llm)  # M3-1 provider-usage-first 记账
+    engine = QueryEngine(llm, registry, workspace_root=workspace_root, context=context)
 
     typer.secho(f"任务: {task}", fg=typer.colors.CYAN, bold=True)
     typer.secho(f"工作目录: {workspace_root}", fg=typer.colors.BRIGHT_BLACK)
@@ -74,10 +76,14 @@ def run(task: str, mock: bool = typer.Option(False, "--mock", help="无 key 演�
     usage = result.usage
     ratio = usage.cache_hit_ratio
     cache_line = f"，缓存命中 {ratio:.0%}" if ratio is not None else ""
+    ctx_line = ""
+    if context.last_stats is not None:
+        s = context.last_stats
+        ctx_line = f"，上下文 {s.warning_level} ({s.utilization:.0%}/{s.total_tokens} tokens)"
     typer.secho(
         f"\n[{result.terminated_reason}] 步骤 {result.steps} · "
         f"token {usage.total_tokens}（prompt {usage.prompt_tokens} + "
-        f"completion {usage.completion_tokens}）{cache_line}",
+        f"completion {usage.completion_tokens}）{cache_line}{ctx_line}",
         fg=typer.colors.BRIGHT_BLACK,
     )
 
