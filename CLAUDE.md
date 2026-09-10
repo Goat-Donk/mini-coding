@@ -4,7 +4,7 @@
 
 ## 项目定位
 
-求职作品集：**CodeAgent** —— 参考 [pengchengneo/Claude-Code](https://github.com/pengchengneo/Claude-Code) 源码架构，用 Python 从零实现的小型 AI Coding Agent（约 3000 行 / 21 天）。核心循环手写（不套 Agent SDK），支撑层用成熟库（openai / pydantic / streamlit / typer / pytest）。比 MiniCode 简历更强、更新：检查点恢复、cache-aware 上下文、block-at-submit hooks、diff 语义编辑、轨迹驱动评估。
+求职作品集：**CodeAgent** —— 参考 [pengchengneo/Claude-Code](https://github.com/pengchengneo/Claude-Code) 源码架构，用 Python 从零实现的小型 AI Coding Agent（4,017 行 / 19 模块 / 168 测试）。核心循环手写（不套 Agent SDK），支撑层用成熟库（openai / pydantic / streamlit / typer / pytest）。差异化：cache-aware 上下文 + 缓存省钱指标、step 级检查点恢复、block-at-submit hooks、轨迹驱动评估（真实 tinydb 提交 + 隐藏测试）、记忆自进化、MCP 工具接入。
 
 ## 硬约束（不可违反）
 
@@ -38,7 +38,11 @@ python -m pytest tests/                      # 跑全部测试（每模块完成
 python -m pytest tests/test_xxx.py -k 用例    # 单模块/单用例
 python -m app.cli --mock "任务"               # 无 key 演示
 python -m app.cli "任务"                      # 真实 DeepSeek（需 .env 配 DEEPSEEK_API_KEY）
-streamlit run app/ui_streamlit.py            # 控制台（M2 起）
+python -m app.cli --resume                   # 从最近检查点续跑（配合 Ctrl+C 演示）
+python -m app.cli --mcp .codeagent/mcp.json "任务"   # 加载 MCP server（见 mcp.example.json）
+python -m eval.golden_tasks --clone --limit 10       # 拉 tinydb 并列出真实 fix 提交
+python -m eval.runner --limit 3              # 跑黄金任务出回归报告（--mock 无 key 冒烟）
+streamlit run app/ui_streamlit.py            # 控制台（指标 + 权限按钮 + 检查点回放）
 ```
 
 ## 工程约定
@@ -51,7 +55,9 @@ streamlit run app/ui_streamlit.py            # 控制台（M2 起）
 
 ## 参考与来源
 
+- **README（作品集门面：能力表 + 架构图 + 快速开始）** → `README.md`
 - **架构详解（逐层对应 CC 源码 + mermaid 图）** → `docs/architecture.md`
+- **面试讲解稿（逐模块口径 + 压力问题应答 + 演示动线）** → `docs/interview_guide.md`
 - CC 源码笔记 → `docs/reference/claude-code-notes.md`（含用户飞书文档《CC》要点）
 - offer-Master 笔记 → `docs/reference/offer-master-notes.md`
 - MiniCode 笔记 → `docs/reference/minicode-notes.md`（长会话上下文治理：落盘/记账/compact/分层记忆/权限粒度）

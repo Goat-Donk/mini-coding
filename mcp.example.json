@@ -1,0 +1,11 @@
+{
+  "_说明": "MCP 配置示例。复制为 .codeagent/mcp.json 后按需修改——.codeagent/ 已 gitignore，本地配置不会进仓库。",
+  "_用法": "python -m app.cli --mcp .codeagent/mcp.json \"任务\"",
+  "_字段": "servers.<别名>.command = [可执行文件, 参数...]（必填）；timeout = 单次请求超时秒数（可选，默认 20）。工具名与内置工具冲突时自动加 <别名>__ 前缀。",
+  "servers": {
+    "fs": {
+      "command": ["npx", "-y", "@modelcontextprotocol/server-filesystem", "."],
+      "timeout": 20
+    }
+  }
+}

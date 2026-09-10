@@ -140,10 +140,10 @@ python -m app.cli --resume               # 从最近检查点续跑（配合 Ctr
 python -m app.cli --mcp .codeagent/mcp.json "任务"   # 加载 MCP server（第三方工具）
 ```
 
-**接 MCP server**（`.codeagent/mcp.json`）：
+**接 MCP server**（复制 [`mcp.example.json`](mcp.example.json) 为 `.codeagent/mcp.json`）：
 
 ```json
-{"servers": {"fs": {"command": ["python", "-m", "some_mcp_server"]}}}
+{"servers": {"fs": {"command": ["npx", "-y", "@modelcontextprotocol/server-filesystem", "."]}}}
 ```
 
 MCP 工具**必须显式配置才注册**——第三方 server 不受 workspace 沙箱约束，所以只读性只信 server 声明的

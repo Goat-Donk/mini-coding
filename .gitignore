@@ -17,6 +17,7 @@ venv/
 # --- runtime data (trajectory/checkpoint/memory) ---
 data/*
 !data/.gitkeep
+.codeagent/          # 运行期记忆（rules/learned.md）与本地 MCP 配置，不进仓库
 
 # --- demo workspace repos (real OSS clones) ---
 workspace/*/
