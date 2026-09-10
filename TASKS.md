@@ -56,6 +56,6 @@
 
 ## 进度快照
 
-- 当前里程碑：**M1**（接近完成，待 push）
-- 最近完成：M1-6 循环、M1-7 测试全绿（59/59）+ cli 最小版
-- 下一步：M1-8 commit + push；然后 M2-1 permissions
+- 当前里程碑：**M2 全部完成**（权限 + hooks + 控制台 v1，已 push）
+- 最近完成：M2-3 控制台（AppTest 无头跑通）、M2-4 文档；M1-9 空响应恢复补入
+- 下一步：**M3 上下文治理（差异化核心）**——M3-1 provider-usage-first 记账 + cache-aware 布局
