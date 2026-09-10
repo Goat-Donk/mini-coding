@@ -33,9 +33,9 @@
 
 ## M4 记忆 + research 子 agent（Day 12–15）
 
-- [ ] M4-1 `agent/memory.py`：**分层指令文件**（工作区根 MINI.md/CLAUDE.md/.codeagent/rules/*.md + `@include` 解析 + hash 去重 + 每文件 8K/总计 20K 预算）+ **任务后提取 + 简化 consolidation**（跨会话应用约定）（验收：`pytest tests/test_memory.py`）
-- [ ] M4-2 `agent/tools/subagent.py`：research 子 agent（只读嵌套循环、独立上下文、受限工具集、可取消，返回结构化报告）（验收：`pytest tests/test_subagent.py`；「探索仓库并总结架构」出报告）
-- [ ] M4-3 更新 TECH_SPEC + commit + push
+- [x] M4-1 `agent/memory.py`：**分层指令文件**（工作区根 MINI.md/CLAUDE.md/.codeagent/rules/*.md + `@include` 解析 + hash 去重 + 每文件 8K/总计 20K 预算）+ **任务后提取 + 简化 consolidation**（跨会话应用约定）（验收：`pytest tests/test_memory.py`）
+- [x] M4-2 `agent/tools/subagent.py`：research 子 agent（只读嵌套循环、独立上下文、受限工具集、可取消，返回结构化报告）（验收：`pytest tests/test_subagent.py`；「探索仓库并总结架构」出报告）
+- [x] M4-3 更新 TECH_SPEC + commit + push
 
 ## M5 评估 + 控制台打磨（Day 16–18）
 
@@ -56,6 +56,6 @@
 
 ## 进度快照
 
-- 当前里程碑：**M3 完成**（上下文治理 + 检查点，差异化核心；M3-1~M3-6 已 push）
-- 最近完成：M3-6 TECH_SPEC 同步（§6.1/6.3/6.5/6b/8.2/9.3 对齐实现）
-- 下一步：**M4 记忆 + research 子代理**（M4-1 agent/memory.py 分层指令文件 + 提取 + consolidation）
+- 当前里程碑：**M4 完成**（记忆 + research 子代理；M4-1~M4-3 已 push，142 测试绿）
+- 最近完成：M4-3 TECH_SPEC 同步（§9.4 memory / §9.5 subagent 对齐实现）
+- 下一步：**M5 评估 + 控制台打磨**（M5-1 golden_tasks：clone tinydb，从 git history 构造修 bug 任务）

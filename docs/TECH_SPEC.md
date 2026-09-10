@@ -742,19 +742,63 @@ def latest_session(workspace_root: Path) -> str | None  # 按检查点 mtime 选
   `session.checkpoint(state)`；`run_from(state)` 从恢复的 state 继续执行。
 - CLI：`--resume`（自动选最近会话）/ `--session-id` / `--step` / `--checkpoint-every`。
 
-### 9.4 agent/memory.py（M4，分层指令文件 + 提取，MiniCode 简化移植）
-- **分层指令文件**：在工作区根（workspace_root）发现候选 `CODEAGENT.md` / `MINI.md` / `CLAUDE.md` + `.codeagent/rules/*.md`（不做全局 home 层，只做项目层）。
-- `@include` 解析：`@相对路径` 行递归读取；拒绝绝对路径/`..`；循环检测；缺失给占位注释。
-- 内容 hash 去重（靠后/靠 workspace_root 的优先）；预算渲染：每文件 ≤8K 字符、总计 ≤20K，超限截断 + 提示。
-- 任务结束提取：llm.complete 从轨迹提炼"仓库约定/经验" → 去重 → 追加/更新记忆文件（少而精、只记可复用约定）。
-- 跨会话注入：新会话把记忆文件内容注入 system_prompt（loop 已支持 memory_blocks）。
-- 简化 consolidation：去重 + 合并相似条目（不 prune 不调度）。
+### 9.4 agent/memory.py（M4-1 已实现：分层指令文件 + 提取 + consolidation）
 
-### 9.5 agent/tools/subagent.py（M4）
-- `SubagentInput{task, tools: list[str] = ["glob","grep","read"]}`（只读工具受限）
-- 独立子循环：新 AgentState + 只读 registry + 自己的 system prompt（"你是研究子代理，只读探索，返回结构化结论"）
-- 返回：`ToolResult.ok(结论报告)`；主循环上下文只收 Z 结论（CC SubAgent 经济学）
-- max_steps 子代理 10 步上限
+```python
+MEMORY_FILENAMES = ("CODEAGENT.md", "MINI.md", "CLAUDE.md")
+RULES_DIR = ".codeagent/rules";  LEARNED_FILE = "learned.md"
+MAX_FILE_CHARS = 8_000;  MAX_TOTAL_CHARS = 20_000
+
+def discover_memory_files(workspace_root: Path) -> list[Path]   # 低→高优先级
+def build_memory_blocks(workspace_root: Path) -> list[str]      # 渲染记忆块（高优先级在前）
+def extract_conventions(llm, events, *, max_events=60) -> list[str]  # 任务后提炼（LLM 失败→[]）
+def consolidate(items: list[str]) -> list[str]                  # 归一化 + 子串合并 + hash 去重
+def save_learned(workspace_root: Path, new_items) -> Path       # 写回 learned.md
+class MemoryManager:
+    def __init__(self, workspace_root, *, llm=None): ...
+    def blocks(self) -> list[str]
+    def extract_and_learn(self, events) -> list[str]
+```
+
+- **分层优先级（低→高）**：根目录 `CODEAGENT.md` < `MINI.md` < `CLAUDE.md`
+  → `.codeagent/rules/*.md`（按文件名，`learned.md` 置最后=最高）。不做全局 home 层。
+- **@include**：`@相对路径` 行递归原位展开；拒绝绝对路径 / `..` 段（含 `sub/../x` 形式）
+  / 沙箱逃逸；循环检测与缺失都给占位注释（不报错不中断）。
+- **去重 + 预算**：内容 sha256 去重，重复时保留靠后（高优先级）一份；单文件 >8K 截断、
+  总长 >20K 从低优先级丢弃 + 末尾截断，均附 `<!-- 已截断 -->` 提示。
+- **任务后提取**：llm.complete 从轨迹事件（tool_call/llm_call 摘要）提炼 `- ` 条目，
+  过滤"无"；LLM 异常 → []（提取失败不阻断任务）。`save_learned` 去重合并写回
+  `learned.md`，下次 discover 自动包含 → **跨会话生效**。
+- **consolidation**：空白归一化 → 被更长条目包含的合并掉 → hash 去重（不 prune 不调度）。
+- **接入**：cli.py 启动 `memory_blocks=MemoryManager(ws, llm=None if mock else llm).blocks()`；
+  真实模式任务后 `extract_and_learn(result.events)`（mock 保持脚本确定性）。
+- 测试：tests/test_memory.py（19 个：发现顺序/@include 全部拒绝路径/循环/去重/预算/提取/consolidation/落盘往返）。
+
+### 9.5 agent/tools/subagent.py（M4-2 已实现：research 子代理）
+
+```python
+class SubagentInput(BaseModel):
+    task: str
+    tools: list[str] = ["glob", "grep", "read"]   # 只读白名单
+    max_steps: int = 10
+
+class SubagentTool(Tool):
+    name = "subagent"  # is_read_only() = False（串行执行，避免嵌套并发）
+    def __init__(self, llm, workspace_root): ...
+    def execute(self, args, ctx) -> ToolResult: ...
+    @staticmethod _restricted_registry(requested: list[str]) -> ToolRegistry
+```
+
+- **独立上下文**：子代理用全新 AgentState + `SUBAGENT_SYSTEM_PROMPT`（只读定位），
+  主循环 messages/usage/compact 全不共享；内部复用 QueryEngine（同一 LLM），代码零重复。
+- **只读受限**：默认 glob/grep/read，写工具/bash 一律不给；`_restricted_registry` 永不包含
+  subagent 自身 → 天然禁止递归嵌套；未知名字静默忽略。
+- **返回**：`ToolResult.ok(结论报告)`（主上下文只收 Z tokens）；子代理失败/超步如实
+  `ToolResult.fail("[子代理 max_steps，N 步] …")`，不假装成功，主模型可据此调整。
+- **接入**：cli/ui 引擎组装处 `registry.register(SubagentTool(llm, workspace_root))`
+  （不能进 ToolRegistry.default——需要 llm/workspace 构造参数）。
+- 测试：tests/test_subagent.py（6 个：跑通回报告/只读白名单+不改文件/max_steps 兜底/
+  system prompt 定位/禁止递归/串行注册）。
 
 ### 9.6 eval/（M5）
 - golden_tasks.py：从 tinydb 的 git history 找真实 bug 修复 commit → 任务 = "修复 <commit前> 的 bug"，隐藏判定 = 该 commit 的测试
