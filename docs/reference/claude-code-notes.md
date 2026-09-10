@@ -104,7 +104,9 @@ interface Tool {
 - Skills = 领域知识胶囊 + 脚本（SKILL.md + 文档 + 模板 + 脚本），**渐进式披露**（只按需加载技能内容）。
 - vs SubAgent：SubAgent 适合复杂多步多角色（独立上下文互不干扰）；Skill 适合单一明确可复用小任务。
 - 结论："Agent 不再负责实现逻辑，只做调度。"
-- **本项目不做 Skills 系统**（范围控制），用 hooks 展示扩展性。
+- ~~本项目不做 Skills 系统~~ → **2026-09-11 改**：做了**渐进披露这一层**（`agent/skills.py`：
+  只把 name+简介进 system prompt，正文由 `load_skill` 按需取）。**没做**的是安装 / 市场 /
+  权限元数据这些外围。原决定反转的理由见 `minicode-notes.md` §8。
 
 ## 10. Hooks〔feishu〕★ 我们直接采用
 

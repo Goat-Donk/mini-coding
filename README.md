@@ -4,7 +4,7 @@
 **核心循环手写**（不套 LangGraph / Agent SDK），支撑层用成熟库（openai SDK / pydantic v2 / streamlit / typer / pytest）。
 
 > **一句话**：把 Claude Code 的架构用 Python 重写一遍——不是移植代码，是移植设计。
-> 5,237 行源码 / 20 个模块 / 268 个测试。真实跑分见[评估章节](#评估eval)。
+> 6,241 行源码 / 24 个模块 / 330 个测试。真实跑分见[评估章节](#评估eval)。
 
 📄 文档：[技术方案 `docs/TECH_SPEC.md`](docs/TECH_SPEC.md) · [架构详解 `docs/architecture.md`](docs/architecture.md) · [任务清单 `TASKS.md`](TASKS.md) · [参考笔记 `docs/reference/`](docs/reference/)
 
@@ -16,7 +16,7 @@
 
 | 能力 | 说明 | 对应 Claude Code 机制 |
 |---|---|---|
-| **cache-aware 上下文布局** | 稳定前缀（system+task 固定不动）+ 两级 compact，让 DeepSeek 磁盘缓存持续命中；控制台实时画命中率与省钱曲线 | TOKEN_BUDGET / CONTEXT_COLLAPSE |
+| **cache-aware 上下文布局** | 稳定前缀（system+task 固定不动）+ 三级 compact，让 DeepSeek 磁盘缓存持续命中；控制台实时画命中率与省钱曲线 | TOKEN_BUDGET / CONTEXT_COLLAPSE |
 | **step 级检查点 / 崩溃恢复** | 每 5 步原子落盘 state，`--resume` 从最近检查点**接着 step 计数**续跑；任务中途 kill 进程不丢进度 | `/resume` |
 | **block-at-submit hooks** | `PreToolUse` 包裹 `git commit`，`data/tests_pass.marker` 不存在就**阻断**——逼 agent 进入「测试并修复」循环；marker 只在**测试命令真跑成功**时由 `PostToolUse` 写入，失败即清除 | Hooks（block-at-submit） |
 | **真·轨迹驱动评估** | 从 tinydb 真实 git history 挖 bug 修复提交构造黄金任务，隐藏测试判分，出完成率/成本回归报告 | SWE-bench 思路 |
@@ -25,6 +25,12 @@
 | **MCP 客户端** | 手写 MCP stdio 客户端接入标准 MCP server；**第三方工具照样过权限与 hooks**，且**默认不放行**——必须列进 `mcp.json` 的 `allow` 才免确认 | MCP（工具接入标准） |
 | **第三方工具授权** | `Tool.is_external()` → 权限引擎单独归类，默认 `ask`（无交互确认 → 拒绝），拒绝文案带出处与解除方式；子进程环境按名清洗凭据类变量 | 权限与安全审查 |
 | **注入文本检测 + 会话污染标记** | `agent/security.py` 对已知文本模式做**概率性**检测（只出告警）；`high` 标记让**三类不可逆动作**（网络外发 / 读凭据 / 写记忆文件）在 `PermissionsEngine` 的**后置天花板**上从 allow 降为 ask —— 该位置在记忆之后，`allow_always` 短路不了它 | 权限与安全审查 |
+| **提问暂停 / 续答** | 信息不足时 agent 调 `ask_user` **停下**并把问题打出来；`--resume "你的回答"` 把回复送进会话接着跑。「打断」是**数据标志**（`ToolResult.await_user`）而非阻塞控制流，所以 headless 评测只要不注册这个工具就完全不受影响 | `ask_user` 工具 / 澄清提问 |
+| **skills 渐进披露** | 工作区放 `SKILL.md`，**只有 name + 简介**进 system prompt，正文由 `load_skill` 按需取 —— 装 50 个 skill 也不额外占常驻 token | Skills（渐进披露） |
+| **计划清单跨回合** | `update_plan` 写 `state.plan`，**随检查点落盘**：中途 kill 或换会话续跑都不丢；`--plan` 可无 key 直接查看。每次传**完整清单**（不是增量），状态只有一个写入者 | TodoWrite / 计划清单 |
+| **工具输出分级截断** | compact 流水线的**第 0 级**：按工具给不同预算先缩内容，缩不够才删消息；`grep`/`pytest` 的**结论在尾部**，所以是 head 70% + tail 30% 而不是只留头部；**失败结果给更大预算**（错误原文是模型自修复的依据）。**只在越过 warning 线时才跑**，低于阈值逐字节不碰（保住前缀缓存） | 上下文分级截断 |
+
+> 上表最后四项是 M8 按参考实现的**设计**重写的（未复制任何代码），出处与「哪些明确不吸收」见 [MiniCode 笔记 §8](docs/reference/minicode-notes.md)。
 
 ### 实测：缓存命中率曲线（真·冷启动）
 
@@ -63,7 +69,7 @@ flowchart TB
         LOOP["loop.py · QueryEngine<br/>think → tool → observe → finish<br/>只读并发 / 写工具串行"]
         LLM["llm.py<br/>DeepSeekClient · MockLLM<br/>usage + cache 采集"]
         STATE["state.py<br/>AgentState + OpenAI 消息构造"]
-        CTX["context.py<br/>provider-usage-first 记账<br/>cache-aware 布局 + 两级 compact"]
+        CTX["context.py<br/>provider-usage-first 记账<br/>cache-aware 布局 + 三级 compact"]
         TR["tool_result.py<br/>超大结果落盘 + 预览"]
         SESS["session.py<br/>JSONL 轨迹 + 检查点 + resume"]
     end
@@ -164,6 +170,8 @@ streamlit run app/ui_streamlit.py        # 控制台，勾选「Mock 演示」
 python -m app.cli "给 README 加一行说明并验证"
 python -m app.cli --resume               # 从最近检查点续跑（配合 Ctrl+C 杀进程演示）
 python -m app.cli --resume --clear-taint # 复位污染标记（误报被收紧时用它解锁）
+python -m app.cli --resume "补充的信息"   # 回答 agent 的提问后续跑（agent 调 ask_user 停下来时）
+python -m app.cli --plan                 # 只看最近会话的**任务计划清单**后退出（不需要 API key）
 python -m app.cli --mcp .codeagent/mcp.json "任务"   # 加载 MCP server（第三方工具）
 ```
 
@@ -204,7 +212,7 @@ python -m eval.runner --limit 2 --mock           # 无 key 冒烟：只验证管
 **测试**：
 
 ```bash
-python -m pytest tests/                  # 268 passed
+python -m pytest tests/                  # 330 passed
 ```
 
 ---
@@ -270,14 +278,17 @@ $ python -m eval.runner --limit 2
 
 | 层 | 文件 | 行数 |
 |---|---|---|
-| 核心循环 | `agent/loop.py` `llm.py` `state.py` `context.py` `tool_result.py` `session.py` | 1,447 |
-| 治理 | `agent/permissions.py` `hooks.py` `memory.py` `security.py` | 1,408 |
-| 工具 | `agent/tools/base.py` `bash.py` `files.py` `subagent.py` | 796 |
+| 核心循环 | `agent/loop.py` `llm.py` `state.py` `context.py` `tool_result.py` `session.py` | 1,738 |
+| 治理 | `agent/permissions.py` `hooks.py` `memory.py` `security.py` | 1,434 |
+| 技能 | `agent/skills.py` | 271 |
+| 工具 | `agent/tools/base.py` `bash.py` `files.py` `subagent.py` `ask.py` `plan.py` `skills.py` | 1,097 |
 | MCP | `agent/mcp.py` | 386 |
-| 入口 | `app/cli.py` `ui_streamlit.py` `replay.py` | 710 |
+| 入口 | `app/cli.py` `ui_streamlit.py` `replay.py` | 825 |
 | 评估 | `eval/golden_tasks.py` `runner.py` | 490 |
-| **源码合计** | **20 个模块** | **5,237** |
-| 测试 | `tests/` | 4,584（268 个用例） |
+| **源码合计** | **24 个模块** | **6,241** |
+| 测试 | `tests/` | 5,957（330 个用例） |
+
+> 口径：源码 = `agent/` + `app/` + `eval/` 里**被 git 跟踪**的 `.py` 行数（不含 `eval/repos/` 下的克隆仓，它被 gitignore）；模块数 = 其中**非空**的 `.py` 文件数（4 个空 `__init__.py` 不计）。
 
 ---
 
@@ -286,7 +297,7 @@ $ python -m eval.runner --limit 2
 ```
 coding_agent/
 ├── CLAUDE.md              # 精炼约定 + 索引（新会话自动加载）
-├── TASKS.md               # 勾选式任务清单（M1~M6，进度快照）
+├── TASKS.md               # 勾选式任务清单（M1~M8，进度快照）
 ├── docs/
 │   ├── TECH_SPEC.md       # 详细技术方案：签名 / 数据结构 / 边界 / 测试用例
 │   ├── architecture.md    # 架构详解（逐层对应 CC 源码）
@@ -304,9 +315,9 @@ coding_agent/
 
 ## 设计取舍
 
-**做**：核心循环手写 · 只读工具并发 · diff 语义编辑（唯一匹配 + 失败回喂自修复）· 权限沙箱 · hooks · 两级 compact · 检查点恢复 · 分层记忆 · research 子代理 · 轨迹驱动评估。
+**做**：核心循环手写 · 只读工具并发 · diff 语义编辑（唯一匹配 + 失败回喂自修复）· 权限沙箱 · hooks · 三级 compact · 检查点恢复 · 分层记忆 · research 子代理 · 轨迹驱动评估。
 
-**不做**（范围控制，不是不会）：向量 RAG（CC 自己也是靠 grep/glob/read 检索）· Skills 系统 · A2A · 多代理协调器 · 语音 / Vim / 远程 bridge / TUI 组件层——这些是 Claude Code 里「大规模」而非「核心」的部分。
+**不做**（范围控制，不是不会）：向量 RAG（CC 自己也是靠 grep/glob/read 检索）· Skills 的安装/市场/权限元数据（只做了 SKILL.md 渐进披露这一层，见能力表）· A2A · 多代理协调器 · 语音 / Vim / 远程 bridge / TUI 组件层——这些是 Claude Code 里「大规模」而非「核心」的部分。
 
 **硬约束**：LLM 只用 DeepSeek（`deepseek-chat`），测试走 MockLLM · 所有文件操作限制在 `workspace_root` 沙箱内，bash 拦危险命令 · **数据全真实**，agent 操作真实仓库、评估用真实提交，不造假。
 
@@ -378,6 +389,7 @@ coding_agent/
 ## 参考与来源
 
 - [pengchengneo/Claude-Code](https://github.com/pengchengneo/Claude-Code) — 主参考（查询循环 / 工具接口 / 上下文管理 / hooks / 权限）→ [笔记](docs/reference/claude-code-notes.md)
-- [LiuMengxuan04/MiniCode](https://github.com/LiuMengxuan04/MiniCode) — 长会话上下文治理 → [笔记](docs/reference/minicode-notes.md)
+- [LiuMengxuan04/MiniCode](https://github.com/LiuMengxuan04/MiniCode)（TS，MIT）— 长会话上下文治理 → [笔记](docs/reference/minicode-notes.md)
+  - M8 的四项机制（提问暂停 / skills 渐进披露 / 计划清单 / 分级截断）**照其设计重写，未复制任何代码**：本地那份第三方 Python 移植（`minicode/` 59,852 行）**自有部分未声明授权**，且即便授权允许，照抄也会让「核心循环手写」这个定位失效。取舍与「明确不吸收」清单见笔记 §8。
 - [offer-Master](https://github.com/happyFigure/offer-Master) — 工程分层组织 → [笔记](docs/reference/offer-master-notes.md)
 - [Anthropic: Building Effective Agents](https://www.anthropic.com/engineering/building-effective-agents) — workflow vs agent 的边界

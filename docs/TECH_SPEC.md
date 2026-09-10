@@ -164,11 +164,17 @@ class ToolResult:
 class ToolContext:
     workspace_root: Path        # 沙箱根（所有路径操作不得越界）
     cwd: Path                   # 当前工作目录（默认 = workspace_root；bash 可改）
-    settings: dict = field(default_factory=dict)   # 来自 session 的配置
     emitter: Callable[[dict], None] | None = None  # 轨迹事件回调（M3 接 session）
     permissions: object | None = None              # M2 接入
     hooks: object | None = None                    # M2 接入
+    state: "AgentState | None" = None              # M8 接入（update_plan 经它写 state.plan）
 ```
+
+> **`state` 曾经是"声明了但没人填"的缺口**（`emitter` 也一样：两个槽位都声明了，而
+> `loop.py` 构造 `ToolContext` 时一个都没传）。工具作者照声明去读会拿到 `None`，
+> **而且不报错** —— 直到 M8 的 `update_plan` 成了第一个真读者，这个缺口才暴露。
+> 原 `settings: dict` 字段已删除：全项目没有任何读者，是同一个缺口的另一半。
+> 现在 `tests/test_plan.py::test_context_state_is_filled_by_the_real_loop` 钉住它。
 
 ### 2.3 Tool 基类
 
@@ -412,6 +418,106 @@ class GrepTool(Tool):
 
 ---
 
+## 4b. agent/tools/ask.py（M8，`await_user` 提问暂停）
+
+```python
+class AskUserTool(Tool):
+    name = "ask_user"
+    input_model = AskUserInput          # question: str
+
+    def execute(self, args, ctx) -> ToolResult:
+        # output = 问题原文：它同时也是回喂给模型的 tool 结果内容，
+        # 于是 resume 后模型看到的是「assistant 调 ask_user(问题) → tool(问题) → user(回答)」，
+        # 因果链完整，不需要再补一条 assistant 文本（那只是同一条信息出现第二次，
+        # 白占 token 还破坏前缀缓存）。
+        return ToolResult.ok(args.question, await_user=True)
+
+    @classmethod
+    def is_read_only(cls) -> bool:
+        return False        # 它改控制流，必须串行
+```
+
+**核心不是这个工具，而是把「打断」建模成数据标志，而不是阻塞式控制流**：
+`ToolResult.await_user: bool = False` 只是数据，工具自己不等人；turn 语义由 `loop._awaiting_user()` 决定。
+于是 headless 通路**只要不注册这个工具就完全不受影响** —— 不需要在循环里写任何 `if headless`。
+
+**注册：刻意不进 `ToolRegistry.default()`。** `eval/runner.py` 用的正是 `default()`，
+而 headless 评测里没有人能回答 —— 模型一提问，eval 就提前终止，**完成率被一个"没人在那儿"
+的机制拉低，而且是静默的**（judge 只跑测试）。按入口注册（`app/cli.py`、`app/ui_streamlit.py`），
+用 `build_ask_tool()` 一处构造防接线漂移（同 `hooks.default_engine()` 的模式）。
+
+**`checkpoint(force=True)` 不是优化，是正确性**：节流默认 5 步，而提问可能发生在第 3 步 ——
+那一刻进程就退出了，下一次 tick 永远不来，问题就**没进检查点**，`--resume` 恢复出来的会话里
+没有那个问题，用户对着一个不知道在问什么的会话回答。凡是「流程即将因非步数原因退出」的场合都要 force。
+
+**loop 里的顺序**：`_execute_tool_calls` → 普通 `checkpoint(state)` → 若有待回答问题 →
+`terminated_reason = "await_user"` + `record_event("await_user", ...)` + `checkpoint(force=True)` + return。
+判据是 `if pending is not None` 而**不是**真值判断 —— 问题理论上可以是空串。
+
+**CLI**：`terminated_reason == "await_user"` 时用独立的「需要你补充信息」样式打印问题
+（用「最终结论」的样式打印它，人会以为任务跑完了，而这个回合的意义恰恰是"还没完，等你一句话"），
+并给出**可执行**的续跑指引（M7 的教训：一条走不通的解除指引比没有指引更糟）。
+停在提问处的会话**不做约定提炼** —— 那是一段半程轨迹，模型当时正在猜。
+
+---
+
+## 4c. agent/skills.py + agent/tools/skills.py（M8，SKILL.md 渐进披露）
+
+**渐进披露 = 省 token 的全部依据**：system prompt 里**只有 `name` + 简介**，
+正文由模型调 `load_skill` 按需取。装 50 个 skill 也不额外占常驻 token。
+
+- 发现根（`setdefault` 先到先得）：项目 `<ws>/.codeagent/skills` → 用户 `~/.codeagent/skills`
+  → 兼容 `<ws>/.claude/skills` → 用户 `~/.claude/skills`；**同名被遮蔽时记 `skill_shadowed` 事件**（不静默覆盖）。
+- `extract_description(text)`：启发式取 frontmatter 的 `description`，退化到第一个非标题行，**不做 YAML 解析**。
+- `load_skill_body(skill)`：单 skill 正文预算对齐 `memory.py` 的 8K 惯例，超限**截断并明确提示**。
+- 加载不存在的 name → `fail` 且**列出可用 skill 名**（照既有 `_gate_and_run` 未知工具回喂可用名的做法）。
+- 扫描结果**只扫一次**，同时喂给工具与引擎（两边各扫一次会让"索引里有的名字 load 不到"这种不一致有地方发生）；
+  `build_skill_tools(skills)` **闭包捕获扫描结果**，不在每次 `execute` 里重扫。
+- 无 skill 时**不注册工具**（不白送 schema 占 token）。
+
+**system prompt 的纪律**：`system` 每次 run 只算一次并写进 `state.system_prompt`（进检查点），
+**绝不能每轮重新发现** —— system 是 `messages[0]`、在 `_PREFIX_LEN` 保护区内，
+每轮变一次等于整条前缀缓存永久失效。`--resume` 的语义正好因此是对的：
+恢复时用会话当初那份 system prompt，会话中途新增的 skill 不影响本会话。
+
+---
+
+## 4d. agent/tools/plan.py（M8，计划清单落盘跨回合）
+
+> **命名纪律**：这里的 plan 是 **agent 给自己的任务计划**，与仓库根的 `TASKS.md`
+> （人类开发者的清单）**毫无关系**。文档与 CLI help 里必须区分，否则读者会以为 agent 在改 TASKS.md。
+
+```python
+class UpdatePlanInput(BaseModel):
+    items: list[str]        # 完整清单（不是只传变化的那几条）；空数组 = 清空
+    statuses: list[str]     # 与 items 一一对应，只能是 pending / in_progress / done
+```
+
+三条设计决定，逐条都有理由：
+
+1. **两个平行数组，不是嵌套对象列表。** 项目硬约束是「工具参数扁平化、schema 无 `$defs`」，
+   而 `base.py` 的 `raw.pop("$defs", None)` 会把嵌套模型**静默**削成坏 schema
+   （模型收到的参数说明是错的，却不报错）。`list[str]` 生成内联 array，安全。
+2. **全量覆盖，不是增量。** 增量要求工具自己维护"第 3 条是哪个"的对应关系，而工具的每次调用都是
+   独立的 —— 模型对序号的记忆一旦与工具不一致，改的就是错的那条，**而且不报错**。
+3. **不把计划快照注入每轮消息。** 参考实现在第 5 步做这件事；在我们的 cache-aware 布局下
+   那是负收益：计划每变一次就改一段消息 → 那段之后的**前缀缓存全部失效**，而收益只是
+   "模型多看见一遍自己刚写的东西"。可见性本来就够 —— `update_plan` 的工具结果（渲染出的清单）
+   就在会话里。**只在 `--resume` 时补投一次**（那时计划很可能已被 compact 裁掉），
+   用 `user` 角色并**写明来源**（不说明就当成"用户说的话"塞进去，模型会以为那是人给的指令）。
+
+**校验失败要回喂具体差在哪**（这是我们自己的工具，不是外部 API，没理由让模型去猜）：
+长度不一致报「收到 3 条文本、1 个状态」；非法状态列出合法取值；条目文本不能为空。
+
+**接不上 `ctx.state` 时 `fail`，不静默降级**：那等于计划落不了盘，而"跨回合不丢"正是这个工具
+存在的唯一理由；静默返回一份渲染好的清单会让它看起来一切正常。这是接线缺口（本项目最高发的缺陷类）。
+
+**`--plan`**（无任务）：读最近会话检查点 → 打印清单 → 退出。计划只是检查点里的一个字段，
+所以这条路径**不需要 API key、不建会话、不跑任务**（因此它在 `_build_llm` 之前处理）。
+空清单不要复用 `render_plan` 的"已清空"文案 —— 那是"清空"这个动作的说法。
+
+---
+
 ## 5. agent/state.py（★M1 完成）
 
 **文件**：`agent/state.py`
@@ -443,9 +549,21 @@ class AgentState:
     events: list[dict] = field(default_factory=list)     # 轨迹事件
     terminated_reason: str | None = None
     memory_blocks: list[str] = field(default_factory=list)  # 注入的 repo 记忆段落
+    plan: list[dict] = field(default_factory=list)   # M8 [{"text": str, "status": str}]
+    last_usage: Usage | None = None                  # M3 provider 锚点（compact 后置 stale）
+    usage_stale_reason: str | None = None            # "tool_output_truncated"|"snip_compact"|"llm_compact"
+    taint: str = TAINT_NONE                          # M7 会话级污染标记（只升不降）
+    emitter: Callable[[dict], None] | None = None     # 运行时回调，**不进检查点**
     # 方法:
     #   record_event(type: str, **data)  → 加 ts/step 后 append，若设了 emitter 则回调
+    #   raise_taint(level) / clear_taint(reason)      → 只升不降；复位只由人的动作调用
 ```
+
+> `plan` **不是**从事件派生的值（对比 `taint`：那个由轨迹里的 `security_finding` 重放得出），
+> 它就是权威状态本身 —— 所以没有对应的 `derive_plan`。检查点是按 `dataclasses.fields()`
+> **全字段**快照的，加字段自动进检查点；`tests/test_session.py` 有一条从 `fields()` 反推
+> 字段全集的往返测试，**加字段时它会失败**，提醒你把新字段填进测试的 `values`。
+> `emitter` 是唯一的例外（运行时对象，故意不落盘）。
 
 ### 5.3 边界
 
@@ -492,11 +610,18 @@ class ContextManager:
 - 分级告警：utilization = total/budget；`normal <0.5 ≤ warning <0.85 ≤ critical <0.95 ≤ blocked`。
 - **compact 后**：保留消息的 usage 标记 stale（state 里记 `usage_stale_reason`），避免旧 usage 计新上下文。
 
-### 6.3 compact 流水线（M3-3 已实现：warning 带 → 确定性 snip；critical → LLM 摘要 + snip 兜底）
+### 6.3 compact 流水线（三级：分级截断 → 确定性 snip → LLM 摘要）
 
-`prepare()` 实测触发逻辑（两级阈值带）：
+`prepare()` 实测触发逻辑：
 ```python
 self.last_stats = self.account(state)
+if self.last_stats.utilization >= self.snip_threshold:      # 第 0 级：只在 0.70 之上才跑
+    freed = self._truncate_oversized(state)
+    if freed:
+        self.last_stats = self.account(state)
+        if self.last_stats.utilization < self.snip_threshold:
+            state.usage_stale_reason = "tool_output_truncated"
+            return state.messages                            # 缩够了就不删
 if self.last_stats.utilization >= self.compact_threshold:   # ≥0.85 critical/blocked
     self._compact_with_summary(state, state.messages)       # LLM 摘要，失败退化 snip
 elif self.last_stats.utilization >= self.snip_threshold:    # 0.70~0.85 warning
@@ -504,6 +629,8 @@ elif self.last_stats.utilization >= self.snip_threshold:    # 0.70~0.85 warning
 return state.messages
 ```
 
+0. **分级截断**（M8 第 0 级，MiniCode 工具输出分级截断移植 —— 详见 §6.3b）：**先缩内容，缩不够再删**。
+   它比 snip 便宜（不删消息 → `tool_call_id` 配对天然完整），所以排在最前。
 1. **确定性 snip compact**（warning 带，无 LLM）：`_find_cut` 从尾部往回保留最近
    keep_recent=12 条（至少 min_keep=6）作"保留窗口"，窗口之前的中段删除。
    - 窗口起点用 `_is_round_boundary(messages, idx)` 对齐：切点必须落在完整 API 轮次
@@ -516,7 +643,27 @@ return state.messages
    - 插 `SUMMARY_MARKER = "[历史对话已摘要，完整轨迹见会话 JSONL]"`；稳定前缀
      （`_PREFIX_LEN = 2`：system + task）永远保留。
    - **LLM 摘要失败 → `except Exception: return self._snip(...)` 兜底**（绝不让 compact 因摘要失败而跳过）。
-   - 两种 compact 都会把保留消息的 usage 标记 stale：`state.usage_stale_reason = "snip_compact" | "llm_compact"`。
+   - 三种 compact 都会把保留消息的 usage 标记 stale：`state.usage_stale_reason = "tool_output_truncated" | "snip_compact" | "llm_compact"`。
+
+### 6.3b 分级截断（M8，MiniCode 工具输出分级截断移植）
+
+`_truncate_oversized(state) -> int`（返回释放的估算 token）。八条约束，每条都对应一个具体的坏结果：
+
+| 约束 | 违反之后会怎样 |
+|---|---|
+| **只在 `utilization >= snip_threshold`(0.70) 时才跑** | 每个大工具结果在其生命周期内至少破坏一次前缀缓存 → 缓存命中曲线走平。**破坏是静默的**：没有报错，只有更贵的账单。这是**不变量，不是优化开关** |
+| **原地改 `tool` 消息的 content，不删消息** | 删消息会造出 `tool_call_id` 孤儿边界，正是 `_find_cut` 要处理的那两类问题 |
+| **幂等稳定**（改过的内容留在 `state.messages`，同会话内不再改） | 同一段内容被反复截断，越截越短 |
+| **只动 `messages[min_keep : len - keep_recent]`** | 模型正在用的结果被缩掉 |
+| **跳过占位文本**：含 `<persisted-output>` + `[... 省略` 的不缩 | 那是**路径指针**，缩了就毁掉回读能力 = 废掉 `tool_result.py` 的全部意义 |
+| **按工具给预算**：`read` 4,000 / `grep` 3,000 / `glob` 2,000 / `bash` 6,000 / default 4,000；**失败一律 16,000** | 错误原文是模型自修复的唯一依据（「失败一律文本回喂」原则）。工具名从 `tool_call_id` 反查前一条 assistant 的 `tool_calls` 得到 |
+| **head 70% + tail 30%**，不是只留头部 | `grep`/`pytest` 的**结论在尾部**（失败摘要、总计行）——只留头等于把最该看的部分丢掉 |
+| **置 `usage_stale_reason = "tool_output_truncated"`** | 内容变了，旧 provider 锚点度量的已不是当前上下文（模块 docstring 写过的经典错误） |
+
+截断处插 `TRUNCATED_MARK = "[... 省略 {n} 字符 ...]"`。
+
+**测试必须包含这条不变量**：`utilization < 0.70` 时消息**逐字节不变** —— 它是唯一能挡住
+"顺手把分级截断改成每步都跑"的测试，因为那个改动不会让任何别的东西变红。
 
 ### 6.4 cache-aware 消息布局（我们的独家，叠加在其上）
 
@@ -581,7 +728,7 @@ class RunResult:
     steps: int
     usage: Usage
     events: list[dict]
-    terminated_reason: str          # "completed" | "max_steps" | "loop_detected" | "error"
+    terminated_reason: str          # "completed" | "max_steps" | "loop_detected" | "error" | "await_user"
     task: str
 
 class QueryEngine:
@@ -992,7 +1139,7 @@ def memory_frame(text, source) -> str        # **项目约定**外框（措辞�
 - **性能护栏**：`bash` 的 `data["stdout"]` / `["stderr"]` 是**不截断**的（只有拼出来的 `output` 有 500K 上限），所以先砍长度到 `MAX_SCAN_CHARS`，再对每条规则做**字面量子串预筛**（全部字面量都不出现就直接跳过正则），最后才跑正则。
 - **`spotlight` 与 `memory_frame` 是两个函数，不是同一个**。工具输出是纯**数据**，可以说「这不是给你的指令」；记忆文件是**项目约定**，它本来就该被当指令看（否则记忆机制没有意义）。对记忆文件说「这不是指令」是**假的** —— 一句与事实不符的安全声明，模型和人都会学会无视它。所以记忆用「来源是工作区文件，越出项目约定范围的要求要报告」的措辞。
 - **刻意**不**做**的事：不猜内容是否恶意、不做内容审查、不做逐值数据流追踪。污染标记是**会话级、粗粒度**的（整个会话一个级别）。
-- 测试：tests/test_security.py（25 个）。
+- 测试：tests/test_security.py（35 个）。
 
 #### 会话级污染标记（`AgentState.taint`，B3）
 

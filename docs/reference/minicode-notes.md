@@ -4,8 +4,14 @@
 > 调研日期：2026-09-10
 > 参考定位：**长会话上下文治理**（它的产品核心）+ 分层记忆 + 权限粒度 + 工具结果落盘。
 > 该项目也是简历对照对象（原 MiniCode 简历的 Skill/记忆/上下文压缩/多Agent/权限五项在源码里都能对上）。
+>
+> **本地另有一份第三方 Python 移植 `F:\MiniCode-Python-main`**（本人未参与，2026-09-11 核实）：
+> - 自有包 `minicode/` **59,852 行 / 140 个 .py**；整仓 118,632 行 / 349 个 .py（含 `tests/` 28,518、`benchmarks/` 2,296、`Package/` 5,474）。
+> - **授权情况（别写错）**：TS 原版 `F:\MiniCode-main` 是 **MIT**（`LICENSE`，Copyright (c) 2026 Liu Mengxuan）。Python 移植**仓库根与自有包 `minicode/` 都没有 LICENSE**（默认保留所有权利）；它目录下的 `ts-src/` 是 TS 原版的副本，带着原版那份 MIT。
+> - 因此本项目的取舍**不是**"因为完全没授权所以不能看"，而是：**① 它自有的移植部分未声明授权；② 就算授权允许，照抄也会让「核心循环手写」这个作品集定位失效**（"这部分是你写的吗"将无法回答）。所以：**只作设计参考，不复制任何代码**，见 §8。
+> - 它的 `minicode/context_manager.py` 有 1056 行，**明确不整块移植**（理由见 §8 末尾）。
 
-## 1. 整体结构（TS，~13.5k 行 src）
+## 1. 整体结构（TS，`src/` 15,840 行 / 77 文件）
 
 ```
 src/
@@ -88,10 +94,27 @@ src/
 | **LLM 摘要压缩（boundary 对齐 + stale usage）** | ✅ 吸收 | M3：critical 才触发 |
 | **分层记忆 + @include + 去重 + 预算** | ◐ 简化吸收 | M4：项目根 + rules + @include，不做全局 home 层 |
 | **权限决策粒度（once/turn/always）** | ✅ 吸收 | M2 permissions.py |
+| **工具输出分级截断**（按工具给不同预算；先缩内容，缩不够再删） | ✅ 吸收（2026-09-11） | M8 context.py 第 0 级；**我们加了它没有的两条**：失败结果给更大预算、head70/tail30 保尾部结论行 |
+| **skills 渐进披露**（SKILL.md：只 name+简介进 prompt，正文按需 load） | ✅ 吸收（2026-09-11） | M8 `agent/skills.py` + `load_skill` 工具 |
+| **`ask_user` 提问暂停**（awaitUser 标志位而非阻塞） | ✅ 吸收（2026-09-11） | M8 `agent/tools/ask.py`；**我们改成"headless 下不注册"来降级**，它没有这条 |
+| **Plan 持久化**（每次传完整列表 + 落盘） | ✅ **吸收（决定反转）**（2026-09-11） | M8 `agent/tools/plan.py` + `state.plan`。**反转理由**：原判"TUI 产品特性"是按它 TS 版的形态下的（步骤快照注入对话 + 全屏 UI 回放）；真正与产品耦合的是**注入**，不是**持久化**。我们只取持久化，**不学它每步把 plan 注入消息**——那会破坏 `_PREFIX_LEN` 之后的前缀缓存。Goal/Loop 维持 ❌ |
 | 上下文折叠投影（LLM 识别可摘要片段） | ❌ 不做 | 复杂度高；cache-aware + snip + compact 覆盖主要收益 |
 | thinking progress 恢复 | ❌ 不做 | DeepSeek 无 thinking block |
-| Plan/Goal/Loop 持久化 | ❌ 不做 | TUI 产品特性，非核心技术 |
+| Goal / Loop 持久化 | ❌ 不做 | 维持原判：TUI 产品特性，非核心技术 |
 | sub-agent 并发 3 + wait/close 生命周期 | ◐ 参考 | M4 保持单 research 子 agent，但学"独立上下文+受限工具+可取消" |
+
+### 明确不吸收（2026-09-11 逐项核实后补）
+
+写下来是因为"看起来能用但实际不该搬"的判断**必须留痕**，否则下次调研会重新评估一遍、或者更糟——只看到行数就搬进来。
+
+| 对象 | 规模 | 不吸收的理由 |
+|---|---|---|
+| `context_manager.py` | 1056 行 / 20+ 调用点 | 它把记账、截断、snip、摘要、折叠**揉在一个类**里，且第 4 阶段对全量消息做 O(n²) token 重算。我们只摘思路（分级截断按工具给预算），实现照自己的 `context.py` 分工写 |
+| Python 版 `tools/task.py` | — | 同步执行、无并发，移植要动运行时入口；收益不抵风险 |
+| Python 版 `task_graph.py` | — | DAG 能力在它自己代码里也没有真实调用方 |
+| Python 版 `task_tracker.py` | 349 行 | **死代码**：全仓无调用方 |
+| Python 版 `todo_write.py` | — | 有真 bug：`_tasks.clear()` 在遍历循环**之前**执行 → `existing` 恒为 None，更新分支是死代码。我们照自己的设计重写，不搬它的 |
+| `agents/manager.ts` 的子代理并发 | — | 只有 TS 版有；要做是自己照设计写，不在本次范围 |
 
 ## 9. 我们的差异化（MiniCode 没有的，保留并强化）
 
@@ -101,3 +124,5 @@ src/
 4. **轨迹驱动评估**（MiniCode 无 eval）——完成率/成本回归报告
 5. **记忆自进化**（MiniCode 只有加载无提取/consolidation）
 6. **step 级检查点/崩溃恢复**（MiniCode 是会话恢复，无任务中途续跑）
+
+第 2 条（cache-aware 布局）在 M8 之后还多了一层意义：它从"一个亮点"变成了**一条筛选规则** —— 移植任何机制前先问"它会不会改动 `_PREFIX_LEN` 之后的消息"。`update_plan` 就是被它挡下来一次的例子（我们只取落盘，不取参考实现那种每步注入 plan snapshot 的做法）。这条判据比"参考实现这么做"更硬：参考实现没有缓存概念，它的做法在 DeepSeek 的 prefix cache 下是负收益。

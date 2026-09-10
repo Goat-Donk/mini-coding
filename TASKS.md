@@ -74,7 +74,7 @@
 - [x] B2 `agent/hooks.py`：`detect_injection()` 挂进 `default_engine()` 的 post_hooks（唯一构造点）。扫 `ctx.result.output`（模型真读到的字节），**fail-open 但大声记日志**
 - [x] B3 `AgentState.taint` 会话级粗粒度标记：只升不降、**没有 `set_taint`**、唯一复位者是人的动作（CLI `--clear-taint`）
 - [x] B4 记忆按**来源**隔离而非按内容过滤：`memory_frame` 来源框架 + `high` 会话写入 `learned.pending.md`（不自动注入）+ `@include` 拒 `data/tool-results/` 与深度上限
-- [x] B5 `tests/test_security.py`：25 例（payload 必命中 / 良性必不误报 / 文档讲注入不判 high / **自建样例集如实报实测数** / 天花板位置 / 端到端 / 场景 B 不锁死 / resume 往返 / fail-open）
+- [x] B5 `tests/test_security.py`：**35 例**（payload 必命中 / 良性必不误报 / 文档讲注入不判 high / **自建样例集如实报实测数** / 天花板位置 / 端到端 / 场景 B 不锁死 / resume 往返 / fail-open）
 - [x] B6 README「已知未修复的绕过路径」S1–S16 —— **本项可信度最高的部分**，写「已知绕过」比写「实现了注入防御」强得多。S6–S10 每条都配了探针实测结果，S16 是最该先修的那条
 
 ### Part C 文档
@@ -99,12 +99,44 @@
 
 ---
 
+## M8 按需移植参考实现的四项机制（2026-09-11）
+
+**背景**：原提议是放弃本项目现有代码、直接复制本地那份第三方 Python 移植（`F:\MiniCode-Python-main`）在其上优化，理由是"从零写太慢"。**评估后该提议的前提不成立**，已改选「保留 CodeAgent，按需移植机制」：
+
+1. 项目已完成（M1–M7），**不存在"从零开始"的剩余工作**，放弃现有代码是净成本；
+2. 定位是「核心循环手写」，照抄会毁掉这个定位（"这部分是你写的吗"将无法回答），既有资产（S1–S16 绕过路径表、V1–V4 真实验证、缓存命中曲线、评估框架）也无法迁移；
+3. 本地那份 Python 移植**自有部分未声明授权**（详见 `docs/reference/minicode-notes.md` 头部 —— 注意 TS 原版是 MIT，别写成"完全没授权"）。
+
+**因此本里程碑的全部实现 = 照设计用自己的代码重写，未复制任何代码。**
+
+- [x] P1 `ToolContext` 接线修复：`state`/`emitter` 声明了但**没有任何入口填**（工具作者照声明去读会拿到 None 且不报错）；删掉无读者的 `settings` 字段。顺带修 `ToolResultStore` 生产路径未接线
+- [x] P2 `agent/tools/ask.py` + `ToolResult.await_user`：提问暂停/续答。**打断建模成数据标志而非阻塞控制流**，headless 靠"不注册"降级；`checkpoint(force=True)` 保证第 3 步的提问也能落盘
+- [x] P3 `agent/skills.py` + `agent/tools/skills.py`：SKILL.md 渐进披露，system prompt 只放 name+简介
+- [x] P4 `agent/context.py` 分级截断：compact 流水线**第 0 级**，按工具给预算、head70/tail30、失败结果给更大预算
+- [x] P5 `agent/tools/plan.py` + `AgentState.plan` + `--plan`：计划清单落盘跨回合
+- [x] P6 文档同步（CLAUDE.md / TECH_SPEC / architecture / interview_guide / README / minicode-notes §8 / 本节）
+- [ ] P7 真实 LLM 验证四项 + **缓存命中率 A/B**（分级截断最要紧）+ 全量测试
+
+### 变异测试（"牙齿检查"）：逐条打断机制，确认对应测试变红
+
+- **P4 分级截断**：9 条变异全部被捕获
+- **P5 计划清单**：11 条变异全部被捕获 —— 静默降级 / 去掉长度校验 / 去掉状态校验 / `is_read_only` 改 True / 覆盖改追加 / 从 `default()` 摘掉 / 不填 `state` / 不补投计划 / `--plan` 失去独立出口 / 复用"已清空"文案 / **每轮注入计划快照**（最后这条即参考实现的做法，被我们的缓存约束否决）
+
+> 为什么必须做：单测全绿只说明"代码没崩"，不说明"测试真的在看这件事"。这条纪律在 P4 上尤其要紧 —— 分级截断的失败模式是**静默的**，「只在越过 0.70 时才跑」这条不变量一旦被改成每步都跑，**不会让任何测试变红**，只会让缓存命中曲线走平。所以专门有「utilization < 0.70 时消息逐字节不变」一条钉着它。
+
+### 一处静默失效的修复（.gitignore）
+
+`.pytest_tmp/` 与 `.codeagent/` 两条规则**从未生效过**：gitignore 只在**行首**把 `#` 当注释，写在模式后面的 `# ...` 会成为模式本身的一部分。`.codeagent/` 是运行期记忆目录（`rules/learned.md`），漏 ignore 会让它有机会进仓库。已把行尾注释移到独立行并加注说明。
+
+---
+
 ## 进度快照
 
-- 当前里程碑：**M7 完成**（M7-1~M7-6 + Part C 全部完成；四条真实 LLM 端到端验证 V1–V4 已全跑，工作区 `m7verify/`、`m7verify-nolock/` 已 gitignore）
-- 最近完成：M7 安全机制加固（结构性 A1–A7 + 检测器 B1–B6 + 文档 C1–C5 + 真实验证 V1–V4 及其发现的两个真 bug）
-- 代码状态：5,237 行源码 / 20 模块 / 268 测试全绿
-- 验证中发现并修复的真 bug：
+- 当前里程碑：**M8 实现完成，待真实验证**（P1–P6 完成；P7 未做）
+- 上一里程碑：**M7 完成**（M7-1~M7-6 + Part C 全部完成；四条真实 LLM 端到端验证 V1–V4 已全跑，工作区 `m7verify/`、`m7verify-nolock/` 已 gitignore）
+- 代码状态：**6,241 行源码 / 24 模块 / 330 测试全绿**
+  - 口径：源码 = `agent/` + `app/` + `eval/` 里被 git 跟踪的 `.py` 行数（不含 `eval/repos/` 克隆仓）；模块数 = 其中非空的 `.py` 文件数
+- 验证中发现并修复的真 bug（M7 期间）：
   1. **judge 假阴性**：tinydb 的 `pytest.ini` 写死 `--cov*`，本机无 pytest-cov → pytest 以 usage error（退出码 4）退出，**测试一次没跑**，却被判成"没修好"，完成率被压成假的 0%。修法：`-o addopts=` + 把退出码 2/3/4/5 识别为无效判定（记入 error，不污染完成率）。修前 `0/2` → 修后 `1/2`
   2. **`--resume` 文档与实现不一致**：README/CLAUDE.md 写 `python -m app.cli --resume`，但 `task` 是必填位置参数 → 直接报 `Missing argument 'TASK'`。修法：`task` 改为可选 + 非 resume 时空任务报错
   3. **agent 不知道自己的工作目录**：system prompt 只说"只能在工作目录（沙箱）内操作"，却从没告诉它这个目录**是什么**。修法：system prompt 新增"工作目录"段，注入 `{workspace_root}` 与 `{platform}` 槽位；注入用逐个 `str.replace` 而非 `str.format`（自定义 prompt 含花括号会抛 KeyError）。
@@ -125,11 +157,15 @@
   - **M6-7 的真实模型验证已补跑**（2026-09-10，DeepSeek 官方 `deepseek-chat`）：修 bug 任务 **5 步**修好（10,112 token / 缓存命中 73%）；kill → `--resume` 恢复后**第 4 步直接 `edit(path=calc.py)`**，无重新探路、无磁盘遍历，续跑至 11 步完成（缓存命中 90%）。轨迹扫描「瞎猜路径」4 类模式（`/workspace`、`C:\Users\<字母>`、`dir C:\Users`、全盘搜索）**无命中**
   - CLI 流式输出这条**已真实可见**（事件随步实时打印）；system prompt 注入工作目录这条的收益**见上条第 3 点的更正口径**
   - ~~Streamlit 控制台没在浏览器里真开过~~ ✅ **已完成（2026-09-10）**：用真实 Chrome（CDP 驱动）打开 `http://localhost:8600`，**并操作控件跑通了一个 mock 任务**——勾 mock、输入任务、点"开始任务"，页面出现"事件日志（3 条）"[步1] glob → [步2] 0 工具调用、缓存命中率曲线、会话 `s20260910-194424`、检查点回放、"✅ 最终结论"与"终止原因 completed · 步骤 2"。**控制台在真实浏览器里可用，不只是 AppTest 能过**
-  - ~~真实 token 压力下的两级 compact 从未触发~~ ✅ **已完成（2026-09-10）**：`token_budget` 调小（生产 64,000）后用**真实 provider usage** 驱动，两级都真实触发：
+  - ~~真实 token 压力下的两级 compact 从未触发~~ ✅ **已完成（2026-09-10，当时流水线只有两级）**：`token_budget` 调小（生产 64,000）后用**真实 provider usage** 驱动，两级都真实触发：
     - `BUDGET=3400` → 步 9（77.0%，20 条消息）与步 11 **确定性 snip** 触发（消息 20→15、19→15），stale=`snip_compact`
     - `BUDGET=2600` → 步 9（100.7%）与步 11 **LLM 摘要 compact** 触发，stale=`llm_compact`（不是退化成 snip）
     - compact 之后的步 10、11 LLM 调用均成功 → 压出来的消息序列合法（没有孤儿 tool 消息），否则 API 会 400
     - **顺带挖出一个真约束**：光有 token 压力不够。`_find_cut` 要求 `len(messages) - keep_recent > min_keep`（即 **>18 条消息**）才可能存在合法切割点。实测步 8 时 util 已 72.9%（18 条消息）但 `cut=6` 不合法 → **不触发**；步 9 消息涨到 20 条才触发。这解释了为什么"上下文只到 10%"和"util 100% 也不触发"是两回事
+    > ⚠️ **M8 之后这组数字的口径要重测**：分级截断是**加在 snip 之前的第 0 级** ——
+    > 若它在同一预算下先把 utilization 压回 0.70 以下，snip 就不会触发。所以上面这组是
+    > **两级时代**的记录，三级时代是否复现由 P7 的缓存/触发 A/B 回答，**不能默认它仍然成立**。
+
   - **CLI 接权限引擎与 hooks**（2026-09-10 发现 → 同日修）：`app/cli.py` 构造 `QueryEngine` 时既没传 `permissions=` 也没传 `hooks=`，只有 `app/ui_streamlit.py` 接了。后果：README/CLAUDE.md 宣传的「危险命令拦截 + block-at-submit hook」在 **CLI 路径上不生效**（Streamlit 路径生效）。
     - **权限**：两处 `QueryEngine(...)`（正常分支 + `--resume` 分支）都传 `permissions=PermissionsEngine(workspace_root)`。**不传 `confirm`** → 引擎对危险命令给 `ask`，loop 在无确认交互时按安全默认拒绝——与接入前的行为一致，只是判定改由引擎统一做。
     - **hooks**：两个入口改为共用 `hooks.default_engine(workspace_root)`（一处构造，避免再次漂移）。**默认规则不变**：普通工具/命令仍 `allow`；`bash` 工具自身的危险命令兜底只在「无权限引擎」时生效，现在由引擎接管（行为仍是拒绝，文案变化）。
