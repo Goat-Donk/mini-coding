@@ -6,9 +6,12 @@
 
 求职作品集：**CodeAgent** —— 参考 [pengchengneo/Claude-Code](https://github.com/pengchengneo/Claude-Code) 源码架构，用 Python 从零实现的小型 AI Coding Agent（4,158 行 / 19 模块 / 184 测试）。核心循环手写（不套 Agent SDK），支撑层用成熟库（openai / pydantic / streamlit / typer / pytest）。差异化：cache-aware 上下文 + 缓存省钱指标、step 级检查点恢复、block-at-submit hooks、轨迹驱动评估（真实 tinydb 提交 + 隐藏测试）、记忆自进化、MCP 工具接入。
 
-**已验证状态**：真实 LLM 端到端跑通（修 bug 全流程、kill+`--resume` 续跑、eval 出真实报告 50% 1/2）。本机 `.env` 走 DashScope 的 OpenAI 兼容端点 + `deepseek-v4-flash`——因为 agentrouter 的 key 被客户端指纹锁死（非 Claude Code 客户端一律 401）。README「评估」章节有真实数字与口径说明。
+**已验证状态**：真实 LLM 端到端跑通（修 bug 全流程、kill+`--resume` 续跑、eval 出真实报告 50% 1/2）。README「评估」章节有真实数字与口径说明。
 
-> ⚠️ **2026-09-10 晚：DashScope 账号欠费**（所有模型返回 400 `Arrearage`），真实 LLM 暂时跑不了，只能用 `--mock`。已跑过的真实数字是当时实测、不作废，但**不能再复现**；要重跑真实任务需先给账号充值。
+> ⚠️ **真实跑分的通路说明（重要，别被历史记录误导）**：上面那批数字是当初临时借用 DashScope（阿里百炼）端点 + `deepseek-v4-flash` 跑出来的——当时是为了先验证通，属于**临时手段，不是项目选定的通路**。
+> 项目硬约束是「LLM 只用 DeepSeek 官方 API」（`https://api.deepseek.com` + `deepseek-chat`，见 `.env.example`），代码默认值也是这个。
+> 现在 `.env` 已改回官方通路，**`DEEPSEEK_API_KEY` 需要填官方 key 才能跑真实任务**（没有 key 时用 `--mock`）。拿到 key 后应重跑 `python -m eval.runner --limit 2`，把 README 里的数字换成官方口径。
+> 另：本机 agentrouter 的 key 用不了——它只放行 Claude Code 客户端，自写程序一律 `401 unauthorized client detected`（实测 6 种认证头组合 × 2 个端点全 401）。
 
 ## 硬约束（不可违反）
 
@@ -49,7 +52,7 @@ python -m eval.runner --limit 3              # 跑黄金任务出回归报告（
 streamlit run app/ui_streamlit.py            # 控制台（指标 + 权限按钮 + 检查点回放）
 ```
 
-> 本机跑真实任务前先 `export NO_PROXY="localhost,127.0.0.1,aliyuncs.com"` 并 unset `HTTPS_PROXY`（DashScope 是境内服务，走代理会绕远）。
+> 本机跑真实任务前先 `export NO_PROXY="localhost,127.0.0.1,api.deepseek.com"` 并 unset `HTTPS_PROXY`（DeepSeek 官方是境内服务，走代理会绕远）。
 > CLI 已支持**事件实时流式打印**（工具调用一发生就打，不用等任务结束）。
 
 ## 工程约定

@@ -223,11 +223,12 @@ python -m eval.runner --limit 2
 | `770486ff` | `1 failed, 32 passed` — `TypeError: unhashable type: 'dict'` 仍在 | 没修好 |
 | `e70f9b1d` | `109 passed` | 真修好了 |
 
-> **口径说明**：本轮用的是 **DashScope 的 OpenAI 兼容端点 + `deepseek-v4-flash`**（本机 agentrouter 的 key 被客户端指纹锁死，非 Claude Code 客户端一律 401）。缓存命中率因此是 **DashScope 的前缀缓存**口径，与 DeepSeek 官方 `prompt_cache_hit_tokens` 机制同类但数值不等价。换官方 `deepseek-chat` 重跑会得到不同数字 —— 请自行跑 `--limit N` 取属于你的报告。
+> **口径说明（必读）**：下面这组数字是当初为了**先验证端到端能通**，临时借用 **DashScope（阿里百炼）的 OpenAI 兼容端点 + `deepseek-v4-flash`** 跑出来的。
+> 这是**临时验证手段，不是本项目的选定通路**：项目硬约束是「LLM 只用 DeepSeek 官方 API」（`https://api.deepseek.com` + `deepseek-chat`，见 [`.env.example`](.env.example)，代码默认值同）。
+> 因此命中率是 DashScope 的**前缀缓存**口径，与 DeepSeek 官方 `prompt_cache_hit_tokens` 机制同类但数值不等价。
+> **填好自己的官方 key 后，请重跑 `python -m eval.runner --limit 2` 取属于你的报告**——完成率、token、成本都会不一样。
 >
-> ⚠️ **可复现性说明**：上面这组数字是 2026-09-10 白天**实测**的。同日晚该 DashScope 账号进入欠费状态（所有模型返回 400 `Arrearage`），
-> 因此**这批数字现在无法复现**，需要先给账号充值。数字本身不作废（当时确实跑出来了），但请把它当「历史实测」而不是「你拉下来就能复现的基准」。
-> 同样地，此后做的两处修复（CLI 流式输出、system prompt 注入工作目录）目前**只有 MockLLM + 单测覆盖，未用真实模型复跑** —— 充值后应补跑 `--limit 2` 确认步数与完成率的变化。
+> 另：本机 agentrouter 的 key 走不通（它只放行 Claude Code 客户端，自写程序一律 `401 unauthorized client detected`，实测 6 种认证头组合 × 2 个端点全部 401）。要接自己的程序，用官方 API key。
 
 **一个真实踩过的坑（已修 + 已加回归测试）**：tinydb 的 `pytest.ini` 写死了 `--cov-append --cov-report term --cov tinydb`，本机没装 pytest-cov 时 pytest 会以 **usage error（退出码 4）直接退出**——测试一次都没跑。而 judge 原本只看 `returncode == 0`，于是把它算成"agent 没修好"，完成率被压成假的 **0%**。修法：judge 用 `-o addopts=` 清掉仓库自带 addopts，并把退出码 2/3/4/5（压根没跑成）识别为**无效判定**计入 `error`，不再污染完成率。同一个 bug 修前修后：`0/2` → `1/2`。
 

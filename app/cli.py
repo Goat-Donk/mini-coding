@@ -79,8 +79,9 @@ def _build_llm(mock: bool) -> BaseLLM:
     load_dotenv()
     if not os.environ.get("DEEPSEEK_API_KEY"):
         typer.secho(
-            "未配置 DEEPSEEK_API_KEY。请复制 .env.example 为 .env 并填入，"
-            "或使用 --mock 无 key 演示。",
+            "未配置 DEEPSEEK_API_KEY。请在 .env 中填入（格式见 .env.example）——"
+            "官方 key 申请：https://platform.deepseek.com → API Keys。"
+            "或用 --mock 做无 key 演示。",
             fg=typer.colors.YELLOW,
         )
         raise typer.Exit(1)

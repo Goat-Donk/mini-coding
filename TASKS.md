@@ -67,6 +67,7 @@
   3. **agent 不知道自己的工作目录**（`--resume` 迷路的真根因）：system prompt 只说"只能在工作目录（沙箱）内操作"，却从没告诉它这个目录**是什么** → 模型猜 `/workspace`、`dir C:\Users\<编造的用户名>\`，遍历磁盘 15 步才找到真路径。`--resume` 只是把它放大（恢复的状态里模型已认定错误路径）。修法：system prompt 新增"工作目录"段，注入 `{workspace_root}` 与 `{platform}` 槽位；注入用逐个 `str.replace` 而非 `str.format`（自定义 prompt 含花括号会抛 KeyError）
   4. **CLI 跑完才一次性打印事件**：长任务中途零反馈。修法：`QueryEngine(on_event=...)` 实时回调 + `app/cli.py` 的 `EventPrinter`（**带锁** —— 只读工具并发执行时 `record_event` 会从多个工作线程回调，不加锁两行会交错）。顺带给 `Session.emit` 的 JSONL 写入加锁，让"append-only 不交错"成为真保证
 - 已知待改进（未修）：
-  - **真实 LLM 复跑被账号欠费阻断**（2026-09-10 晚：DashScope 所有模型 400 `Arrearage`）。M6-7 的两个修复目前只有 **MockLLM + 单测** 覆盖，**"步数是否下降 / `--resume` 是否不再迷路" 未用真实模型复跑过** —— 充值后必须补跑，别当已验证
+  - **真实跑分用的是临时通路，待换官方口径重跑**：README/M6-6 的数字来自当初临时借用的 DashScope（阿里百炼）端点 + `deepseek-v4-flash`（且用的是 vision MCP 那个 key，额度已跑光、现账号欠费）。项目选定通路是 DeepSeek 官方 API（`https://api.deepseek.com` + `deepseek-chat`，代码默认值即此，无需改代码）。`.env` 已改回官方，**填好官方 key 后必须重跑 `python -m eval.runner --limit 2` 换掉 README 里的数字**
+  - M6-7 的两处修复（CLI 流式输出、system prompt 注入工作目录）目前只有 **MockLLM + 单测**覆盖，**"步数是否下降 / `--resume` 是否不再迷路" 未用真实模型跑过** —— 拿到官方 key 后一并补跑
   - Streamlit 控制台只跑过 AppTest，没在浏览器里真开过
   - 真实 token 压力下的两级 compact 从未触发（实测上下文只到 10%）
