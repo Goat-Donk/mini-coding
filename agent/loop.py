@@ -351,6 +351,12 @@ class QueryEngine:
         result = tool.run(call.arguments, ctx)
 
         # 4) PostToolUse hooks（观察/提示，非阻断）
+        #    返回值必须拼进 output：这里原先丢弃了 hints，导致 PostToolUse 这一层
+        #    治理**从未到达模型**（hook 跑了，但它的观察结论没人看）。hints 是回喂给
+        #    模型的观察信息（如「测试通过 → marker 已写入，commit 已解锁」），
+        #    不改变 success —— 提示不是结论。
         if self.hooks is not None:
-            self.hooks.run_post(call.name, call.arguments, result, state)
+            hints = self.hooks.run_post(call.name, call.arguments, result, state)
+            if hints:
+                result.output = result.output + "\n" + "\n".join(hints)
         return result

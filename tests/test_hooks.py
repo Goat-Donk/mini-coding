@@ -88,6 +88,61 @@ def test_run_post_receives_result(tmp_path):
     assert seen["event"] == "PostToolUse"
 
 
+def test_loop_delivers_post_hook_hints_to_model(tmp_path):
+    """回归：post-hook 的返回值必须**真的到达模型**。
+
+    这里曾有一处静默失效 —— `_gate_and_run` 调了 `run_post` 但不看返回值，
+    于是 PostToolUse 这一层治理从未影响过模型：hook 跑了，结论没人看。
+    断言必须写成端到端（模型收到的 tool 消息里得有这句），因为只测
+    `HookEngine.run_post` 是测不出这个 bug 的 —— 它本来就返回得好好的。
+    """
+    seen: dict[str, list[str]] = {}
+
+    def post(ctx):
+        return "观察: 这是 post-hook 给出的提示"
+
+    def then_answer(messages, tools):
+        seen["tool_msgs"] = [m["content"] for m in messages if m.get("role") == "tool"]
+        return LLMResult(content="收到提示")
+
+    engine = make_engine(
+        tmp_path,
+        MockLLM.script(MockLLM.tool("glob", {"pattern": "**/*"}).responses[0], then_answer),
+        hooks=HookEngine(post_hooks=[post], workspace_root=tmp_path),
+    )
+    result = engine.run("看看目录")
+
+    assert result.terminated_reason == "completed"
+    assert seen["tool_msgs"], "模型这一轮应该收到 tool 消息"
+    assert any("这是 post-hook 给出的提示" in text for text in seen["tool_msgs"])
+    # 提示是**观察**不是结论：工具本身仍然算成功
+    calls = [e for e in result.events if e["type"] == "tool_call"]
+    assert calls[0]["success"] is True
+
+
+def test_loop_delivers_hints_on_failed_tool_too(tmp_path):
+    """工具失败时提示同样要到达 —— 恰恰是失败路径最需要观察信息。"""
+    seen: dict[str, list[str]] = {}
+
+    def post(ctx):
+        return "观察: 失败也要给提示"
+
+    def then_answer(messages, tools):
+        seen["tool_msgs"] = [m["content"] for m in messages if m.get("role") == "tool"]
+        return LLMResult(content="收到")
+
+    engine = make_engine(
+        tmp_path,
+        MockLLM.script(MockLLM.tool("read", {"path": "不存在.txt"}).responses[0], then_answer),
+        hooks=HookEngine(post_hooks=[post], workspace_root=tmp_path),
+    )
+    result = engine.run("读一个不存在的文件")
+
+    calls = [e for e in result.events if e["type"] == "tool_call"]
+    assert calls[0]["success"] is False
+    assert any("失败也要给提示" in text for text in seen["tool_msgs"])
+
+
 def test_loop_hook_blocks_commit(tmp_path):
     """git commit 被 hook 阻断 → 失败回喂模型（含 [hook 阻断]），agent 改道完成。"""
     seen = {}
