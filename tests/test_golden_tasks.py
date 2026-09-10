@@ -1,5 +1,13 @@
 """M5-1 tests: eval/golden_tasks.py（本地迷你 git 仓库离线验证，不联网）。"""
-from eval.golden_tasks import build_task, discover_fix_commits, git, judge, materialize, remove_worktree
+from eval.golden_tasks import (
+    JudgeResult,
+    build_task,
+    discover_fix_commits,
+    git,
+    judge,
+    materialize,
+    remove_worktree,
+)
 
 
 def test_discover_fix_commits(fixture_repo):
@@ -72,3 +80,40 @@ def test_materialize_isolates_worktree(tmp_path, fixture_repo):
         assert "return a + b\n" in (repo / "src" / "app.py").read_text(encoding="utf-8")
     finally:
         remove_worktree(repo, ws)
+
+
+def test_judge_ignores_repo_addopts(tmp_path, fixture_repo):
+    """目标仓库 pytest.ini 的 addopts 不能让判定失效（真实事故回归测试）。
+
+    tinydb 的 pytest.ini 写死 `--cov-append --cov-report term --cov tinydb`；本机没装
+    pytest-cov 时 pytest 会以 usage error（退出码 4）直接退出——测试一次都没跑，
+    却会被 judge 当成「agent 没修好」，把假阴性算进完成率。judge 必须用
+    `-o addopts=` 清掉仓库自带的 addopts。
+    """
+    repo, base, fix = fixture_repo
+    task = build_task(repo, discover_fix_commits(repo)[0])
+    ws = tmp_path / "ws"
+    materialize(task, ws, repo)
+    try:
+        # 模拟目标仓库带一个本机不存在的插件参数
+        (ws / "pytest.ini").write_text(
+            "[pytest]\naddopts=--no-such-plugin-flag\n", encoding="utf-8"
+        )
+        r = judge(task, ws)
+        assert r.executed is True     # 测试真的执行了
+        assert r.returncode == 1      # base 未修复 → 跑完并失败，而非 usage error 4
+        assert r.error is None
+    finally:
+        remove_worktree(repo, ws)
+
+
+def test_judge_result_flags_invalid_judgment():
+    """退出码 2/3/4/5 = 压根没跑成 → 必须报 error，不能算作「没修好」。"""
+    ok = JudgeResult(passed=False, returncode=1, summary="1 failed, 32 passed")
+    assert ok.executed is True
+    assert ok.error is None
+
+    for code in (2, 3, 4, 5):
+        bad = JudgeResult(passed=False, returncode=code, summary="ERROR: usage: ...")
+        assert bad.executed is False
+        assert bad.error is not None and str(code) in bad.error

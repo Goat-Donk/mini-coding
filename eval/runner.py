@@ -51,11 +51,12 @@ class TaskResult:
     error: str | None
     duration_s: float
     cost_cny: float
+    judge_summary: str | None = None   # judge 的 pytest 摘要（判定依据，可回溯）
 
     @property
     def summary_line(self) -> str:
         if self.error:
-            return f"  ✗ {self.task.id}  {self.task.title[:58]:<58}  [error] {self.error}"
+            return f"  ! {self.task.id}  {self.task.title[:58]:<58}  [无效判定] {self.error}"
         mark = "✓" if self.passed else "✗"
         stats = ""
         if self.run is not None:
@@ -105,9 +106,15 @@ def run_single(
     duration_s = time.perf_counter() - t0
 
     passed = False
+    judge_summary: str | None = None
     try:
         judged = judge(task, ws)
         passed = judged.passed
+        judge_summary = judged.summary
+        if judged.error is not None:
+            # 测试压根没跑成 → 这是「判定无效」，不是「agent 没修好」，
+            # 必须记成 error 而不是让它污染完成率（假阴性）
+            error = judged.error
     except Exception as exc:
         error = f"judge 失败: {exc}"
     finally:
@@ -124,7 +131,7 @@ def run_single(
     )
     return TaskResult(
         task=task, passed=passed, run=run, error=error,
-        duration_s=duration_s, cost_cny=cost,
+        duration_s=duration_s, cost_cny=cost, judge_summary=judge_summary,
     )
 
 
@@ -145,7 +152,9 @@ def run_eval(
     results = [run_single(t, repo_dir, ws_root=ws_root, mock=mock) for t in tasks]
 
     n = len(results)
+    invalid = sum(1 for r in results if r.error is not None)
     passed = sum(1 for r in results if r.passed)
+    scored = n - invalid                      # 真正被判定的任务数（排除无效判定）
     total_tokens = sum((r.run.usage.total_tokens if r.run else 0) for r in results)
     total_cost = sum(r.cost_cny for r in results)
     ratios = [
@@ -159,8 +168,10 @@ def run_eval(
         "mode": "mock" if mock else "deepseek",
         "repo": str(repo_dir),
         "tasks": n,
+        "judged": scored,
+        "invalid": invalid,
         "passed": passed,
-        "completion_rate": round(passed / n, 3) if n else 0.0,
+        "completion_rate": round(passed / scored, 3) if scored else None,
         "total_tokens": total_tokens,
         "total_cost_cny": round(total_cost, 4),
         "avg_cache_hit_ratio": avg_ratio,
@@ -170,6 +181,7 @@ def run_eval(
                 "title": r.task.title,
                 "passed": r.passed,
                 "error": r.error,
+                "judge_summary": r.judge_summary,
                 "duration_s": round(r.duration_s, 1),
                 "steps": r.run.steps if r.run else None,
                 "tokens": r.run.usage.total_tokens if r.run else None,
@@ -206,16 +218,21 @@ def main() -> None:
 
     print("\n逐任务结果：")
     for r in report["per_task"]:
+        if r["error"]:
+            print(f"  ! {r['id']}  {r['title'][:58]:<58}  [无效判定] {r['error']}")
+            continue
         mark = "✓" if r["passed"] else "✗"
-        err = f"  [error] {r['error']}" if r["error"] else ""
         print(
             f"  {mark} {r['id']}  {r['title'][:58]:<58}"
-            f" {r['steps']}步 {r['tokens']}t ¥{r['cost_cny']:.3f} {r['duration_s']}s{err}"
+            f" {r['steps']}步 {r['tokens']}t ¥{r['cost_cny']:.3f} {r['duration_s']}s"
         )
 
     print("\n== 汇总 ==")
+    rate = report["completion_rate"]
+    rate_str = f"{rate:.0%}" if rate is not None else "N/A（无有效判定）"
+    invalid_note = f" · 无效判定 {report['invalid']} 个（不计入完成率）" if report["invalid"] else ""
     print(
-        f"  完成率 {report['completion_rate']:.0%}（{report['passed']}/{report['tasks']}）"
+        f"  完成率 {rate_str}（{report['passed']}/{report['judged']} 个有效任务）{invalid_note}"
         f" · token {report['total_tokens']} · 估算成本 ¥{report['total_cost_cny']}"
         f" · 平均缓存命中率 "
         + (f"{report['avg_cache_hit_ratio']:.0%}" if report["avg_cache_hit_ratio"] is not None else "N/A")

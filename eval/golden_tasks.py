@@ -168,11 +168,29 @@ def remove_worktree(repo_dir: Path, target_dir: Path) -> None:
     git(repo_dir, "worktree", "remove", "--force", str(Path(target_dir).resolve()))
 
 
+# pytest 退出码语义：0=全部通过、1=有用例失败 —— 两者都说明测试真的跑完了；
+# 2=被中断、3=内部错误、4=用法错误、5=没收集到用例 —— 这几种是「压根没跑成」，
+# 判定无效，绝不能当成「agent 没修好」记入完成率。
+_PYTEST_EXECUTED = (0, 1)
+
+
 @dataclass
 class JudgeResult:
     passed: bool
     returncode: int
     summary: str                      # pytest 输出摘要（诚实展示，不造假）
+
+    @property
+    def executed(self) -> bool:
+        """测试是否真的执行了。False 表示这次判定无效（不是 agent 的锅）。"""
+        return self.returncode in _PYTEST_EXECUTED
+
+    @property
+    def error(self) -> str | None:
+        """判定无效时给出原因，供 runner 记入报告 error 字段。"""
+        if self.executed:
+            return None
+        return f"judge 未能执行测试（pytest 退出码 {self.returncode}）: {self.summary}"
 
 
 def judge(task: GoldenTask, workspace: Path) -> JudgeResult:
@@ -188,7 +206,10 @@ def judge(task: GoldenTask, workspace: Path) -> JudgeResult:
         p.write_text(content, encoding="utf-8")
 
     proc = subprocess.run(
-        ["python", "-m", "pytest", *task.test_files, "-q", "--no-header"],
+        # -o addopts= 清掉目标仓库 pytest.ini 自带的 addopts：tinydb 写死了
+        # `--cov-append --cov-report --cov tinydb`，本机没装 pytest-cov 时 pytest 会
+        # 以 usage error（退出码 4）直接退出——测试一次都没跑，却会被误判成「没修好」。
+        ["python", "-m", "pytest", *task.test_files, "-q", "--no-header", "-o", "addopts="],
         cwd=workspace, capture_output=True, text=True,
     )
     out = (proc.stdout or "") + (proc.stderr or "")
