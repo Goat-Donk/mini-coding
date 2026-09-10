@@ -48,7 +48,7 @@
 
 - [x] M6-1 README 完善（mermaid 架构图）+ docs/architecture.md（逐层对应 CC 源码）
 - [x] M6-2 docs/interview_guide.md（面试讲解稿）
-- [x] M6-3 MCP 客户端接入一个标准 MCP server
+- [x] M6-3 MCP 客户端接入一个标准 MCP server（**2026-09-10 升级为接真实第三方 server**：modelcontextprotocol 官方 `mcp-server-time`，见下方验证记录）
 - [x] M6-4 录制演示视频（修 bug → 加功能 → 杀进程恢复 → 跨会话记忆）
 - [x] M6-5 收尾：CLAUDE.md 精简为 Lean 约定版 + 最终 commit/push
 - [x] M6-6 真实 LLM 端到端验证（接真实 key 跑通全流程；修掉验证中暴露的真 bug：judge 假阴性、`--resume` 文档与实现不一致）
@@ -72,9 +72,19 @@
      → 因此这次改动应如实定性为**防御性健壮性改进**：它消除了"模型不知道工作目录"这个不确定性（并让绝对路径一定写对），但**没有实测到步数下降**。commit `943939f` 的 message 里"修 `--resume` 迷路的真根因"属过度声称，以此条为准。
   4. **`pwd` 在 Windows 上返回无效路径**（本次 A/B 顺带挖出的真问题）：本机 `pwd` 被 Git for Windows 的 `D:\Git\usr\bin\pwd.exe` 抢占 → 返回 MSYS 风格 POSIX 路径 `/d/RAG项目/...`，**在 Windows 上不是合法路径**；`cd`（不带参数）返回的才是 `D:\RAG项目\...`。B 组就是这么写错的。修法：platform hint 里明确"确认当前目录用 `cd`，不要用 `pwd`"
   5. **CLI 跑完才一次性打印事件**：长任务中途零反馈。修法：`QueryEngine(on_event=...)` 实时回调 + `app/cli.py` 的 `EventPrinter`（**带锁** —— 只读工具并发执行时 `record_event` 会从多个工作线程回调，不加锁两行会交错）。顺带给 `Session.emit` 的 JSONL 写入加锁，让"append-only 不交错"成为真保证
+  6. **默认端口 8501 在本机起不来**（2026-09-10 挖出）：`streamlit run` 默认 8501，但本机 Windows 保留了 `8457-8556` 端口段（`netsh interface ipv4 show excludedportrange protocol=tcp`）→ 绑定报 `WinError 10013`（权限不允许），日志只说 "Port 8501 is not available"。**这大概就是控制台一直没在浏览器里真开过的原因。** 绕法：`--server.port 8600`（不在任何保留段内）。README 的快速开始已加此提示。
+  7. **MCP 只用自建假 server 验过**（2026-09-10 补验）：原来只有 `tests/fake_mcp_server.py`。现改用 **modelcontextprotocol 官方 `mcp-server-time`**（PyPI `mcp-server-time 2026.8.18`，`python -m mcp_server_time`）真实跑通三段：
+     - **协议层**：握手成功（serverInfo `mcp-time`，协议版本 `2025-06-18` 与客户端声明一致）→ `tools/list` 拿到 2 个工具（`get_current_time` / `convert_time`，均声明 `readOnlyHint=True`）→ `tools/call` 返回真实时间
+     - **端到端**：`python -m app.cli --mcp <config> --step 8 "用 MCP 工具查上海时间并写进 shanghai_time.txt"` → 步 1 直接调 `get_current_time`，步 2 写文件、步 3 回读确认，4 步 `completed`
+     - **门禁链（最关键）**：三组对照证明确实**不是绕过治理的后门** —— A 组（无权限无 hook）**放行**；B 组（`{"tools": {"get_current_time": "deny"}}`）被**权限拒绝**；C 组（PreToolUse hook 阻断）被 **hook 拦下**。附带收获：B/C 两组里模型如实回答"没能拿到时间，也不会凭空编"，没有编造时间
 - 已知待改进（未修）：
   - ~~**真实跑分用的是临时通路，待换官方口径重跑**~~ ✅ **已完成（2026-09-10）**：用 DeepSeek 官方 `deepseek-chat` 重跑 `python -m eval.runner --limit 2` → 完成率 50%（1/2）、62,812 token、¥0.0625、缓存命中 83%；README 的跑分与缓存曲线已全部换成官方口径（曲线为真·冷启动：step1 0% → 累计 77%）。历史 DashScope 数字只作为口径说明里的对照保留，并注明不可直接比。
   - **M6-7 的真实模型验证已补跑**（2026-09-10，DeepSeek 官方 `deepseek-chat`）：修 bug 任务 **5 步**修好（10,112 token / 缓存命中 73%）；kill → `--resume` 恢复后**第 4 步直接 `edit(path=calc.py)`**，无重新探路、无磁盘遍历，续跑至 11 步完成（缓存命中 90%）。轨迹扫描「瞎猜路径」4 类模式（`/workspace`、`C:\Users\<字母>`、`dir C:\Users`、全盘搜索）**无命中**
   - CLI 流式输出这条**已真实可见**（事件随步实时打印）；system prompt 注入工作目录这条的收益**见上条第 3 点的更正口径**
-  - Streamlit 控制台只跑过 AppTest，没在浏览器里真开过
-  - 真实 token 压力下的两级 compact 从未触发（实测上下文只到 10%）
+  - ~~Streamlit 控制台没在浏览器里真开过~~ ✅ **已完成（2026-09-10）**：用真实 Chrome（CDP 驱动）打开 `http://localhost:8600`，**并操作控件跑通了一个 mock 任务**——勾 mock、输入任务、点"开始任务"，页面出现"事件日志（3 条）"[步1] glob → [步2] 0 工具调用、缓存命中率曲线、会话 `s20260910-194424`、检查点回放、"✅ 最终结论"与"终止原因 completed · 步骤 2"。**控制台在真实浏览器里可用，不只是 AppTest 能过**
+  - ~~真实 token 压力下的两级 compact 从未触发~~ ✅ **已完成（2026-09-10）**：`token_budget` 调小（生产 64,000）后用**真实 provider usage** 驱动，两级都真实触发：
+    - `BUDGET=3400` → 步 9（77.0%，20 条消息）与步 11 **确定性 snip** 触发（消息 20→15、19→15），stale=`snip_compact`
+    - `BUDGET=2600` → 步 9（100.7%）与步 11 **LLM 摘要 compact** 触发，stale=`llm_compact`（不是退化成 snip）
+    - compact 之后的步 10、11 LLM 调用均成功 → 压出来的消息序列合法（没有孤儿 tool 消息），否则 API 会 400
+    - **顺带挖出一个真约束**：光有 token 压力不够。`_find_cut` 要求 `len(messages) - keep_recent > min_keep`（即 **>18 条消息**）才可能存在合法切割点。实测步 8 时 util 已 72.9%（18 条消息）但 `cut=6` 不合法 → **不触发**；步 9 消息涨到 20 条才触发。这解释了为什么"上下文只到 10%"和"util 100% 也不触发"是两回事
+  - **CLI 没有接权限引擎与 hooks**（2026-09-10 发现，**未修**）：`app/cli.py` 构造 `QueryEngine` 时既没传 `permissions=` 也没传 `hooks=`，只有 `app/ui_streamlit.py` 接了。后果：README/CLAUDE.md 宣传的「危险命令拦截 + block-at-submit hook」在 **CLI 路径上不生效**（Streamlit 路径生效）。沙箱本身没漏——`files.py` 每个路径都 `_resolve` 校验、`bash.py` 的 cwd 校验无条件生效、危险命令在无权限引擎时由工具自身兜底拒绝——**漏的是规则引擎（allow/deny/ask）与 hooks 这两层**。默认规则是"一律 allow（只 deny 路径越界、asks 危险命令）"，所以接进去不会改变正常流程，但 hooks 默认接入会改变行为，需用户决定

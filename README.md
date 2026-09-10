@@ -151,6 +151,11 @@ python -m app.cli --mock "读 README 并总结项目结构"
 streamlit run app/ui_streamlit.py        # 控制台，勾选「Mock 演示」
 ```
 
+> ⚠️ **Windows 上 Streamlit 默认端口可能起不来**：默认 8501 常落在系统保留端口段里
+> （本机是 `8457-8556`，`netsh interface ipv4 show excludedportrange protocol=tcp` 可查），
+> 表现为日志只说 `Port 8501 is not available`、实际是 `WinError 10013 权限不允许`。
+> 换个不在保留段的端口即可：`streamlit run app/ui_streamlit.py --server.port 8600`。
+
 **接真实 DeepSeek**：
 
 ```bash
