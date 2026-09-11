@@ -31,6 +31,11 @@ from agent.state import AgentState
 # 每加一项都意味着「这个字段跨会话会丢」，需要有理由。
 _SKIP_FIELDS = frozenset({"emitter"})
 
+# 检查点节拍的缺省值。放在模块级是因为它有两个读者：新会话的构造、以及
+# `from_checkpoint` 读到**没有记节拍的老检查点**时的回落。两边写在两个地方，
+# 就会出现"新会话每 5 步、老会话恢复成别的数"这种没人能一眼看出的不一致。
+DEFAULT_CHECKPOINT_EVERY = 5
+
 # 需要反序列化回类型的字段（JSON 里是 dict，dataclass 要的是对象）。
 # 其余字段按 JSON 原样传回 `AgentState(**raw)`。
 _FIELD_DECODERS: dict[str, object] = {
@@ -134,13 +139,29 @@ def load_state(payload: dict, session_id: str) -> AgentState:
     return AgentState(session_id=session_id, **raw)
 
 
+def _stored_cadence(payload: dict) -> int | None:
+    """从检查点 payload 里读会话当初的检查点节拍；没有/不可用 → None。
+
+    读不出来时返回 None 而**不是**某个默认值：调用方才是决定"回落成什么"的地方，
+    这里替它决定会让 `DEFAULT_CHECKPOINT_EVERY` 的改动只生效一半。
+
+    非法值（0 / 负数 / 非整数 —— 比如检查点被手改过）同样返回 None 走回落，
+    而不是夹到 1：夹成 1 意味着"每步都写"，对一个已经损坏的检查点做出比正常
+    默认更激进的行为，是错的方向。
+    """
+    value = payload.get("checkpoint_every")
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 1:
+        return value
+    return None
+
+
 class Session:
     def __init__(
         self,
         workspace_root: Path,
         session_id: str,
         *,
-        checkpoint_every: int = 5,
+        checkpoint_every: int = DEFAULT_CHECKPOINT_EVERY,
         on_event=None,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve()
@@ -193,6 +214,13 @@ class Session:
             "session_id": self.session_id,
             "step": state.step,
             "ts": time.time(),
+            # 节拍**必须跟着会话落盘**，否则 `--resume` 只能靠"没传就用 5"这个
+            # 隐式回落 —— 而 5 只是 CLI 的默认值，不是这个会话的事实。会话当初
+            # 是 `--checkpoint-every 1` 起的，恢复后却按 5 走，用户没有任何办法
+            # 看出这件事（命令成功、输出正常、退出码 0，唯一证据是检查点数不涨）。
+            # 放在 payload 顶层而不是 state 里：它是**会话配置**，不是 AgentState
+            # 的字段（state 会被 `load_state` 整个喂给 `AgentState(**raw)`）。
+            "checkpoint_every": self.checkpoint_every,
             "state": dump_state(state),   # 全字段快照（见模块 docstring）
         }
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -213,15 +241,35 @@ class Session:
         session_id: str,
         *,
         step: int | None = None,
-        checkpoint_every: int = 5,
+        checkpoint_every: int | None = None,
     ) -> tuple["Session", AgentState]:
         """从检查点恢复；step=None → 该 session 最近一个检查点。
 
         返回 (Session, AgentState)；AgentState 直接传给
         QueryEngine.run_from(state) 继续执行。
+
+        `checkpoint_every=None` = **沿用这个会话当初的节拍**（从被恢复的那个
+        检查点里读），而不是回落 CLI 的默认值。优先级：**显式传参 > 会话里记的
+        > `DEFAULT_CHECKPOINT_EVERY`**（最后一条只对本次改动之前写下的老检查点
+        生效 —— 它们没有这个字段）。
+
+        为什么值得单独一档：节拍是**这个会话事实的一部分**。用 `--checkpoint-every 1`
+        起的会话崩在半路，恢复时按 5 走，代价是丢一整段工作（真跑现场：kill 在
+        step 5，续跑到 step 9，检查点数还是 5）。而且它是**哑的**：命令成功、
+        退出码 0，唯一证据是检查点数没涨。
         """
-        session = cls(workspace_root, session_id, checkpoint_every=checkpoint_every)
+        session = cls(
+            workspace_root, session_id,
+            # 显式传了就用它；没传先按默认构造，下面读到会话里记的再改
+            checkpoint_every=(
+                DEFAULT_CHECKPOINT_EVERY if checkpoint_every is None else checkpoint_every
+            ),
+        )
         payload = session._load_payload(step)
+        if checkpoint_every is None:
+            stored = _stored_cadence(payload)
+            if stored is not None:
+                session.checkpoint_every = stored
         return session, load_state(payload, session_id)
 
     def _load_payload(self, step: int | None) -> dict:

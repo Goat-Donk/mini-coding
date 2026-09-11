@@ -5,7 +5,12 @@ from pathlib import Path
 from agent.llm import MockLLM
 from agent.loop import QueryEngine
 from agent.state import AgentState
-from agent.session import Session, latest_session, state_dict
+from agent.session import (
+    DEFAULT_CHECKPOINT_EVERY,
+    Session,
+    latest_session,
+    state_dict,
+)
 from agent.tools.base import ToolRegistry
 
 
@@ -101,6 +106,99 @@ def test_resume_latest_checkpoint_when_step_none(tmp_path):
     engine.run("任务")
     _, restored = Session.from_checkpoint(tmp_path, "r2")  # step=None → 最近
     assert restored.step == 3
+
+
+def test_checkpoint_records_the_cadence(tmp_path):
+    """节拍是**会话的事实**，要跟着检查点落盘。
+
+    不落盘的话，`--resume` 只能靠"没传就用 5"这个隐式回落 —— 而 5 是 CLI 的
+    默认值，不是这个会话的事实。会话当初按 1 步一存起的，恢复后按 5 走，
+    唯一的证据是检查点数不涨：命令成功、输出正常、退出码 0。
+    """
+    session = Session(tmp_path, "cad1", checkpoint_every=3)
+    engine = make_engine(
+        tmp_path,
+        MockLLM.script(*tool_rounds(3), MockLLM.text("完成").responses[0]),
+        session=session,
+    )
+    engine.run("任务")
+    cp = json.loads(
+        (tmp_path / "data" / "checkpoints" / "cad1" / "step-3.json").read_text(encoding="utf-8")
+    )
+    assert cp["checkpoint_every"] == 3
+    # 放在 payload 顶层而不是 state 里：它不该被 `AgentState(**raw)` 吃到
+    assert "checkpoint_every" not in state_dict(cp)
+
+
+def test_resume_inherits_the_session_cadence(tmp_path):
+    """不传 `checkpoint_every` 时，`--resume` 沿用**该会话当初的**节拍，不回落 5。
+
+    这是本次修的第二半：前半是"传了不生效"（见 test_cli 的
+    test_resume_honors_checkpoint_every），后半是"不传就用 CLI 默认值"——
+    后半同样是错的，而且更难发现，因为 5 凑巧也是个合法节拍。
+    """
+    session = Session(tmp_path, "cad2", checkpoint_every=1)
+    engine = make_engine(
+        tmp_path,
+        MockLLM.script(*tool_rounds(2), MockLLM.text("完成").responses[0]),
+        session=session,
+    )
+    engine.run("任务")
+    assert session.list_checkpoints() == [1, 2]
+
+    resumed, _ = Session.from_checkpoint(tmp_path, "cad2")   # 不传节拍
+    assert resumed.checkpoint_every == 1, "没沿用它当初的 1，而是回落成了默认值"
+
+    # 显式传参仍然优先（否则等于节拍再也改不了）
+    overridden, _ = Session.from_checkpoint(tmp_path, "cad2", checkpoint_every=7)
+    assert overridden.checkpoint_every == 7
+
+
+def test_resume_falls_back_for_legacy_checkpoints(tmp_path):
+    """本次改动之前写下的检查点没有这个字段 → 回落 `DEFAULT_CHECKPOINT_EVERY`。
+
+    必须单独钉：老检查点在磁盘上是**真实存在**的（M1–M8 跑出来的全都没有这个
+    字段），读到 None 时如果直接把 None 塞给构造器，`max(1, None)` 会当场抛
+    `TypeError` —— 那不是"兼容旧格式"，是"旧会话再也恢复不了"。
+    """
+    session = Session(tmp_path, "cad3", checkpoint_every=1)
+    engine = make_engine(
+        tmp_path,
+        MockLLM.script(*tool_rounds(1), MockLLM.text("完成").responses[0]),
+        session=session,
+    )
+    engine.run("任务")
+
+    path = tmp_path / "data" / "checkpoints" / "cad3" / "step-1.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload.pop("checkpoint_every", None)   # 伪装成 M8 之前的检查点
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    resumed, _ = Session.from_checkpoint(tmp_path, "cad3")
+    assert resumed.checkpoint_every == DEFAULT_CHECKPOINT_EVERY
+
+
+def test_resume_ignores_a_corrupt_cadence(tmp_path):
+    """检查点被手改过（0 / 负数 / 字符串）→ 回落默认，而不是夹成"每步都写"。
+
+    夹成 1 是错的方向：对一个已经损坏的检查点做出比默认更激进的行为
+    （每步一个检查点文件），会把磁盘写满。
+    """
+    session = Session(tmp_path, "cad4", checkpoint_every=1)
+    engine = make_engine(
+        tmp_path,
+        MockLLM.script(*tool_rounds(1), MockLLM.text("完成").responses[0]),
+        session=session,
+    )
+    engine.run("任务")
+
+    path = tmp_path / "data" / "checkpoints" / "cad4" / "step-1.json"
+    for bad in (0, -3, "3", True):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["checkpoint_every"] = bad
+        path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        resumed, _ = Session.from_checkpoint(tmp_path, "cad4")
+        assert resumed.checkpoint_every == DEFAULT_CHECKPOINT_EVERY, f"{bad!r} 没被挡住"
 
 
 def test_latest_session_by_mtime(tmp_path):

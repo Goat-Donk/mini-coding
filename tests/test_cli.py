@@ -508,6 +508,46 @@ def test_resume_honors_checkpoint_every(tmp_path, monkeypatch):
 
     "静默"是这条最值得钉的地方：命令跑成功了、输出正常、退出码 0，
     唯一的证据是检查点数没涨。
+
+    **第一段刻意用 2 而不是 1**：会话自己会记住节拍（见
+    `test_resume_without_the_flag_inherits_the_session_cadence`），如果第一段也用 1，
+    那么"显式传参没被转发"会**因为沿用了会话里那个同样是 1 的值**而假装通过 ——
+    测试绿了，但它测的是另一条路。用 2 起步、显式传 1，两条路才分得开。
+    """
+    for letter in "abcdefgh":
+        (tmp_path / f"{letter}.txt").write_text(f"{letter}\n", encoding="utf-8")
+
+    first = _invoke(
+        tmp_path, monkeypatch,
+        MockLLM.script(*_distinct_reads(0, 2), LLMResult(content="第一段结束")),
+        extra_args=("--checkpoint-every", "2"),
+    )
+    assert first.exit_code == 0, first.output
+
+    from agent.session import Session, latest_session
+
+    sid = latest_session(tmp_path)
+    assert Session(tmp_path, sid).list_checkpoints() == [2]
+
+    # 显式传 1：**必须压过会话里记的 2**
+    second = _invoke(
+        tmp_path, monkeypatch,
+        MockLLM.script(*_distinct_reads(2, 3), LLMResult(content="续跑结束")),
+        extra_args=("--resume", "--checkpoint-every", "1"),
+    )
+    assert second.exit_code == 0, second.output
+
+    # 续跑跑了 step 3/4/5 → 每步一存就是 [2,3,4,5]；
+    # 显式传参被丢掉、沿用会话里的 2 的话只有 step 4 → [2,4]
+    assert Session(tmp_path, sid).list_checkpoints() == [2, 3, 4, 5]
+
+
+def test_resume_without_the_flag_inherits_the_session_cadence(tmp_path, monkeypatch):
+    """`--resume` **不带** `--checkpoint-every` 时，沿用该会话当初的节拍，而不是 CLI 的默认 5。
+
+    这是"节拍没有持久化在会话里"这个未定义行为的修复。原来的两半都是错的：
+    传了不生效（上一条测试钉着），不传就回落 CLI 默认值 —— 后半更难发现，
+    因为 5 凑巧也是个合法节拍，命令成功、退出码 0，唯一证据是检查点数不涨。
     """
     for letter in "abcdefgh":
         (tmp_path / f"{letter}.txt").write_text(f"{letter}\n", encoding="utf-8")
@@ -524,16 +564,19 @@ def test_resume_honors_checkpoint_every(tmp_path, monkeypatch):
     sid = latest_session(tmp_path)
     assert Session(tmp_path, sid).list_checkpoints() == [1]
 
+    # **不带** --checkpoint-every 续跑
     second = _invoke(
         tmp_path, monkeypatch,
         MockLLM.script(*_distinct_reads(1, 3), LLMResult(content="续跑结束")),
-        extra_args=("--resume", "--checkpoint-every", "1"),
+        extra_args=("--resume",),
     )
     assert second.exit_code == 0, second.output
 
-    # 续跑跑了 step 2/3/4 → 每步一存就该是 [1,2,3,4]；
-    # 回落成 5 的话这一步都写不出来（原样 [1]）
+    # 沿用 1 → step 2/3/4 各存一个；回落成 5 则一个都写不出来（原样 [1]）
     assert Session(tmp_path, sid).list_checkpoints() == [1, 2, 3, 4]
+    # 实际生效的节拍要**打出来** —— 这次改动唯一的可见性出口
+    assert "检查点节拍: 每 1 步" in second.output
+    assert "沿用该会话当初的设置" in second.output
 
 
 def test_resume_events_reach_the_trajectory(tmp_path, monkeypatch):

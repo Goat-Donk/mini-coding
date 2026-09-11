@@ -25,7 +25,12 @@ from agent.memory import MemoryManager
 from agent.security import TAINT_HIGH, TAINT_NONE
 from agent.skills import discover_skills
 from agent.permissions import PermissionsEngine
-from agent.session import Session, latest_session, new_session_id
+from agent.session import (
+    DEFAULT_CHECKPOINT_EVERY,
+    Session,
+    latest_session,
+    new_session_id,
+)
 from agent.state import user as user_message
 from agent.tools.ask import build_ask_tool
 from agent.tools.base import ToolRegistry
@@ -140,8 +145,9 @@ def run(
     step: int | None = typer.Option(
         None, "--step", help="--resume 时指定恢复步数（默认最近检查点）"
     ),
-    checkpoint_every: int = typer.Option(
-        5, "--checkpoint-every", help="每 N 步写一次检查点"
+    checkpoint_every: int | None = typer.Option(
+        None, "--checkpoint-every",
+        help="每 N 步写一次检查点；省略时新会话用 5、--resume 沿用该会话当初的值",
     ),
     mcp: Path | None = typer.Option(
         None, "--mcp", help="MCP 配置文件路径（如 .codeagent/mcp.json），加载后注册远端工具"
@@ -249,8 +255,19 @@ def run(
             # 结束时的检查点数**还是 5** —— 4 步工作全在内存里，再崩一次就整段丢。
             # 而"计划清单跨回合"恰恰是为这种场景准备的。修好后同一段跑出 [1..10]。
             # 回落的那条路也有测试钉着（tests/test_cli.py::test_resume_honors_checkpoint_every）。
+            #
+            # 现在再进一步：**没传**这个参数时不再回落 5，而是沿用该会话当初的节拍
+            # （`None` 就是这个意思，由 `from_checkpoint` 从检查点里读）。原来的行为
+            # 是"传了不生效 + 不传就用 CLI 的默认值"——后半句同样是错的：5 是 CLI 的
+            # 默认值，不是这个会话的事实。用户没法看出恢复后节拍变了，所以下面把
+            # **实际生效的节拍**打出来（这是这次改动里唯一的"可见性"出口）。
             session, restored = Session.from_checkpoint(
                 workspace_root, sid, step=step, checkpoint_every=checkpoint_every
+            )
+            typer.secho(
+                f"检查点节拍: 每 {session.checkpoint_every} 步"
+                + ("" if checkpoint_every is not None else "（沿用该会话当初的设置）"),
+                fg=typer.colors.BRIGHT_BLACK,
             )
             # 先接上事件出口，**再**记下面的 resume 事件。`record_event` 只在
             # `state.emitter` 非空时才写 JSONL，而 emitter 原先要等 `run_from` 才被
@@ -306,7 +323,13 @@ def run(
                 )
             result = engine.run_from(restored)
         else:
-            session = Session(workspace_root, new_session_id(), checkpoint_every=checkpoint_every)
+            session = Session(
+                workspace_root, new_session_id(),
+                # 新会话没有"当初的值"可沿用，省略就是 CLI 的默认节拍
+                checkpoint_every=(
+                    DEFAULT_CHECKPOINT_EVERY if checkpoint_every is None else checkpoint_every
+                ),
+            )
             engine = QueryEngine(
                 llm, registry, workspace_root=workspace_root, context=context,
                 session=session, memory_blocks=memory_blocks, on_event=printer,
