@@ -21,6 +21,7 @@ import typer
 from dotenv import load_dotenv
 
 from agent.context import ContextManager
+from agent.goal import DEFAULT_GOAL_TURNS, GOAL_CHECK_TAIL_LINES, render_goal
 from agent.hooks import default_engine
 from agent.llm import BaseLLM, DeepSeekClient, LLMResult, MockLLM, ToolCall
 from agent.loop import QueryEngine
@@ -43,6 +44,7 @@ from agent.session import (
 from agent.state import user as user_message
 from agent.tools.ask import build_ask_tool
 from agent.tools.base import ToolRegistry
+from agent.tools.goal import build_goal_tools
 from agent.tools.plan import render_plan
 from agent.tools.skills import build_skill_tools
 from agent.tools.subagent import SubagentTool
@@ -70,10 +72,32 @@ class EventPrinter:
                 f"  [{event.get('step')}] … 模型返回空响应，"
                 f"重试 {event.get('attempt')}/{event.get('limit')}"
             )
+        elif etype == "goal_check":
+            # 完成检查必须**实时可见**：它是人给的判据在跑，而这条命令的退出码
+            # 决定了整个目标算不算完成。藏在最终报告里等于让人事后才发现
+            # 「原来它跑的是那条命令」。
+            line = self._format_goal_check(event)
+        elif etype == "goal_completed":
+            line = f"  [{event.get('step')}] ★ 目标完成（完成检查通过）"
         else:
             return  # llm_call 等事件太吵，不逐条打印（轨迹 JSONL 里都有）
         with self._lock:
             typer.echo(line)
+
+    def _format_goal_check(self, event: dict) -> str:
+        verdict = event.get("verdict")
+        mark = {"passed": "✓", "failed": "✗", "invalid": "!"}.get(verdict, "?")
+        line = (
+            f"  [{event.get('step')}] {mark} 完成检查 {verdict}: "
+            f"{str(event.get('command'))[:60]} [{event.get('duration_ms')}ms]"
+        )
+        if verdict != "passed":
+            line += f" [exit code: {event.get('exit_code')}]"
+        if verdict == "invalid":
+            # 判定无效是**最容易被忽略**的一态（它既不报错也不失败）——
+            # 原因必须跟着打出来，否则人只会看到一行莫名其妙的 "!"
+            line += f"\n      {str(event.get('reason'))[:200]}"
+        return line
 
     def _format_tool_call(self, event: dict) -> str:
         self.tool_calls += 1
@@ -344,6 +368,11 @@ def _build_runtime(
     # 完成率被一个"没人在那儿"的机制拉低，而且是静默的（judge 只跑测试）。
     # 与 SubagentTool 一样按入口注册（构造点见 build_ask_tool）。
     registry.register(build_ask_tool())
+    # M9-6 目标：**同样刻意不进 `default()`** —— eval 用的正是 default()，而
+    # headless 里没有任何入口能创建目标（`/goal` 是 REPL 的命令），模型会拿到
+    # 一个永远失败的诱饵。理由与 ask_user 完全同构。
+    for goal_tool in build_goal_tools():
+        registry.register(goal_tool)
     # skills 渐进披露：索引进 system prompt（只 name+简介），正文由 load_skill 按需取。
     # 发现结果**只扫一次**，同时喂给工具与引擎 —— 两边各扫一次会让"索引里有的名字
     # load 不到"这种不一致有地方发生。无 skill 时不注册工具（不白送 schema 占 token）。
@@ -460,6 +489,69 @@ def _reinject_plan(state) -> None:
     typer.secho(f"计划恢复: {len(state.plan)} 条", fg=typer.colors.CYAN)
 
 
+def _reinject_goal(state) -> None:
+    """恢复会话时把目标**补投一次**（单发与 REPL 共用一处）。
+
+    补投的理由与 `_reinject_plan` 完全一样：目标很可能已经被 compact（snip /
+    摘要）裁掉了，那样模型就不知道自己在为什么干活。**只补一次、不每轮贴** ——
+    每轮贴等于把"目标有没有变"变成"消息有没有变"，一变就破坏 `_PREFIX_LEN`
+    之后的前缀缓存。
+
+    （目标**从不进 system prompt**：`system` 是 `messages[0]`、在 `_PREFIX_LEN`
+    保护区内，而且目标是会话中途创建的、注入就得回改第 0 条。可见性靠这里的
+    补投 + 创建那一刻的 kickoff 消息，本来就够。）
+    """
+    if state.goal is None:
+        return
+    state.messages.append(
+        user_message(
+            "（会话恢复：这是本会话正在推进的目标。完成判据由人给定，你无法修改，"
+            "运行时会在你声明完成后执行它。）\n" + render_goal(state.goal)
+        )
+    )
+    state.record_event("goal_resumed_in_context", status=state.goal.status)
+    typer.secho(f"目标恢复: {state.goal.objective}", fg=typer.colors.CYAN)
+
+
+def _print_goal(workspace_root: Path, session_id: str | None, step: int | None) -> None:
+    """打印某个会话的目标（`--goal`）。
+
+    与 `--plan` 完全同构，理由也一样：**没有这条出口，REPL 里设的目标在进程外
+    没有任何消费者**（本项目明确防这个 —— `--rename`/`--fork` 当初就是配着
+    `--sessions` 一起做的）。目标本身是检查点里的一个字段，读它就够了，
+    所以不需要 key、不建会话、不跑任务，因此排在 `_build_llm` 之前。
+    """
+    sid = _resolve_sid(workspace_root, session_id)
+    try:
+        _, state = Session.from_checkpoint(workspace_root, sid, step=step)
+    except FileNotFoundError as exc:
+        typer.secho(f"读不到检查点: {exc}", fg=typer.colors.YELLOW)
+        raise typer.Exit(1)
+    typer.secho(
+        f"会话 {_session_label(workspace_root, sid)} 的目标:",
+        fg=typer.colors.CYAN, bold=True,
+    )
+    if state.goal is None:
+        typer.echo("（该会话没有目标 —— 目标只能在 REPL 里用 /goal 设定）")
+        return
+    typer.echo(render_goal(state.goal))
+    # 输出**从事件里取**，不从 `goal.last_check` 取：事件是判定的权威记录、
+    # 本来就在检查点里（`state.events`），而 `last_check` 只是给 `/goal status`
+    # 用的摘要缓存。在 `last_check` 里再存一份输出就是同一个东西的第二份拷贝。
+    last = next(
+        (e for e in reversed(state.events) if e.get("type") == "goal_check"), None
+    )
+    if last and last.get("output_tail"):
+        # **判据与它的输出印在一起**：这是「空转的检查命令」（README S17）唯一
+        # 的缓解手段 —— 运行时只看退出码、不评价这条命令检查了什么，所以至少
+        # 要让人一眼看见它到底跑了什么、回了什么。
+        typer.secho(
+            f"最近一次判定输出（末尾 {GOAL_CHECK_TAIL_LINES} 行）:",
+            fg=typer.colors.BRIGHT_BLACK,
+        )
+        typer.echo(str(last["output_tail"]))
+
+
 def _extract_learned(runtime: _Runtime, events: list[dict], taint: str, *,
                      terminated_reason: str | None = None) -> None:
     """任务后提炼仓库约定（M4-1；单发与 REPL 共用一处）。
@@ -524,6 +616,10 @@ def run(
         False, "--plan",
         help="只打印最近会话的**任务计划清单**后退出（agent 自己排的，不是 TASKS.md）",
     ),
+    goal: bool = typer.Option(
+        False, "--goal",
+        help="只打印最近会话的**目标**（含最近一次完成检查的判定与输出）后退出",
+    ),
     session_id: str | None = typer.Option(
         None, "--session-id",
         help="会话 id **或名字**（--resume/--fork/--rename/--plan 时指定；默认取最近会话）",
@@ -560,6 +656,10 @@ def run(
         False, "--repl",
         help="常驻交互模式：进提示符，一行一个回合（可带任务作为第一回合）",
     ),
+    goal_turns: int = typer.Option(
+        DEFAULT_GOAL_TURNS, "--goal-turns",
+        help="REPL 里目标**一拍**自动推进最多几个回合（上限 3×25 步，防止把人锁在提示符外）",
+    ),
 ):
     """在 workspace 内执行一个任务（或从检查点续跑、分叉、改名、列会话）。"""
     workspace_root = _default_workspace()
@@ -572,6 +672,12 @@ def run(
     if plan:
         # 放在"任务不能为空"检查之前：--plan 本来就不带任务
         _print_plan(workspace_root, session_id, step)
+        raise typer.Exit()
+    if goal:
+        # 与 --plan 同类：读检查点里的一个字段就该够，所以不需要 key、不建会话、
+        # 不跑任务 —— 因此它排在 `_build_llm` 之前（测试用"一调用就炸"的
+        # `_build_llm` 替身钉住这条）。
+        _print_goal(workspace_root, session_id, step)
         raise typer.Exit()
     if rename is not None and not fork:
         # 只改名：不跑任务。`--fork` 一起给时改名的是**分叉出来的那个**，
@@ -627,6 +733,7 @@ def run(
                 step=step,
                 checkpoint_every=checkpoint_every,
                 clear_taint=clear_taint,
+                goal_turns=goal_turns,
             )
         finally:
             runtime.close()
@@ -700,6 +807,7 @@ def run(
                 # 用 user 角色 + 说明来源：计划是 agent 自己产出的，不加以说明地
                 # 当成"用户说的话"塞进去，模型会以为是人给的指令。
                 _reinject_plan(restored)
+            _reinject_goal(restored)
             if task.strip():
                 # 续跑指示：`--resume "..."` 曾经**静默丢掉**这个参数（run_from 用的是
                 # state.task），于是「拒绝文案让你 --clear-taint 复位后重试」这条动线

@@ -9,10 +9,13 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 from agent.llm import ToolCall, Usage
 from agent.security import TAINT_NONE, higher
+
+if TYPE_CHECKING:
+    from agent.goal import Goal
 
 
 # ---------- 消息构造器（OpenAI 格式） ----------
@@ -132,6 +135,12 @@ class AgentState:
     # 就是权威状态本身，不是从事件派生的值 —— 所以**没有** `derive_plan` 这类
     # 对应物（对比下面的 `taint`，那个是从事件重放的）。
     plan: list[dict] = field(default_factory=list)           # [{"text": str, "status": str}]
+
+    # M9-6 进程内目标（人用 `/goal` 创建，`agent/goal.py`）。与 plan 一样是
+    # **权威状态本身**、随检查点走，不是从事件派生的值。
+    # **绝不能**放进 `terminated_reason` —— 那个是**每回合一份**、由 `_run_loop`
+    # 入口复位（M9-5 修的正是这个），把跨回合的东西放进去等于重造那个 bug。
+    goal: Optional["Goal"] = None
 
     # M3 上下文记账：最近一次 llm.chat 的 usage（provider 锚点）；compact 后置 stale
     last_usage: Optional[Usage] = None

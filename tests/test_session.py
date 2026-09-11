@@ -275,6 +275,7 @@ def test_checkpoint_round_trips_every_state_field(tmp_path):
     """
     import dataclasses
 
+    from agent.goal import Goal
     from agent.llm import Usage
     from agent.state import AgentState
 
@@ -293,6 +294,20 @@ def test_checkpoint_round_trips_every_state_field(tmp_path):
         "last_usage": Usage(prompt_tokens=3, completion_tokens=4),
         "usage_stale_reason": "snip_compact",
         "taint": "high",
+        # 目标用**每个字段都非默认**的一份：漏了 `_FIELD_DECODERS` 的 `"goal"`
+        # 时它会以 `dict` 形态回来，`==` 立刻不等 —— 而那正是本项目最阴的一类
+        # 故障（dataclass 不查类型，直到有人读 `.status` 才炸，炸点还被
+        # `_run_loop` 的 except 吞成 terminated_reason="error"）。
+        "goal": Goal(
+            objective="让 tests/test_textstat.py 全绿",
+            check_command="python -m pytest tests/test_textstat.py -q",
+            status="paused",
+            pause_reason="等人工确认口径",
+            created_step=3,
+            turns=2,
+            declaration={"summary": "修好了", "evidence": ["pytest 绿"], "step": 9},
+            last_check={"verdict": "failed", "step": 9, "exit_code": 1, "reason": None},
+        ),
     }
     all_fields = {f.name for f in dataclasses.fields(AgentState)}
     assert set(values) | {"emitter"} == all_fields, (
@@ -310,6 +325,7 @@ def test_checkpoint_round_trips_every_state_field(tmp_path):
         assert getattr(restored, name) == values[name], name
     assert restored.emitter is None  # 回调不落盘（恢复后由入口重新接）
     assert isinstance(restored.usage, Usage)  # 类型也回来了，不只是 dict
+    assert isinstance(restored.goal, Goal)  # 同上：漏解码器时这里是个 dict
 
 
 def test_dump_state_names_the_unserializable_field():

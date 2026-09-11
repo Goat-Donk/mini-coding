@@ -4,7 +4,7 @@
 **核心循环手写**（不套 LangGraph / Agent SDK），支撑层用成熟库（openai SDK / pydantic v2 / streamlit / typer / pytest）。
 
 > **一句话**：把 Claude Code 的架构用 Python 重写一遍——不是移植代码，是移植设计。
-> 9,139 行源码 / 26 个模块 / 559 个测试。真实跑分见[评估章节](#评估eval)。
+> 10,113 行源码 / 28 个模块 / 597 个测试。真实跑分见[评估章节](#评估eval)。
 📄 文档：[技术方案 `docs/TECH_SPEC.md`](docs/TECH_SPEC.md) · [架构详解 `docs/architecture.md`](docs/architecture.md) · [任务清单 `TASKS.md`](TASKS.md) · [参考笔记 `docs/reference/`](docs/reference/)
 
 ---
@@ -18,7 +18,7 @@
 | **cache-aware 上下文布局** | 稳定前缀（system+task 固定不动）+ 三级 compact，让 DeepSeek 磁盘缓存持续命中；控制台实时画命中率与省钱曲线 | TOKEN_BUDGET / CONTEXT_COLLAPSE |
 | **step 级检查点 / 崩溃恢复** | 每 N 步原子落盘 state，`--resume` 从最近检查点**接着 step 计数**续跑；任务中途 kill 进程不丢进度。**节拍随会话落盘**：`--resume` 不带 `--checkpoint-every` 时沿用会话当初的值，并把生效值打出来 | `/resume` |
 | **step 级分叉 / 会话命名** | `--fork --step K` 从**任意一步**另开一条路（TS 原版的 fork 是**会话级**的，只能从"现在"复制）；`--rename` 给人看得懂的名字，`--sessions` 列出名字 / 步数 / 分叉来源。会话 id **或名字**都能用来 `--resume`。**是对话分叉不是工作区分叉**：文件不回滚到第 K 步，CLI 会明确打出来 | `/fork` · `/rename` · `/resume` |
-| **常驻交互模式（REPL）** | `--repl` 进提示符：**一行输入 = 一个回合**，整个进程共用一份 `messages`，上下文真的接得上（第二回合不重读源码就能接着改）。9 个斜杠命令（`/new` `/resume` `/fork` `/plan` `/sessions` `/rename` `/clear-taint` `/help` `/exit`）全部复用已有函数、零新机制。**多回合把四处「单发时看不见」的失效逼了出来**：`terminated_reason` 不复位、`allow_turn` 永不过期、skill 发现每回合重放、中断后 tool 结果配对残缺（详见下表） | `/resume` 后的连续会话 |
+| **常驻交互模式（REPL）** | `--repl` 进提示符：**一行输入 = 一个回合**，整个进程共用一份 `messages`，上下文真的接得上（第二回合不重读源码就能接着改）。10 个斜杠命令（`/new` `/resume` `/fork` `/plan` `/goal` `/sessions` `/rename` `/clear-taint` `/help` `/exit`）全部复用已有函数、零新机制。**多回合把四处「单发时看不见」的失效逼了出来**：`terminated_reason` 不复位、`allow_turn` 永不过期、skill 发现每回合重放、中断后 tool 结果配对残缺（详见下表） | `/resume` 后的连续会话 |
 | **block-at-submit hooks** | `PreToolUse` 包裹 `git commit`，`data/tests_pass.marker` 不存在就**阻断**——逼 agent 进入「测试并修复」循环；marker 只在**测试命令真跑成功**时由 `PostToolUse` 写入，失败即清除 | Hooks（block-at-submit） |
 | **真·轨迹驱动评估** | 从 tinydb 真实 git history 挖 bug 修复提交构造黄金任务，隐藏测试判分，出完成率/成本回归报告 | SWE-bench 思路 |
 | **分层记忆 + 自进化** | `CODEAGENT.md` / `CLAUDE.md` / `.codeagent/rules/*.md` 分层 + `@include` + hash 去重 + 预算；任务后提取约定写回，**下次会话自动生效** | CLAUDE.md 机制 |
@@ -31,6 +31,7 @@
 | **skills 渐进披露** | 工作区放 `SKILL.md`，**只有 name + 简介**进 system prompt，正文由 `load_skill` 按需取 —— 装 50 个 skill 也不额外占常驻 token | Skills（渐进披露） |
 | **改动前复核** | `Tool.preview()` 在**写盘之前**产出 diff 交给权限确认（`edit` / `write`），权限从「事后报告」变「事前审批」；`--review-edits` 打开交互确认。diff 与执行**共用同一份匹配语义**，不会出现「预览说能改、执行说不唯一」 | 权限确认带 diff（事前审批） |
 | **计划清单跨回合** | `update_plan` 写 `state.plan`，**随检查点落盘**：中途 kill 或换会话续跑都不丢；`--plan` 可无 key 直接查看。每次传**完整清单**（不是增量），状态只有一个写入者 | TodoWrite / 计划清单 |
+| **进程内目标 + 显式完成检查** | `--repl` 里 `/goal <目标> --check <命令>`：目标**跨回合自动推进**（一拍最多 N 回合），**判分权在人手里**——模型只能调 `declare_goal_done` **声明**完成，运行时随即跑**人预先给定的**那条命令，**退出码 0 才算完成**；非 0 把输出尾部回喂让它继续修。判定是**三态**（通过 / 未通过 / **判定无效**：命令压根没跑成的单独一档，对齐 eval 的 `JudgeResult.executed` 教训）。`/goal pause\|resume\|clear` + 人在提示符敲一行字 = 隐式暂停。检查走**同一条门禁链**（hooks / 权限 / 污染天花板一并生效） | `/goal` 命令族 · `goal/context.ts` |
 | **工具输出分级截断** | compact 流水线的**第 0 级**：按工具给不同预算先缩内容，缩不够才删消息；`grep`/`pytest` 的**结论在尾部**，所以是 head 70% + tail 30% 而不是只留头部；**失败结果给更大预算**（错误原文是模型自修复的依据）。**只在越过 warning 线时才跑**，低于阈值逐字节不碰（保住前缀缓存）| 上下文分级截断 |
 
 > ⚠️ 最后一行（分级截断）**实测收益比设计预期小**：端到端命中率没降，但单次截断要付 8.8 倍的 miss token，且免不掉下一级。**去留已拍板：保持现状**（理由与完整数据见 [分级截断的真实代价](#分级截断的真实代价端到端看不见微观对照看得见) 与 `TASKS.md` 的 P7-d）。
@@ -88,6 +89,7 @@ flowchart TB
 
     subgraph CORE["核心循环 agent/"]
         LOOP["loop.py · QueryEngine<br/>think → tool → observe → finish<br/>只读并发 / 写工具串行"]
+        GOAL["goal.py<br/>进程内目标状态机<br/>三态完成判定（人给的判据）"]
         LLM["llm.py<br/>DeepSeekClient · MockLLM<br/>usage + cache 采集"]
         STATE["state.py<br/>AgentState + OpenAI 消息构造"]
         CTX["context.py<br/>provider-usage-first 记账<br/>cache-aware 布局 + 三级 compact"]
@@ -113,6 +115,7 @@ flowchart TB
         SUB["subagent.py<br/>research 子代理（只读）"]
         ASK["ask.py<br/>ask_user 提问暂停"]
         PLAN["plan.py<br/>update_plan 计划清单"]
+        GTOOL["goal.py<br/>declare_goal_done 声明（非判定）"]
         SKT["skills.py<br/>load_skill 取正文"]
     end
 
@@ -125,6 +128,7 @@ flowchart TB
     REPL --> LOOP
     UI --> LOOP
     LOOP --> LLM
+    LOOP --> GOAL
     LOOP --> STATE
     LOOP --> CTX
     LOOP --> PERM
@@ -137,9 +141,11 @@ flowchart TB
     BASE --> SUB
     BASE --> ASK
     BASE --> PLAN
+    BASE --> GTOOL
     BASE --> SKT
     CTX --> TR
     MEM --> STATE
+    GOAL -. 人给的判据走同一条门禁链 .-> LOOP
     RUN --> GT
     RUN --> LOOP
     RP --> SESS
@@ -208,6 +214,7 @@ python -m app.cli --resume               # 从最近检查点续跑（配合 Ctr
 python -m app.cli --resume --clear-taint # 复位污染标记（误报被收紧时用它解锁）
 python -m app.cli --resume "补充的信息"   # 回答 agent 的提问后续跑（agent 调 ask_user 停下来时）
 python -m app.cli --plan                 # 只看最近会话的**任务计划清单**后退出（不需要 API key）
+python -m app.cli --goal                 # 只看最近会话的**目标**（目标 / 状态 / 完成判据 / 最近判定，不需要 API key）
 python -m app.cli --sessions             # 列出会话：名字 / 步数 / 分叉来源（不需要 API key）
 python -m app.cli --rename "基线方案"      # 给最近会话起名（只动元数据，不需要 API key）
 python -m app.cli --fork --step 3 "换个思路"   # 从第 3 步分叉出新会话并续跑（对话分叉，不动工作区文件）
@@ -221,9 +228,11 @@ python -m app.cli --mcp .codeagent/mcp.json "任务"   # 加载 MCP server（第
 python -m app.cli --repl                    # 进提示符
 python -m app.cli --repl "先跑一下测试"      # 带任务：它作为**第一个回合**跑掉再进提示符
 python -m app.cli --repl --resume --session-id <sid>   # 恢复后接着聊
+python -m app.cli --repl --goal-turns 5     # 目标自动推进一拍最多几个回合（默认 3）
 ```
 
-提示符是 `codeagent [会话名或 id · step 12 · high] › `（污染级别只在非 none 时显示）。
+提示符是 `codeagent [会话名或 id · step 12 · high] › `（污染级别只在非 none 时显示；有目标时另加一格
+`goal:active` / `goal:paused`，`done` 不显示——恒显一个值会让人不再看它）。
 行首的 `/` 一律当命令，**要把它当任务发出去就在行首加一个空格**；打错的命令只打印提示、
 **不会**发给模型（打错一个字母 = 一次真实的模型调用，而回答看起来还挺像回事）。
 
@@ -234,6 +243,7 @@ python -m app.cli --repl --resume --session-id <sid>   # 恢复后接着聊
 /resume        切到某个会话：id 或名字；省略 = 最近一个
 /fork          从当前会话的第 N 步分叉出去并切过去（省略 = 最近检查点）
 /plan          打印 agent 自己排的任务计划清单
+/goal          设定并自动推进一个目标；子命令 status / pause [原因] / resume / clear
 /sessions      列出所有会话（名字/步数/检查点数/分叉来源）
 /rename        给当前会话起个人看得懂的名字
 /clear-taint   复位本会话的污染标记（**人的动作**）
@@ -242,6 +252,33 @@ python -m app.cli --repl --resume --session-id <sid>   # 恢复后接着聊
 每回合结束打一行**本回合**增量（不是会话累计）：`[completed] 本回合 step 6→9 · token 13,323
 （prompt 12,899 + completion 424），缓存命中 95%，上下文 normal (7%)，检查点 7 个`。
 退出时强制落一次检查点，并给出**真能跑起来**的续跑命令。
+
+**进程内目标（`/goal`）**：一行输入是一个回合，但一个目标往往要**好几个回合**才推得动——`/goal` 就是让
+"下一个回合"自动接上：
+
+```bash
+codeagent › /goal 让 median_word_length 对空输入返回 0 --check python -m pytest tests/ -q
+目标: 让 median_word_length 对空输入返回 0
+  状态: active
+  完成判据（人给的，退出码 0 才算完成）: python -m pytest tests/ -q
+  自动推进: 已 0 回合（建于 step 7）
+  （一拍自动推进最多 3 回合 × 每回合 25 步 = 75 步，用 --goal-turns 改）
+```
+
+- **判据由人给，模型改不了。** 模型只有一个工具 `declare_goal_done`——它**声明**"我觉得成了"，
+  运行时随即把上面那条命令**真跑一遍**，`exit 0` 才算完成。模型既不能创建目标、也不能改判据、
+  也不能暂停或清空（同 `clear_taint` 的纪律：**标记不由被标记者清除**）。判分权不在模型手里，
+  这是这一项和"让模型自己说完成了"的全部区别。
+- **判定是三态，不是"过 / 不过"。** 命令**压根没跑成**（被门禁拦下 / 超时 / 工具异常）单独记一档
+  `判定无效`：算完成和算没完成都是错的。同一条教训来自 eval 的 `JudgeResult.executed`。
+- **未通过 ≠ 结束**：命令输出**末尾 40 行**以 `user` 消息回喂，模型在同一回合里接着修，修好再声明一次。
+- **暂停的真实后果**：`/goal pause` 让 REPL **不再自动续跑**（不是"什么都不做"——没有定时器，
+  暂停必须停掉一个真的在跑的东西）。反过来，**人在提示符敲了一行字就是一次隐式暂停**：那一行是人接手的意思。
+  一拍期间人敲不进字（`input()` 阻塞），所以上限不是优化，是防锁死。
+- **检查走同一条门禁链**（`_gate_and_run`），hooks / 权限 / 污染天花板一并生效，所以"检查被拦下"
+  有明确判据而不是靠猜。这条链的代价如实记在 S19。
+- 目标**一个字都不进 system prompt**（同 `plan` 的纪律：`system` 是 `messages[0]`，在缓存保护区内，
+  变一次 = 整条前缀缓存永久失效）。引导放在**目标被创建的那一刻**——那里天然有一个用户回合。
 
 **联网任务**：`web_fetch` / `web_search` 默认就在工具集里（`ToolRegistry.default()`）。
 
@@ -326,7 +363,7 @@ python -m eval.runner --limit 2 --mock           # 无 key 冒烟：只验证管
 **测试**：
 
 ```bash
-python -m pytest tests/                  # 340 passed
+python -m pytest tests/                  # 597 passed
 ```
 
 ---
@@ -393,17 +430,18 @@ $ python -m eval.runner --limit 2
 
 | 层 | 文件 | 行数 |
 |---|---|---|
-| 核心循环 | `agent/loop.py` `llm.py` `state.py` `context.py` `tool_result.py` `session.py` | 2,383 |
+| 核心循环 | `agent/loop.py` `llm.py` `state.py` `context.py` `tool_result.py` `session.py` | 2,593 |
+| 目标 | `agent/goal.py` | 232 |
 | 治理 | `agent/permissions.py` `hooks.py` `memory.py` `security.py` | 1,519 |
 | 技能 | `agent/skills.py` | 281 |
-| 工具 | `agent/tools/base.py` `bash.py` `files.py` `web.py` `subagent.py` `ask.py` `plan.py` `skills.py` | 1,771 |
+| 工具 | `agent/tools/base.py` `bash.py` `files.py` `web.py` `subagent.py` `ask.py` `plan.py` `goal.py` `skills.py` | 1,889 |
 | MCP | `agent/mcp.py` | 961 |
-| 入口 | `app/cli.py` `repl.py` `ui_streamlit.py` `replay.py` | 1,734 |
+| 入口 | `app/cli.py` `repl.py` `ui_streamlit.py` `replay.py` | 2,148 |
 | 评估 | `eval/golden_tasks.py` `runner.py` | 490 |
-| **源码合计** | **26 个模块** | **9,139** |
-| 测试 | `tests/` | 10,019（559 个用例） |
+| **源码合计** | **28 个模块** | **10,113** |
+| 测试 | `tests/` | 10,962（597 个用例） |
 
-> 口径：源码 = `agent/` + `app/` + `eval/` 下的非空 `.py` 行数（不含 `eval/repos/` 下的克隆仓，它被 gitignore）；模块数 = 其中**非空**的 `.py` 文件数（4 个空 `__init__.py` 不计）。
+> 口径：源码 = `agent/` + `app/` + `eval/` 下**非空** `.py` 文件的**全部行数**（含空行；不含 `eval/repos/` 下的克隆仓，它被 gitignore）；模块数 = 其中**非空**的 `.py` 文件数（4 个空 `__init__.py` 不计）。
 > **按文件系统数，不按 git 跟踪数** —— 新文件在提交前也该算进去（M9-5 的 `app/repl.py`(503) 与 `tests/test_repl.py`(785) 当时尚未提交）。
 
 ---
@@ -413,7 +451,7 @@ $ python -m eval.runner --limit 2
 ```
 coding_agent/
 ├── CLAUDE.md              # 精炼约定 + 索引（新会话自动加载）
-├── TASKS.md               # 勾选式任务清单（M1~M8，进度快照）
+├── TASKS.md               # 勾选式任务清单（M1~M9，进度快照）
 ├── docs/
 │   ├── TECH_SPEC.md       # 详细技术方案：签名 / 数据结构 / 边界 / 测试用例
 │   ├── architecture.md    # 架构详解（逐层对应 CC 源码）
@@ -431,7 +469,7 @@ coding_agent/
 
 ## 设计取舍
 
-**做**：核心循环手写 · 只读工具并发 · diff 语义编辑（唯一匹配 + 失败回喂自修复）· 权限沙箱 · hooks · 三级 compact · 检查点恢复 · 分层记忆 · research 子代理 · 轨迹驱动评估。
+**做**：核心循环手写 · 只读工具并发 · diff 语义编辑（唯一匹配 + 失败回喂自修复）· 权限沙箱 · hooks · 三级 compact · 检查点恢复 · 分层记忆 · research 子代理 · 常驻 REPL · 进程内目标 + 显式完成检查 · 轨迹驱动评估。
 
 **不做**（范围控制，不是不会）：向量 RAG（CC 自己也是靠 grep/glob/read 检索）· Skills 的安装/市场/权限元数据（只做了 SKILL.md 渐进披露这一层，见能力表）· A2A · 多代理协调器 · 语音 / Vim / 远程 bridge / TUI 组件层——这些是 Claude Code 里「大规模」而非「核心」的部分。
 
@@ -482,7 +520,20 @@ coding_agent/
 | S15 | **没有子代理/工具层的隔离** | 子代理是「受限只读工具集」，不是沙箱。它跑在同一进程、同一 workspace、同一份环境变量下 |
 | S16 | **bash 子进程根本不经过路径沙箱** | 这是 M7 验证时实测到的、也是这份清单里最该先修的一条：`read`/`write`/`edit` 的越界检查走 `_resolve`（第一优先级硬 deny），但 **bash 的 `command` 参数没有任何路径越界判据** —— 沙箱是「工具层的路径解析」，而 bash 把它整个绕过去了。实测：工作区里 `type ..\.env` 与 `cat ../.env` 各自返回 336 字节、内容含**真实 key**（对照组：`read` 工具读同一路径被硬 deny）。环境变量清洗（S12）挡住了最短的那条路，但挡不住这一条 |
 
-**这份清单会过时**：它不是「设计上不允许」，是「截至 `a455dda` 还没做」。逐条修掉其中任何一条，都应该同时改这张表。
+### 三之二、目标完成检查（M9-6，`/goal`）
+
+这四条是「判分权在人手里」这个设计的**代价**，而不是实现疏漏 —— 它们全都来自同一个取舍：运行时只认**人预先给定的那条命令的退出码**，不做任何语义判断。
+
+| # | 绕过路径 | 说明 |
+|---|---|---|
+| S17 | **空转的检查命令** | 判据是人给的，运行时**只看退出码、不评价它检查了什么**。`--check "true"`（或 `exit 0`、`cd .`）永远通过。唯一的缓解是**可见性**：目标渲染、判定文本、`--goal` 输出里都把命令原文印在结果旁边。**没有任何机制阻止** |
+| S18 | **声明不是闸门，只是事后核验** | 模型可以完全不声明就把活干完（目标停在 `active`、白多花几个回合），也可以在毫无证据时声明（靠检查兜底）。它防的是「谎报完成」，**不防「判断失误」** |
+| S19 | **检查的副作用能替 agent 打开一道治理闸门** | 检查走 `_gate_and_run` → PostToolUse hooks 生效 → 一条成功的 `pytest` 会写 `data/tests_pass.marker`，而 `hooks.default_engine` 正是靠它**解锁 `git commit`**。轨迹上这与模型自己跑同一条命令**不可区分** —— 这是复用同一条门禁链的代价，不是疏漏 |
+| S20 | **「判定无效」比 eval 弱一层** | eval 有 pytest 退出码 2/3/4/5 认得出「压根没跑成」；**shell 没有这个信号** —— `exit 127`（命令不存在）、`No module named pytest` 都会被记成**未通过**而不是无效。只有「被门禁拦下 / 超时 / 工具异常」才算无效 |
+
+另外三条一并写在这里：**①** `/fork` 会连目标一起继承，而检查跑在**当前**工作区上 —— 对话分叉、文件不回滚，所以可能白捡一个通过；**②** 检查通过即结束回合，模型**没有机会**补充「还有一件次要的事没做」（这是把判分权拿走的代价）；**③** 检查超时 120s 是常量、没有旋钮。
+
+**这份清单会过时**：它不是「设计上不允许」，是「截至 `a455dda`（S17–S20 截至 M9-6，尚未提交）还没做」。逐条修掉其中任何一条，都应该同时改这张表。
 
 ### 四、这些是**真跑过真实 LLM** 验出来的（不是单测）
 
@@ -495,14 +546,20 @@ coding_agent/
 | 注入检出 → 收紧 → 人解锁 | 工作区放一个含载荷的文件，让 agent 读到 | 轨迹里有 `security_finding`（5 个规则族 / 7 处命中 / 行号 / `level=high`，**不含原文摘录**）与 `gate_block`（带 `source` 与完整理由）；`--clear-taint` 复位后重试成功 |
 | **不锁定** | agent 自己写含载荷的测试文件、再读回、再跑 `pytest` | 8 次工具调用、**0 次 `gate_block`**、任务正常完成 —— 这是「只收紧不可逆动作」这条误报政策的验收点 |
 | **远程 HTTP MCP**（M9-4） | 真网络 + 真第三方 server：DeepWiki 的 Streamable HTTP 端点，`mcp.json` 里只写 `url` | 握手拿到 `protocolVersion 2025-06-18` / `serverInfo DeepWiki 2.14.3`；DeepSeek 实际调用 `read_wiki_structure(repoName=pallets/flask)` 成功（1 步、2425ms、prompt 6190 token、缓存命中 45%），答案与直连该端点拿到的一致。该 server 是**无状态**的（不回 `Mcp-Session-Id`），客户端照常工作 |
+| **进程内目标**（M9-6） | `--repl` 里用 DeepSeek 官方通路真跑五条动线：① 建目标 → 自动续跑推进 → 声明 → 检查真跑通过 ② 给一条**一开始必然失败**的检查 → 判定未通过 → 回喂 → 继续修 → 再声明 → 通过 ③ `pause` / `resume` ④ 人敲一行字 ⑤ `--resume` 一个有活跃目标的会话 | 五条动线**全部有真实日志**。② 里模型收到 `【完成检查未通过】` + 输出尾部 40 行后真的接着改并再次声明；⑤ 证明检查确实长在 `_run_loop` 里（进程外恢复也照跑） |
 
 > **⚠️ 这一条只覆盖到"传输"这一半，如实标注**：`resources` / `prompts` 两个能力面**只对着本地假 server 验证过**。试过的一批公开远端 server 里**没有一个能连上且暴露非空的 resources/prompts**（DNS 不通 / 超时 / 只有 2 个 tools）。两个能力面的**代码路径**是真的（真 socket、真 JSON-RPC、变异测试覆盖），但「接一个真远程 server 读资源」这件事**没跑过**，别讲成跑过。
 > 有意思的是这次真跑给我们的注册条件提供了实证：DeepWiki 在 `initialize` 里**声明了** `resources` 与 `prompts` 两种能力，但两个列表都是空的（原文 `{"resources": []}`）—— 只判能力声明的话，它就会拿到一个**永远调不通**的工具，而「声明了且列表非空」两条都判，它就被正确地跳过了。
+
+> **⚠️ M9-6 这一条要如实拆开讲**：**④ 的现场记录只证明「人敲一行字之后目标不再自动推进」，不证明「那一行暂停了目标」。** 按 `app/repl.py` 的结构，一拍结束时一定已经 `_pause_goal(stop)` 了，所以人拿到提示符时目标**不可能是 `active`** —— 那个「人工回合顺便暂停一下」的分支在纯 stdin 流程里**结构上不可达**。同理 `/goal pause` 在纯 stdin 流程里也敲不到（想验证它得用交互终端）。这不是 bug，是「一拍 = 一次授权」这条不变式的推论。
+> **这五条动线的步数 / token / 缓存数字与既有的单发、REPL 数字不可比**：自动续跑会把 `max_steps` 乘上 `goal_turns`，同一个任务在不同的 `--goal-turns` 下能差出一个量级。所以只记动线是否走通，不引用 token 数字下任何结论。
 
 **这轮验证挖出并修掉了两个真 bug**（都在 `a455dda`，各带一条回归测试）：
 
 1. **天花板在实践中是空转的。** 原先 bash 的凭据分支要求「读动词 + 凭据路径」同现，动词表是 `cat|type|head|tail|less|more|Get-Content|gc`；模型读 `.env` 用的却是 `findstr ... .env`（Windows 上 `grep` 的自然替代）—— 不在表里，于是**天花板没生效**：命令正常执行，变量名进了上下文。这是「单测全绿但机制实际不工作」的典型样本。
 2. **`--resume "补充说明"` 会静默丢掉这个参数。** 拒绝文案让用户「用 `--clear-taint` 复位后再重试」，但复位之后 CLI 没有办法把「我已复位，请重试」送进会话（`run_from` 用的是 `state.task`）。模型按文案指引停下等人，人却回不了话 —— 整条「收紧 → 人解锁 → 重试」的动线断在最后一步。真跑时就是这么卡住的。
+
+**M9-6 期间真跑没有挖出产品缺陷** —— 如实记，因为前面几轮都挖出了东西、这里没有。五条动线全部按设计走通，没有一条需要改产品代码。但真跑**确实**暴露了一个**我自己写的测试素材错误**：这次真跑用的工作区里有一份我手写的 `m9verify/ws_m96_b/tests/test_extra.py`（**是验证素材，不在仓库的 `tests/` 里**），里面一条断言写的是 `median_word_length("a ccc") == 1.5`，而这个词长是 `[1, 3]`、中位数必然是 **2.0** —— 这条断言数学上不可能成立。模型算对了 2.0，却在看不懂的测试与自己的答案之间反复探测（一整个回合一串 `python -c "print((1+3)/2)"`），烧掉 151,038 token 撞上 `max_steps`；两次 `/goal resume` 又各烧 356,906 / 752,135 token。**模型始终没有谎报完成** —— 它一直说"测试失败、我还没修好"，这正是 `declare_goal_done` 那条纪律想要的行为。断言已改成 `median_word_length("a cc") == 1.5`（词长 `[1, 2]`）。写在这里是因为它是一条真实教训：**agent 卡住时，先怀疑任务和判据，再怀疑 agent**。
 
 ---
 

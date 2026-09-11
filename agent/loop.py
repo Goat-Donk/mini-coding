@@ -17,6 +17,15 @@ from pathlib import Path
 import sys
 from typing import Callable
 
+from agent.goal import (
+    CHECK_FAILED,
+    CHECK_INVALID,
+    CHECK_PASSED,
+    GOAL_CHECK_TIMEOUT,
+    GOAL_DONE,
+    render_check_report,
+    tail_lines,
+)
 from agent.hooks import HookEngine
 from agent.llm import BaseLLM, ToolCall, Usage
 from agent.permissions import Decision, PermissionsEngine
@@ -33,13 +42,35 @@ from agent.tool_result import ToolResultStore, compact_batch
 from agent.tools.base import Tool, ToolContext, ToolRegistry, ToolResult
 
 
+#: 目标（M9-6）相关的终止原因。
+#:
+#: 前缀 `REASON_` 是**刻意**的：`agent/goal.py` 里 `GOAL_DONE` 是**状态**（"done"），
+#: 这里是**终止原因**（"goal_done"），两个词都在本模块被 import —— 同名会让
+#: 读代码的人以为它们是同一个东西。（既有的五个终止原因保持字面量不动：那是纯
+#: 改名扫荡，会把"加一个功能"变成"加功能 + 重构核心循环"，而五个返回点正是
+#: 变异体最常锚的地方。）
+REASON_GOAL_DONE = "goal_done"
+REASON_GOAL_CHECK_INVALID = "goal_check_invalid"
+
+#: 一轮 `_run_loop` 可能给出的**全部**终止原因。
+#:
+#: 存在的理由是一个真实的缺口：原先这七个值只散落在各个返回点上，没有任何
+#: 地方列举它们。于是"新增一个终止原因、但忘了让 REPL 的自动推进在它上面停
+#: 下来"不会有任何东西变红 —— 表现只是 burst 白烧预算（`tests/test_goal.py`
+#: 有一条测试用 `BURST_STOP_REASONS` 钉住这个集合，那是它的第二个读者）。
+TERMINATED_REASONS = frozenset({
+    "completed", "max_steps", "loop_detected", "error", "await_user",
+    REASON_GOAL_DONE, REASON_GOAL_CHECK_INVALID,
+})
+
+
 @dataclass
 class RunResult:
     final_text: str | None
     steps: int
     usage: Usage
     events: list[dict]
-    terminated_reason: str   # "completed" | "max_steps" | "loop_detected" | "error" | "await_user"
+    terminated_reason: str   # 取值见 loop.TERMINATED_REASONS（含 "completed" / "await_user" / …）
     task: str
 
     @property
@@ -349,7 +380,23 @@ class QueryEngine:
                         task=task,
                     )
 
+                # ★ M9-6 批前复位：结构性地保证「一次声明只触发一次检查」。
+                # 不复位的话，第 N 步声明过一次之后，**后面每一步**都会重跑一次
+                # 完成检查（声明字段一直挂着）—— 烧钱、上下文爆，而且不报任何错。
+                if state.goal is not None:
+                    state.goal.declaration = None
+
                 pending = self._execute_tool_calls(result.tool_calls, state, ctx)
+
+                # ★ M9-6 完成检查在**批后**：「先跑测试验证、再声明完成」是模型
+                # 同一步里最常见的形状，放在批前只会看到上一轮的陈旧声明。
+                # 放在 checkpoint 之前返回，是为了让这一步的检查点带上**判定之后**
+                # 的目标状态（done / 仍 active），否则 resume 出来的目标是错的。
+                if state.goal is not None and state.goal.declaration is not None:
+                    goal_end = self._verify_goal(state, task, ctx)
+                    if goal_end is not None:
+                        return goal_end
+
                 if self.session is not None:
                     self.session.checkpoint(state)  # M3-4 每 N 步落盘检查点
                 if pending is not None:
@@ -562,6 +609,152 @@ class QueryEngine:
             usage=state.usage,
             events=state.events,
             terminated_reason="await_user",
+            task=task,
+        )
+
+    def _verify_goal(
+        self, state: AgentState, task: str, ctx: ToolContext
+    ) -> RunResult | None:
+        """跑一次**人预先给定的**完成检查命令。返回 None = 未通过，本轮继续。
+
+        **走 `_gate_and_run` 而不是直接 `tool.run`。** 这不是顺手复用：检查命令
+        是**人写的一行 shell**，它必须和模型自己发的命令受同一套治理 ——
+        PreToolUse 的 block-at-submit、权限 deny、危险命令 ask、**污染天花板**。
+        顺带还换来一个明确判据：「检查被拦下了」有 `gate_block` 事件带
+        `source`/`reason`，而不是靠猜（见 S19：副作用同样会走 PostToolUse，
+        所以一条成功的 `pytest` 会写 `data/tests_pass.marker`、**替 agent 解锁
+        `git commit`** —— 轨迹上与模型自己跑同一条命令不可区分，这是复用同一条
+        链的代价，不是疏漏）。
+
+        **绝不伪造 `assistant(tool_calls=[...]) + tool(...)` 消息对**把检查伪装成
+        模型发起的一次工具调用 —— 那是在会话里写下一个模型从没发出过的调用，
+        与 `PAIRING_FILLER`「必须说实话」的纪律直接冲突。判定以 **user 消息**
+        回喂，同 `_reinject_plan` 的先例。
+
+        三态判定（对齐 `eval/golden_tasks.py` 的 `JudgeResult.executed`）：
+        命令**压根没跑成**时，「算完成」和「算没完成」都是错的。
+        """
+        goal = state.goal
+        declaration = dict(goal.declaration or {})
+        # 瞬态字段，取走就清：留着会让它跟着检查点走，而它下一次就会被批前复位，
+        # 两处都写就成了"谁才是权威"的第二个真相源。
+        goal.declaration = None
+
+        # 合成的 call.id 只活在这一次调用里，**不进任何消息**（见 docstring）。
+        call = ToolCall(
+            id=f"goal_check@{state.step}",
+            name="bash",
+            arguments={"command": goal.check_command, "timeout": GOAL_CHECK_TIMEOUT},
+        )
+        before = len(state.events)
+        result = self._gate_and_run(call, state, ctx)
+        # 门禁阻断与"命令真的跑了但退出码非 0"必须分开：前者是**判定无效**。
+        # `_gate_and_run` 的阻断路径（registry / hooks / permissions）都会先记一条
+        # `gate_block` 再返回 fail，所以拿事件切片判定，而不是靠猜错误文本。
+        gate_blocks = [
+            event for event in state.events[before:]
+            if event.get("type") == "gate_block"
+        ]
+        exit_code = (
+            result.data.get("exit_code") if isinstance(result.data, dict) else None
+        )
+
+        if gate_blocks or not result.success or exit_code is None:
+            verdict = CHECK_INVALID
+            reason = (
+                gate_blocks[-1].get("reason") if gate_blocks
+                else (result.error or tail_lines(result.output, 5))
+            )
+        elif exit_code == 0:
+            verdict, reason = CHECK_PASSED, None
+        else:
+            verdict, reason = CHECK_FAILED, None
+
+        state.record_event(
+            "goal_check",
+            verdict=verdict,
+            command=goal.check_command,
+            exit_code=exit_code,
+            duration_ms=result.duration_ms,
+            declaration=declaration,
+            reason=reason,
+            # 事件里存**尾部**而不是全量输出：events 会进检查点，而 `--resume`
+            # 每次恢复都要读它。一次 pytest 的输出可达几十万字符（bash 的兜底
+            # 上限是 500_000），把全量塞进检查点等于让**每一次恢复**都为它付钱。
+            output_tail=(
+                "" if verdict == CHECK_PASSED else tail_lines(result.output)
+            ),
+            output_chars=len(result.output),
+        )
+        goal.last_check = {
+            "verdict": verdict,
+            "step": state.step,
+            "exit_code": exit_code,
+            "reason": reason,
+        }
+
+        if verdict == CHECK_PASSED:
+            goal.status = GOAL_DONE
+            goal.pause_reason = None
+            state.record_event(
+                "goal_completed",
+                objective=goal.objective,
+                command=goal.check_command,
+                turns=goal.turns,
+                declaration=declaration,
+            )
+            # **通过就把回合结束掉，不让模型再写一段结论。** 让它看到「检查通过」
+            # 再自己总结，完成就又变成模型说的话了 —— 恰是本项的反面。结论由
+            # 运行时给出（连同模型的声明原文，人能看到它当初声称了什么）。
+            return self._goal_turn_result(
+                state, task, REASON_GOAL_DONE,
+                f"目标已完成：完成检查通过（`{goal.check_command}` 退出码 0）。\n"
+                f"目标: {goal.objective}\n"
+                f"声明: {declaration.get('summary') or '（无）'}",
+            )
+
+        if verdict == CHECK_INVALID:
+            # **判定无效也结束回合**：检查命令坏了，模型**没有任何办法**修它
+            # （它不能改 `check_command`）。留着它继续，只会让它反复声明、
+            # 每次拿回一条无效判定、把步数烧光。
+            #
+            # **刻意不复用 `await_user`**：那个值连带两件事，两件都不对 ——
+            # `_extract_learned` 会跳过约定提炼（而这里的轨迹是完整的），
+            # REPL 会打印「需要你补充信息」（而这里没有任何人被提问）。
+            # 多一个终止原因是诚实的代价。
+            return self._goal_turn_result(
+                state, task, REASON_GOAL_CHECK_INVALID,
+                f"完成检查未能执行 —— 本次判定不计入。\n"
+                f"目标: {goal.objective}\n"
+                f"检查命令: {goal.check_command}\n"
+                f"原因: {reason}",
+            )
+
+        # 未通过：**保持 active、本轮继续**。结束回合会让模型失去修复机会 ——
+        # 而"检查没过 → 看输出 → 接着修"正是这条动线的全部价值。
+        state.messages.append(
+            user(render_check_report(goal, CHECK_FAILED, tail_lines(result.output)))
+        )
+        return None
+
+    def _goal_turn_result(
+        self, state: AgentState, task: str, reason: str, final_text: str
+    ) -> RunResult:
+        """目标把这一轮结束掉了（检查通过 / 判定无效）。
+
+        与 `_awaiting_user` 同一个理由的 `force=True`：流程即将因**非步数**原因
+        退出，节流的下一次 tick 永远等不来 —— 判定结果会留在内存里，`--resume`
+        恢复出来的目标状态是错的（active，而它其实已经 done 了）。
+        """
+        state.terminated_reason = reason
+        if self.session is not None and hasattr(self.session, "checkpoint"):
+            self.session.checkpoint(state, force=True)
+        return RunResult(
+            final_text=final_text,
+            steps=state.step,
+            usage=state.usage,
+            events=state.events,
+            terminated_reason=reason,
             task=task,
         )
 

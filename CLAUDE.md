@@ -4,16 +4,16 @@
 
 ## 项目定位
 
-求职作品集：**CodeAgent** —— 参考 [pengchengneo/Claude-Code](https://github.com/pengchengneo/Claude-Code) 源码架构，用 Python 从零实现的小型 AI Coding Agent（9,139 行 / 26 模块 / 559 测试）。核心循环手写（不套 Agent SDK），支撑层用成熟库（openai / pydantic / streamlit / typer / pytest）。差异化：cache-aware 上下文 + 缓存省钱指标、step 级检查点恢复 + **step 级分叉/会话命名**、**常驻交互模式（REPL，一行一个回合）**、block-at-submit hooks、轨迹驱动评估（真实 tinydb 提交 + 隐藏测试）、记忆自进化、MCP 工具接入（**stdio + Streamable HTTP 两种传输**）、注入文本检测 + 会话污染天花板、联网工具 + SSRF 拦截、skills 渐进披露、计划清单跨回合、提问暂停/续答、改动前 diff 复核。
+求职作品集：**CodeAgent** —— 参考 [pengchengneo/Claude-Code](https://github.com/pengchengneo/Claude-Code) 源码架构，用 Python 从零实现的小型 AI Coding Agent（10,113 行 / 28 模块 / 597 测试）。核心循环手写（不套 Agent SDK），支撑层用成熟库（openai / pydantic / streamlit / typer / pytest）。差异化：cache-aware 上下文 + 缓存省钱指标、step 级检查点恢复 + **step 级分叉/会话命名**、**常驻交互模式（REPL，一行一个回合）**、**进程内目标 + 显式完成检查（判分权在人手里）**、block-at-submit hooks、轨迹驱动评估（真实 tinydb 提交 + 隐藏测试）、记忆自进化、MCP 工具接入（**stdio + Streamable HTTP 两种传输**）、注入文本检测 + 会话污染天花板、联网工具 + SSRF 拦截、skills 渐进披露、计划清单跨回合、提问暂停/续答、改动前 diff 复核。
 
-> 数字口径（改数字时请沿用）：**源码 = `agent/` + `app/` + `eval/` 下的非空 `.py` 行数**（不含 `eval/repos/` 的克隆仓，它被 gitignore）；**模块数 = 其中非空的 `.py` 文件数**（4 个空 `__init__.py` 不计）；**测试 = `tests/` 行数 / pytest 用例数**。**按文件系统数，不按 git 跟踪数** —— 新文件在提交前也该算进去（M9-5 的 `app/repl.py`(503) 与 `tests/test_repl.py`(785) 当时尚未提交）。
+> 数字口径（改数字时请沿用）：**源码 = `agent/` + `app/` + `eval/` 下非空 `.py` 文件的全部行数**（含空行；不含 `eval/repos/` 的克隆仓，它被 gitignore）；**模块数 = 其中非空的 `.py` 文件数**（4 个空 `__init__.py` 不计）；**测试 = `tests/` 行数 / pytest 用例数**。**按文件系统数，不按 git 跟踪数** —— 新文件在提交前也该算进去（M9-6 的 `agent/goal.py`(232) `agent/tools/goal.py`(118) `tests/test_goal.py`(927) 当时尚未提交）。
 
-**已验证状态**：真实 LLM 端到端跑通（修 bug 全流程、kill+`--resume` 续跑、eval 出真实报告 50% 1/2）。README「评估」章节有真实数字与口径说明。**M6 收尾后又补齐三项此前只是单测覆盖的验证**：compact 在真实 token 压力下真实触发（当时是两级；M8 加了分级截断，现为三级 compact）、MCP 接真实第三方 server（官方 `mcp-server-time`，stdio）并确认仍走权限/hook 门禁链、Streamlit 控制台用真实 Chrome 打开并操作控件跑通 mock 任务。**M9-4 又补了一项**：MCP 接**真实远程 HTTP** server（DeepWiki 的 Streamable HTTP 端点，走公网）并端到端跑通工具调用。**M9-5 又补了三轮**：常驻 REPL 的多回合上下文接续（第二回合不重读源码就改对）、`/rename`+重进+`/fork 2` 新分支接着跑、`--review-edits` 下答「本回合允许」后下一回合同一命令**重新被问**（`m9verify/repl_a|b|c.log`）。
+**已验证状态**：真实 LLM 端到端跑通（修 bug 全流程、kill+`--resume` 续跑、eval 出真实报告 50% 1/2）。README「评估」章节有真实数字与口径说明。**M6 收尾后又补齐三项此前只是单测覆盖的验证**：compact 在真实 token 压力下真实触发（当时是两级；M8 加了分级截断，现为三级 compact）、MCP 接真实第三方 server（官方 `mcp-server-time`，stdio）并确认仍走权限/hook 门禁链、Streamlit 控制台用真实 Chrome 打开并操作控件跑通 mock 任务。**M9-4 又补了一项**：MCP 接**真实远程 HTTP** server（DeepWiki 的 Streamable HTTP 端点，走公网）并端到端跑通工具调用。**M9-5 又补了三轮**：常驻 REPL 的多回合上下文接续（第二回合不重读源码就改对）、`/rename`+重进+`/fork 2` 新分支接着跑、`--review-edits` 下答「本回合允许」后下一回合同一命令**重新被问**（`m9verify/repl_a|b|c.log`）。**M9-6 又补了五条 Goal 动线**（`m9verify/goal_*.log`）：建目标→自动续跑→声明→检查真跑通过 / 一开始必然失败的检查→回喂→继续修→再声明→通过 / `pause`+`resume` / 人敲一行字 / `--resume` 一个有活跃目标的会话（检查照跑）。**M9-6 真跑没有挖出产品缺陷** —— 如实记，因为前面几轮都挖出了东西、这里没有；真跑暴露的是**我自己写的一条测试素材错误**（见下）。
 
 **CLI 治理链路**：`app/cli.py` 的 `_Runtime.engine()` 是**唯一** `QueryEngine(...)` 构造点（M9-5 收的，原先两处各写一遍），单发与常驻 REPL 都从它拿引擎 —— 两处都已接 `PermissionsEngine`（默认 allow、危险命令 ask→无确认交互→拒绝、路径越界 deny、**第三方/MCP 工具须在 `mcp.json` 的 `allow` 里显式授权否则 ask**）与 hooks（`default_engine()`：block-at-submit + marker 自动维护 + **注入检测**）。入口层共用 `hooks.default_engine()`，避免接线漂移（CLI 曾整体漏接 hooks）。`tests/test_cli.py` 共 38 例（接线相关的多条在里面）。
 **唯一例外是 `--review-edits`（M9-1）**：它给 CLI 装上 `confirm` 回调并把 `edit`/`write` 抬成 ask，于是改动落盘前人能看到 diff。**默认关闭是刻意的** —— 我们的 CLI 本来没有确认回调，把 edit 改成默认 ask 会让每次改动都退化成拒绝、整条 CLI 不可用（那就把安全机制变成了路障；TS 原版靠 TTY 模式兜住，我们没有）。所以它是 opt-in，默认路径与 eval 一字不变。
 
-**M7 安全机制（措辞红线，别写错）**：本项目**没有**做「防止 prompt 注入」。分三层：① `permissions.py` 执行（确定性）② `hooks.py` PreToolUse 阻断（确定性）③ `security.py` 检测（**概率性，只出告警，从不直接决定放行/拒绝**）。检测出 `high` 后收紧能力的是**后置天花板**（`_apply_taint_ceiling`，只把三类不可逆动作 网络外发/读凭据/写记忆文件 从 ALLOW 降为 ASK），位置**必须在 `_always`/`_turn` 之后、`confirm` 之前**。禁用措辞：不说「防御/防止注入」，不说「污点追踪/taint 传播」（实为**会话级粗粒度标记**），不说「纵深防御/零信任」，不说「子代理沙箱」（实为**受限只读工具集**），不给「误报率低」这类无数字形容词。局限逐条写在 README「已知未修复的绕过路径」（S1–S16，其中 S6–S10 配了探针实测），改任何一条都要同步改那张表。**bash 的凭据判据是「提到即命中」**（`CREDENTIAL_MENTION`，不锚定末尾，见 permissions.py 的注释）——别「顺手修回去」，那会让天花板重新空转。
+**M7 安全机制（措辞红线，别写错）**：本项目**没有**做「防止 prompt 注入」。分三层：① `permissions.py` 执行（确定性）② `hooks.py` PreToolUse 阻断（确定性）③ `security.py` 检测（**概率性，只出告警，从不直接决定放行/拒绝**）。检测出 `high` 后收紧能力的是**后置天花板**（`_apply_taint_ceiling`，只把三类不可逆动作 网络外发/读凭据/写记忆文件 从 ALLOW 降为 ASK），位置**必须在 `_always`/`_turn` 之后、`confirm` 之前**。禁用措辞：不说「防御/防止注入」，不说「污点追踪/taint 传播」（实为**会话级粗粒度标记**），不说「纵深防御/零信任」，不说「子代理沙箱」（实为**受限只读工具集**），不给「误报率低」这类无数字形容词。局限逐条写在 README「已知未修复的绕过路径」（S1–S20，其中 S6–S10 配了探针实测、S17–S20 是 M9-6 目标完成检查的代价），改任何一条都要同步改那张表。**bash 的凭据判据是「提到即命中」**（`CREDENTIAL_MENTION`，不锚定末尾，见 permissions.py 的注释）——别「顺手修回去」，那会让天花板重新空转。
 
 > ✅ **真实跑分走的是项目选定通路（DeepSeek 官方）**：`https://api.deepseek.com` + `deepseek-chat`，与代码默认值、`.env.example` 一致。
 > 最新一次：`python -m eval.runner --limit 2` → 完成率 50%（1/2）、82,495 token、¥0.0769、缓存命中 82%；真·冷启动曲线 step1 0% → 累计 77%。
@@ -41,7 +41,7 @@
 
 **模块 docstring 要注明机制出处**（先例 `agent/tool_result.py`、`agent/tools/plan.py`），与本项目「参考与来源」的惯例一致。
 
-**M9 向 TS 原版对齐（进行中，排序见 `TASKS.md`）**：核实后 TS 原版 12 项核心能力全部真实现（逐条对照与 file:line 证据在 `docs/reference/minicode-notes.md` §10），本项目按「先小后大」分四批靠。**已做 M9-1 改动前 diff 复核**，机制是：
+**M9 向 TS 原版对齐（进行中，排序见 `TASKS.md`）**：核实后 TS 原版 12 项核心能力全部真实现（逐条对照与 file:line 证据在 `docs/reference/minicode-notes.md` §10），本项目按「先小后大」分四批靠。**只剩压轴的 M9-7 ② sub-agent 并发**（唯一会动核心循环契约的一项）。**已做 M9-1 改动前 diff 复核**，机制是：
 - `Tool.preview(arguments, ctx) -> str | None`（`agent/tools/base.py`）声明**将要做什么**，默认 None；目前只有 `write`/`edit` 实现。
 - **它必须是纯函数**（绝不写盘），且**只能有一份**匹配语义：`EditTool._plan` 同时供 `preview` 与 `execute` 用 —— 各判一遍就会出现「预览说能改、执行说匹配不唯一」，而那时人已经照着预览点过允许了（**两个真相源**）。
 - `_gate_and_run` 里 `details = self._preview(...)` **必须在 `permissions.check()` 之前**取。位置就是这一项的全部意义：人看到 diff 时磁盘上还是旧内容。**挪到 check() 之后不会报任何错**，所以有测试专门钉住确认回调被调用那一刻文件仍是原文。
@@ -82,13 +82,28 @@
 - **`max_steps` 语义变更（行为变更，要主动说）**：从「整个 state 的累计步数上限」改成**「每轮一份预算」**（`_run_loop` 记 `budget_start = state.step`，条件 `state.step - budget_start < max_steps`）。`state.step` **照样累计不重置**（检查点文件名、`--fork --step K`、轨迹 `step` 字段都依赖它单调递增），只改预算的**度量起点**。顺带修掉一个陷阱：会话跑满 25 步后 `--resume` 旧语义下**一次模型调用都不发**、直接又打印「已达到最大步数」。
 - **装配不复制（这一项防漂移的关键）**：`QueryEngine(...)` 原先在 `app/cli.py` 被构造**两遍**（`--resume` 一条路、全新会话一条路，参数逐字相同）。收成 `_Runtime.engine(session)` 一处，单发与常驻从同一处拿。**REPL 若自己装配一遍，迟早漏掉一样** —— CLI 历史上**漏接过 hooks 与 permissions 各一次，两次都是静默的**。
 - **两条硬不变量**：① 不认识的斜杠命令**绝不发给模型**（打错一个字母 = 一次真实调用，而回答看起来还挺像回事 → 这个错误不会被发现）；② 会话切换失败**不能半切换**（`_activate` 三样一起换，**engine 必须跟着换** —— `QueryEngine.session` 构造期绑定；"session 换了、engine/state 没换"是**零报错**的错配：轨迹写进 A、你在看 B）。命令判据用 **`raw.startswith("/")`**（strip **之前**的行），所以行首加空格仍当任务发。
-- **9 个命令的正文由 `_COMMANDS` 表生成**（`/help` 与命令表写两处迟早对不上），有测试断言 `/help` 列出的名字**恰好等于**表的键集合。
+- **10 个命令的正文由 `_COMMANDS` 表生成**（`/help` 与命令表写两处迟早对不上），有测试断言 `/help` 列出的名字**恰好等于**表的键集合。
 - **退出语必须可执行**：`_farewell` 打印「继续: … `--repl --resume --session-id <sid>`」，而检查点是**按节拍**落的、且**只在有工具调用的步上 tick** —— 纯聊天或只走两步就退出会一个检查点都不落，那条命令直接报"读不到检查点"。所以 `_wrap_up` **退出时强制落一次**（理由同 `_awaiting_user` 的 `force=True`：流程即将因非步数原因退出，节流的下一次 tick 永远等不来）。**这条是写测试时逼出来的，不是真跑**，如实记着。
 - **每回合报增量**（`RunResult.steps`/`usage` 是**会话累计**的，五个返回点给的都是 `state.step`）。`Usage` 是**可变 dataclass**、`state.usage += …` 是**原地**累加 → 快照必须 `dataclasses.replace()` 复制，**不复制则相减恒为 0 且不报错**。
 - **`await_user` 在 REPL 里不需要任何特殊代码**（模型提问 → 本轮结束 → 打印问题 → 下一行输入就是回答）。这是 M8「打断是数据标志而不是阻塞控制流」的回报 —— 反过来若 REPL 自己 `input()` 一个"回答"，就是把数据标志退化成阻塞控制流。
 - 变异测试 **19/19** 被抓住（`m9verify/mutate_m9_5.py`）。**三类要说明的**：一个**证明过的等价变异体**（`_run_loop(..., budget_start=state.step)` 省略该实参恒等，因为兜底就是同一个表达式、两次读之间没有东西改 step）；一个**依赖时序的**（`/new` 用 `unique_session_id` 而非秒级 `new_session_id`，跨秒会 MISS —— 但它防的是真缺陷：两个"不同"会话**静默共用**一个检查点目录）；一个**刻意不设的**（`_dispatch` 的 `except typer.Exit: pass`，去掉后 `CliRunner` 会接住异常、退出码照样 0，从输出上分辨不出来）。
 - **一处被变异测试逼出来的测试修正**：空行变异最初 **MISS** —— 空行变成第 3 个回合吃掉脚本响应，最后一条真实输入才报错，而 loop 的 `except Exception` 把它变成 `terminated_reason="error"` 的 `RunResult`、**退出码仍是 0**，原断言照样成立。修法是补 `assert "[error]" not in result.output` 与 `assert users == [...]`（直接钉"模型收到的 user 消息序列"）。
 - **真实端到端跑了三轮**（`m9verify/repl_a|b|c.log`，工作区 `m9verify/ws_m95/`）：A 两回合修 bug + 补测试（第二回合**不重读源码**就改对了）；B `/rename` → 重进 → `/fork 2` → 新分支接着跑；C `--review-edits` 下答「2) 本回合允许」→ **下一回合同一个 edit、同一个文件重新被问**（权限记忆键是 `_classify` 给的 `arguments["path"]`，两回合都是字面量 `textstat.py`，**键相同**，所以"重新问一次"只可能来自回合边界上的清空）。
+
+**已做 M9-6 进程内目标（`agent/goal.py` + `agent/tools/goal.py` + REPL 自动推进）**，机制是：
+- **它不是任务树。** TS 原版 ④ 的唯一证据是 `docs/reference/minicode-notes.md:141` 一行：「进程内 Goal（跨回合推进 + 暂停/恢复/完成检查）」+ `/goal` 命令族 + `goal/context.ts` —— **带状态机的目标对象，没有任何层级结构**，`isComplete` / 停止条件 / 任务树 / `TodoWrite` 全仓零命中。**面试稿里原先那句「④ Goal（目标任务树）」是没有依据的，已更正**（`docs/interview_guide.md` §10 保留了这次自我更正）。「允许中途改结构」现有 `update_plan`（全量覆盖）本来就能做。
+- **判分权在人手里（这一项的全部意义）**：目标由人用 `/goal <目标> --check <命令>` 创建，`check_command` 是**人预先给的可执行判据**。模型只有一个工具 `declare_goal_done` —— 它**声明**，运行时随即跑那条命令，**退出码说了算**。模型不能创建目标、不能改判据、不能暂停/清空（同 `clear_taint` 的纪律：**标记不由被标记者清除**）。**名字刻意不叫 `complete_goal`**：description 是这条能力在唯一常驻请求里的全部说明，而 `complete_goal` 读起来像"调用它 = 完成"。
+- **判定是三态，不是两态**（`CHECK_PASSED` / `CHECK_FAILED` / `CHECK_INVALID`）：命令**压根没跑成**（门禁拦下 / 超时 / 工具异常）单独一档，算完成和算没完成都是错的 —— 直接对应 `eval/golden_tasks.py` 的 `JudgeResult.executed` 教训。**未通过不是终止**：判定 + 输出**尾部 40 行**以 `user` 消息回喂，模型在同一回合里接着修。**通过即结束回合**：让模型看到"检查通过"再自己写结论，完成就又变成模型说的话了。**无效也结束回合**：检查命令坏了模型**没有任何办法**修（它不能改 `check_command`）。
+- **`terminated_reason` 新增两个值**（`goal_done` / `goal_check_invalid`）+ 集中常量 `TERMINATED_REASONS`（原先只有一行注释、无集合 —— 补的是"一共有哪些值"这个真缺口）。**无效不复用 `await_user`**：那个值连带两件事都不对（`_extract_learned` 会跳过约定提炼、REPL 会打印「需要你补充信息」而这里没有人被提问）。
+- **`_run_loop` 只插 4 行，`_execute_tool_calls` 一个字符没改。** 声明经由 `state.goal.declaration` 传递，不走 `ToolResult` 上的第二个标志 —— 批结束时那个 `ToolResult` 已被 `compact_batch` 成字符串，要带出标志就得**改 `_execute_tool_calls` 的返回类型**，而那是 4 个入口共用的核心循环契约（留给 M9-7）。插在 `_run_loop` 里 → 四条入口一起拿到；**批前复位 `declaration = None`** 让「一次声明恰好触发一次检查」是结构性成立的（而不是靠"记得别重复跑"）。
+- **检查复用 `_gate_and_run` 而不是 `bash.run`**：PreToolUse 的 block-at-submit、权限 deny、危险命令 ask、**污染天花板**一并生效，且"检查被拦下"有明确判据（`gate_block` 带 `source`/`reason`）而不是靠猜。代价如实记在 README S19（成功的 `pytest` 会写 `data/tests_pass.marker`，从而**替 agent 解锁 `git commit`**）。**绝不伪造** `assistant(tool_calls=[...]) + tool(...)` 消息对 —— 那等于写下一个模型从没发出过的调用，与 `PAIRING_FILLER`「必须说实话」冲突。判定以 `user` 消息回喂（同 `_reinject_plan` 先例）。
+- **暂停 = REPL 不再自动续跑**（我们的架构里没有定时器，暂停必须停掉一个真的在跑的东西）。**REPL 结构不变量**：`_run_goal_burst` 结尾**一定** `_pause_goal(stop)`，所以**人拿到提示符时目标绝不可能是 `active`** → else 分支那次「人工回合顺便暂停」永远 no-op，**`/goal pause` 在纯 stdin 流程里结构上不可达**（不是 bug，是「一拍 = 一次授权」的推论；真跑那条动线只证明「人敲一行字后不再自动推进」，**不证明"那一行暂停了目标"**，别讲过头）。**一拍上限不是优化是防锁死**：`input()` 阻塞、无定时器，一拍期间人**根本敲不进字**。
+- **目标一个字都不进 system prompt**（同 `plan` 的纪律）：`system` 是 `messages[0]`、在 `_PREFIX_LEN` 保护区内；引导放在**目标被创建的那一刻**（`goal_kickoff_message`）—— 那里天然有一个用户回合，这正是 M8 elicitation gap 的正解形状。
+- **`_FIELD_DECODERS` 必须同步加 `"goal"` 一行**（`agent/session.py`）：`load_state` 走 `AgentState(**raw)`，dataclass **不做类型检查** → 漏了它 `state.goal` 是个 `dict`，直到有人读 `.status` 才抛错，而那个炸点被 `_run_loop` 的 `except Exception` 吞成 `terminated_reason="error"`，看起来像「引擎出错」。有测试 + 变异体专钉。
+- **`--goal-turns` 不进检查点**（交互策略，不是会话事实 —— 与 `checkpoint_every` 相反）；目标工具**不进 `ToolRegistry.default()`**（eval 用的正是 `default()`，headless 里没人能建目标 → 模型只会看到一个永远失败的诱饵，同 `ask_user`）。
+- 变异测试 **20/20**（`m9verify/mutate_m9_6.py`）。**一处如实标注的 MISS**：变异体「人工回合不暂停」被**证明等价** —— 因为 `_pause_goal` 在纯 stdin 流程里本来就不可能在 human-turn 分支产生可观测差异（见上一条不变量），理由写在脚本头部。
+- **真跑五条动线全部有日志**（`m9verify/goal_*.log`）。**这些数字与既有单发/REPL 数字不可比**：自动续跑会把 `max_steps` 乘上 `goal_turns`，同一个任务换个 `--goal-turns` 能差一个量级 —— 所以只记动线是否走通，**不引用 token 数字下任何结论**。
+- **真跑暴露的是我自己的测试素材错误，不是产品缺陷**：这次真跑用的工作区里有一份我手写的 `m9verify/ws_m96_b/tests/test_extra.py`（**验证素材，不在仓库的 `tests/` 里**），其中 `assert median_word_length("a ccc") == 1.5` 数学上不可能成立（词长 `[1,3]` → 中位数 2.0）。模型算对 2.0、看不懂测试，一整个回合反复探测烧掉 **151,038 token** 撞 `max_steps`；两次 `/goal resume` 又各烧 356,906 / 752,135。**模型始终没有谎报完成**（一直说"测试失败、我还没修好"）—— 这正是 `declare_goal_done` 那条纪律想要的行为。断言已改成 `median_word_length("a cc") == 1.5`。**教训：agent 卡住时先怀疑任务和判据，再怀疑 agent。**
 
 ## 硬约束（不可违反）
 
@@ -101,15 +116,16 @@
 
 | 模块 | 文件 | 职责 |
 |---|---|---|
-| 循环 | agent/loop.py | QueryEngine：think→tool→observe→finish，只读并发/串行，终止判定+循环检测 |
+| 循环 | agent/loop.py | QueryEngine：think→tool→observe→finish，只读并发/串行，终止判定+循环检测（含 M9-6 的目标判定 `_verify_goal`） |
+| 目标 | agent/goal.py | 进程内目标状态机（active/paused/done）+ 三态完成判定 + 渲染（M9-6） |
 | LLM | agent/llm.py | BaseLLM → DeepSeekClient / MockLLM；usage+cache 采集 |
-| 工具 | agent/tools/ | base(基类+schema+`preview` 预览钩子) / bash / files(read·write·edit·glob·grep) / web(fetch·search + SSRF) / subagent / ask / plan / skills |
-| 状态 | agent/state.py | 消息构造（OpenAI 格式）+ AgentState（含 `plan`） |
+| 工具 | agent/tools/ | base(基类+schema+`preview` 预览钩子) / bash / files(read·write·edit·glob·grep) / web(fetch·search + SSRF) / subagent / ask / plan / **goal(declare_goal_done)** / skills |
+| 状态 | agent/state.py | 消息构造（OpenAI 格式）+ AgentState（含 `plan`、`goal`） |
 | 上下文 | agent/context.py | provider-usage-first 记账 + cache-aware 布局 + 分级截断/snip/LLM compact（M3·M8） |
 | 工具结果 | agent/tool_result.py | 超大工具结果落盘 + 预览替换 + 批预算（M3） |
 | 权限 | agent/permissions.py | once/turn/always 决策粒度 + 黑名单 + 沙箱 + 确认文案带 `details`（M2·M9） |
 | 钩子 | agent/hooks.py | Pre/PostToolUse + block-at-submit（marker 由测试成功自动写）（M2） |
-| 会话 | agent/session.py | JSONL 轨迹 + 检查点 + resume + **step 级分叉 / 会话命名 / 清单**（M3·M9-3） |
+| 会话 | agent/session.py | JSONL 轨迹 + 检查点 + resume + **step 级分叉 / 会话命名 / 清单**（M3·M9-3）；`_FIELD_DECODERS` 是新增 state 字段的**必改点**（M9-6 的 `goal`） |
 | 记忆 | agent/memory.py | 分层指令文件(@include+去重+预算) + 提取 + 简化 consolidation（M4） |
 | 技能 | agent/skills.py | SKILL.md 渐进披露：只把 name+简介进 system prompt，正文由 load_skill 按需取（M8） |
 | 安全 | agent/security.py | 注入文本检测（**概率性，只出告警**）+ 会话级污染标记 + 来源框架（M7） |
@@ -126,6 +142,7 @@ python -m app.cli --mock "任务"               # 无 key 演示
 python -m app.cli "任务"                      # 真实 DeepSeek（需 .env 配 DEEPSEEK_API_KEY）
 python -m app.cli --resume                   # 从最近检查点续跑（配合 Ctrl+C 演示）
 python -m app.cli --plan                     # 只看最近会话的**任务计划清单**后退出（无 key 也能跑）
+python -m app.cli --goal                     # 只看最近会话的**目标**（目标/状态/判据/最近判定，无 key）
 python -m app.cli --resume "补充的信息"       # 回答 agent 的提问后续跑（配 --session-id 更稳）
 python -m app.cli --sessions                 # 列出会话：名字/步数/分叉来源（无 key）
 python -m app.cli --rename "基线方案"          # 给最近会话起名（只动元数据，无 key）
@@ -134,6 +151,8 @@ python -m app.cli --resume --session-id "基线方案" "接着改"   # 会话 id
 python -m app.cli --repl                     # 常驻交互模式：一行一个回合（M9-5）
 python -m app.cli --repl "先跑一下测试"        # 带任务：它作为**第一个回合**跑掉再进提示符
 python -m app.cli --repl --resume --session-id <sid>   # 恢复后接着聊（退出时会强制落一次检查点）
+python -m app.cli --repl --goal-turns 5      # 目标自动推进一拍最多几个回合（默认 3，M9-6）
+# 提示符内：/goal <目标> --check <命令> 建目标并自动推进；/goal status|pause|resume|clear
 python -m app.cli "任务" --review-edits       # 改动前人工确认：edit/write 先显示 diff（M9-1）
 CODEAGENT_SEARCH_BACKEND=bing python -m app.cli "查 X 并写进文件"   # 联网任务（默认后端 ddg 本机连不上，见下）
 python -m app.cli --mcp .codeagent/mcp.json "任务"   # 加载 MCP server（见 mcp.example.json）

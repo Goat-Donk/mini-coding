@@ -552,6 +552,302 @@ class UpdatePlanInput(BaseModel):
 
 ---
 
+## 4e. agent/goal.py + agent/tools/goal.py（★M9-6，进程内目标 + 显式完成检查）
+
+**文件**：`agent/goal.py`（纯 stdlib、零行为依赖）、`agent/tools/goal.py`（唯一工具）。
+
+> ⚠️ **它不是任务树。** 全仓关于 TS 原版 ④ 的唯一证据是 `docs/reference/minicode-notes.md:141`
+> 那一行，原文是「进程内 Goal（跨回合推进 + 暂停/恢复/完成检查）」+ `/goal` 命令族
+> （`cli-commands.ts:25-30`）与 `goal/context.ts`。`isComplete` / `stop_condition` / 任务树 /
+> `TodoWrite` **全仓零命中**。原版是一个**带状态机的目标对象**，不是树 —— 面试稿里原先那句
+> 「④ Goal（目标任务树）」**没有依据，已更正**（「不允许私自造假数据」的直接要求）。
+> 「允许中途改结构」这半个承诺由现有的 `update_plan`（全量覆盖）本来就兑现了。
+
+### 4e.1 数据结构与判据
+
+```python
+GOAL_ACTIVE, GOAL_PAUSED, GOAL_DONE = "active", "paused", "done"
+CHECK_PASSED, CHECK_FAILED, CHECK_INVALID = "passed", "failed", "invalid"   # 三态，见 4e.3
+
+DEFAULT_GOAL_TURNS = 3        # 一拍自动推进最多几个回合
+GOAL_CHECK_TIMEOUT = 120      # 完成检查命令的秒数上限（bash 工具自身是 300）
+GOAL_CHECK_TAIL_LINES = 40    # 回喂模型的输出尾部行数（事件里也只存尾部）
+
+@dataclass
+class Goal:
+    objective: str                  # 人写的目标
+    check_command: str              # 人给的可执行完成判据（**唯一权威**）
+    status: str = GOAL_ACTIVE
+    pause_reason: str | None = None # 仅 paused 有意义；**resume 必须清掉**
+    created_step: int = 0
+    turns: int = 0                  # 累计自动推进过的回合数（给人看）
+    declaration: dict | None = None # 瞬态：模型刚声明的完成，批前/取走时复位
+    last_check: dict | None = None  # 最近判定的摘要缓存（给 /goal status）
+
+def goal_can_advance(goal) -> bool: ...     # 判据收在一处：goal is not None and status == active
+def render_goal(goal) -> str: ...           # 唯一定义"目标长什么样"（同 render_plan 的纪律）
+def goal_kickoff_message(goal) -> str: ...  # 一拍第一个回合发
+def goal_continuation_message(goal) -> str: # 同一拍后续回合发（短一些，判据仍重述）
+def render_check_report(goal, verdict, output, reason) -> str: ...   # failed / invalid 两态
+def tail_lines(text, limit=GOAL_CHECK_TAIL_LINES) -> str: ...
+```
+
+**为什么单独一个模块**：`agent/state.py` 的自我定位是「会话状态 + 消息构造」（纯数据、零行为），
+而 Goal 带状态机迁移和三份给不同读者用的渲染文本。**为什么不是 `agent/tools/goal.py`**：那样
+`state.py` 要 import `tools/`，与 `tools/base.py` 里「底座依赖上层是反的」相悖。本模块只 import
+标准库 → 无环。
+
+**刻意不做 `derive_goal(events)`**（对比 `taint`）：污染标记有第二个判据依赖它（权限天花板），
+所以必须有重放；目标的唯一消费者是它自己和给人看的 `/goal status`。给一个没有第二个读者的
+东西加重放，只会多出一份可能对不上的真相。
+
+### 4e.2 唯一工具：`declare_goal_done`
+
+```python
+class DeclareGoalDoneInput(BaseModel):
+    summary: str                                  # 一句总结（进轨迹，给人看）
+    evidence: list[str] = Field(default_factory=list)   # 内联 array，**不能**用嵌套模型
+
+class DeclareGoalDoneTool(Tool):
+    name = "declare_goal_done"
+    def is_read_only(cls) -> bool: return False   # 它改变控制流，必须串行
+    def execute(self, args, ctx) -> ToolResult:
+        # 无 state / 无目标 → fail（**模型不能自造目标**）
+        # status == done   → fail（已完成，不再需要声明）
+        # status == paused → fail（**暂停期间不跑检查**）
+        # 正常：goal.declaration = {"summary", "evidence", "step"}；返回**普通** ToolResult
+```
+
+- **命名 `declare_goal_done` 而不是 `complete_goal`**：工具 description 是这条能力在**唯一常驻
+  请求**（工具 schema）里的全部说明，而 `complete_goal` 读起来像「调用它 = 完成」—— 那正是本项
+  要避免的误解。真实语义是：模型**声明**，运行时拿**人预先给定的命令**去跑，**退出码**说了算。
+- **参数扁平**（`summary` + 内联 `evidence: list[str]`）：`base.py` 的 `raw.pop("$defs")` 会把嵌套
+  模型**静默**削成坏 schema。真跑兑现过：模型第一次把 `evidence` 传成字符串，schema 校验直接拒掉。
+- **标志走 `state.goal.declaration`，不走 `ToolResult` 上的第二个标志**：`_execute_tool_calls`
+  在批结束时已经把每个 `ToolResult` `compact_batch` 成字符串了（只返回 `pending: str | None`），
+  要带出第二个标志就得**改它的返回类型** —— 那是四个入口共用的核心循环契约，留给 M9-7。
+  经由 `state` 传递，`_execute_tool_calls` **一个字符都没改**。
+- **没有 pause / clear / status 工具**：与 `clear_taint` 的纪律一致 —— **标记不由被标记者清除**。
+  理由不是"不信任模型"，是**判分权**：模型能改判据或撤销目标，那套检查就退化成自己跟自己打分。
+- **刻意不进 `ToolRegistry.default()`**（按入口注册，`build_goal_tools()` 一处构造）：eval 用的正是
+  `default()`，而 headless 里没有任何入口能创建目标 → 模型只会看到一个永远失败的诱饵（与
+  `ask_user` 同构）。streamlit 同样不注册（它没有 `/goal` 入口）。
+
+### 4e.3 完成检查：三态判定与回合语义
+
+对齐 `eval/golden_tasks.py` 的 `JudgeResult.executed`：命令**压根没跑成**时，「算完成」和
+「算没完成」都是错的。
+
+| 判定 | 触发 | 目标状态 | 回喂 | 事件 | `terminated_reason` | 回合 |
+|---|---|---|---|---|---|---|
+| **`passed`** | exit 0 | `done` | 不喂 | `goal_check` + `goal_completed` | **`REASON_GOAL_DONE`**（新） | 结束 |
+| **`failed`** | exit ≠ 0 | 保持 `active` | 判定文本 + 输出尾部 40 行（**user 消息**） | `goal_check` | 不变 | **继续** |
+| **`invalid`** | 门禁拦下 / 超时 / 工具异常 | 保持 `active` | 「本次判定**不计入**」 | `goal_check` + 门禁自己的 `gate_block` | **`REASON_GOAL_CHECK_INVALID`**（新） | 结束 |
+
+- **通过为什么不回喂、直接结束回合**：让模型看到「检查通过」再自己写结论，完成就又变成模型
+  说的话了 —— 恰是本项的反面。结论由运行时给出（连同模型的声明原文，人能看到它当初声称了什么）。
+- **无效为什么也结束回合**：检查命令坏了，模型**没有任何办法**修它（它不能改 `check_command`），
+  留着继续只会反复声明、每次拿一条无效判定、把步数烧光。
+- **无效为什么不复用 `await_user`**：那个值连带两件事、两件都不对 —— `_extract_learned` 会跳过
+  约定提炼（而这里的轨迹是完整的），REPL 会打印「需要你补充信息」（而这里没有人被提问）。
+- **失败为什么保持 active、本轮继续**：结束回合会让模型失去修复机会 —— 而「检查没过 → 看输出
+  → 接着修」正是这条动线的全部价值。
+
+### 4e.4 检查怎么跑（`loop._verify_goal`）
+
+```python
+call = ToolCall(id=f"goal_check@{state.step}", name="bash",
+                arguments={"command": goal.check_command, "timeout": GOAL_CHECK_TIMEOUT})
+before = len(state.events)
+result = self._gate_and_run(call, state, ctx)          # ← 同一条钩子/权限链
+gate_blocks = [e for e in state.events[before:] if e.get("type") == "gate_block"]
+exit_code = result.data.get("exit_code") if isinstance(result.data, dict) else None
+# gate_blocks 或 not result.success 或 exit_code is None → CHECK_INVALID
+# exit_code == 0 → CHECK_PASSED；否则 CHECK_FAILED
+```
+
+- **走 `_gate_and_run` 而不是直接 `tool.run`**：检查命令是**人写的一行 shell**，必须和模型自己发的
+  命令受同一套治理（PreToolUse 的 block-at-submit、权限 deny、危险命令 ask、污染天花板）。顺带换来
+  一个明确判据 ——「检查被拦下了」有 `gate_block` 事件带 `source`/`reason`，而不是靠猜错误文本。代价见 S19。
+- **合成的 `call.id` 只活在这一次调用里，不进任何消息**。**绝不伪造
+  `assistant(tool_calls=[...]) + tool(...)` 消息对**把检查伪装成模型发起的一次调用 —— 那是在会话里
+  写下一个模型从没发出过的调用，与 `PAIRING_FILLER`「必须说实话」的纪律直接冲突。判定以 **user 消息**
+  回喂，同 `_reinject_plan` 的先例。
+- **事件里只存输出尾部**（`output_tail`）+ `output_chars`：events 会进检查点，`--resume` 每次恢复
+  都要读它，而一次 pytest 的输出可达几十万字符（bash 兜底上限 `MAX_CHARS = 500_000`）。
+
+### 4e.5 插在 `_run_loop` 的哪一行（4 行）
+
+```python
+                # ★ 批前复位：结构性地保证「一次声明只触发一次检查」
+                if state.goal is not None:
+                    state.goal.declaration = None
+                pending = self._execute_tool_calls(result.tool_calls, state, ctx)
+                # ★ 判定在批后、checkpoint 前
+                if state.goal is not None and state.goal.declaration is not None:
+                    goal_end = self._verify_goal(state, task, ctx)
+                    if goal_end is not None:
+                        return goal_end
+                if self.session is not None:
+                    self.session.checkpoint(state)
+```
+
+- **批后**：「先跑测试验证、再声明完成」是模型同一步里最常见的形状；放批前只会看到上一轮的陈旧声明。
+- **checkpoint 之前**：让这一步的检查点带上**判定之后**的目标状态（done / 仍 active），否则
+  `--resume` 恢复出来的目标是错的。
+- **批前复位**：不复位的话第 N 步声明过一次之后**后面每一步**都会重跑一次完成检查 —— 烧钱、
+  上下文爆，而且**不报任何错**。`tests/test_goal.py` 有一条专门钉它。
+- **插在 `_run_loop` 里的收益是四条入口一起拿到**（同 `permissions.new_turn()` 的位置理由）——
+  于是 **`--resume` 一个有活跃目标的会话时，人给的检查照跑**（真跑验收过），否则目标在恢复路径上
+  就是个假死状态。headless 没注册工具、也没有目标，完全 no-op。
+- **同一步里既有声明又有 `ask_user` → 检查先跑**（`goal_done` 赢）：运行时的**事实**优先于模型的
+  **陈述**；两个结论都进轨迹。有测试钉这条优先级。
+
+### 4e.6 新终止原因（`agent/loop.py`）
+
+```python
+REASON_GOAL_DONE = "goal_done"
+REASON_GOAL_CHECK_INVALID = "goal_check_invalid"
+TERMINATED_REASONS = frozenset({
+    "completed", "max_steps", "loop_detected", "error", "await_user",
+    REASON_GOAL_DONE, REASON_GOAL_CHECK_INVALID,
+})
+```
+
+- 前缀 `REASON_` 是**刻意**的：`goal.py` 里 `GOAL_DONE` 是**状态**（`"done"`），这里是**终止原因**
+  （`"goal_done"`），两个词都在 `loop.py` 被 import —— 同名会让读代码的人以为它们是同一个东西。
+- **既有五个字面量保持不动**：那是纯改名扫荡，会把"加一个功能"变成"加功能 + 重构核心循环"，
+  而五个返回点正是变异体最常锚的地方。集中集合补的是真缺口（**一共有哪些值**）—— 在此之前
+  "新增一个终止原因但忘了让 REPL 的自动推进在它上面停下来"不会有任何东西变红。
+- `_goal_turn_result` 与 `_awaiting_user` 一样 `checkpoint(force=True)`：同一个「流程即将因**非步数**
+  原因结束，节流的下一次 tick 永远等不来」的理由。
+
+### 4e.7 `AgentState.goal` 与 `_FIELD_DECODERS`
+
+```python
+    goal: Optional["Goal"] = None     # agent/state.py（TYPE_CHECKING 导入，避免 state ↔ goal 成环）
+```
+
+> ⚠️ **加这个字段必须同时给 `agent/session.py` 的 `_FIELD_DECODERS` 补一行**
+> （`"goal": lambda raw: Goal(**raw) if raw else None`）。`load_state` 走 `AgentState(**raw)`，
+> 而 dataclass **不做类型检查** —— 漏了这一行，字段会是个 `dict`，直到有人读 `.status` 才抛错，
+> 而那个炸点被 `_run_loop` 的 `except Exception` 吞成 `terminated_reason="error"`，**看起来像引擎出错**。
+> 一条测试 + 一条变异体专门钉它。**绝不能**把目标放进 `terminated_reason` —— 那个是**每回合一份**、
+> 由 `_run_loop` 入口复位（M9-5 修的正是这个），把跨回合的东西放进去等于重造那个 bug。
+
+### 4e.8 `/goal` 命令族与自动推进（`app/repl.py`）
+
+`_dispatch` 用 `line.partition(" ")` 切键，键只能是第一段 token → 四个子命令由**同一个 handler**
+按 `rest` 解析。解析规则只有两条且必须确定：**带 `--check` 一定是设定**；**不带 `--check` 且首词是
+已知子命令 → 子命令**；两者都不是 → 用法错（**只在这条命令内失败、不带走 REPL**）。**已知边界**：
+目标文本里出现字面 ` --check ` 会被切开 —— **不做引号解析**，加一层"半个 shell"只会造出第二个
+有歧义的解析器。
+
+| 命令 | 行为 | 事件 |
+|---|---|---|
+| `/goal X --check C` | 已有活跃/暂停目标则**拒绝**（防旧目标的检查命令无声消失）；否则建目标 | `goal_created` |
+| `/goal` / `/goal status` | 纯读（`render_goal`） | 无 |
+| `/goal pause [原因]` | `status=paused` + 存原因；已暂停**拒绝且不覆盖**原原因 | `goal_paused`(auto=False) |
+| `/goal resume` | `status=active`、**必须清 `pause_reason`**；`done` 时拒绝（完成是终态） | `goal_resumed` |
+| `/goal clear` | `state.goal = None`（**不是置 done** —— 后者会在轨迹里留下一句没发生过的成功） | `goal_cleared` |
+
+```python
+def loop(self):
+    while not self._done:
+        if goal_can_advance(self.state.goal):
+            self._run_goal_burst()                      # 一拍自动推进，然后回到提示符
+            if self._done: break
+        raw = input(self._prompt())
+        ...
+        else:
+            self._pause_goal("人工回合（你敲了一行字，目标转为暂停）")   # ★ 隐式暂停
+            self.run_turn(line)
+
+BURST_STOP_REASONS = {"await_user", REASON_GOAL_CHECK_INVALID, REASON_GOAL_DONE,
+                      "max_steps", "loop_detected", "error"}    # ← "completed" 刻意不在
+```
+
+- **`_run_goal_burst` 结尾一定 `_pause_goal(stop)`**（仅在 `goal_can_advance` 为 False 时提前返回）：
+  不留着 active 回提示符，否则循环顶部会立刻再起一拍（按一次回车、敲一条 `/help` 都会重新触发），
+  那就等于无界。**停下来这个动作让「一拍 = 一次授权」在结构上成立。**
+- **上限不是优化，是防锁死**：`input()` 是阻塞的、没有定时器，一拍期间人**根本敲不进字**，无界推进
+  = 把人锁在门外直到烧完额度。所以 `/goal` 的输出里**把授权额度打给人看**（「最多 3 回合 × 每回合
+  25 步 = 75 步」）。`--goal-turns` **刻意不进检查点** —— 它是交互策略，不是会话事实（对比
+  `checkpoint_every`：那个恢复时必须沿用）。`Repl.__init__` 做 `max(1, goal_turns)`。
+- **`"completed"` 刻意不在 `BURST_STOP_REASONS`**：一个回合"正常跑完"（模型给了文字、不再调工具）
+  恰恰是自动推进**要继续**的情形 —— 目标的完成与否由人给的检查命令说了算，不由模型停不停下来说了算。
+  这份集合必须覆盖 `TERMINATED_REASONS` 里除 `completed` 之外的全部取值，有测试钉着。
+- **`_STOP_REASONS` 每个原因都要有话说**：暂停是自动推进的唯一出口，理由说不清的话人只会看到
+  「它自己停了」。
+- **「人敲一行字」= 隐式暂停，这不是偏好而是结构性事实**：人只能在一拍停下时才拿到提示符；那一行
+  若不暂停，回合结束后循环立刻又起一拍，**人再也敲不进第二行**。选暂停还因为它是可逆的那一侧
+  （`/goal resume` 一句话恢复），且它**不静默**（把原因与恢复方式打出来）。
+- **暂停是数据不是控制流**（同 `await_user` 的纪律）：`_pause_goal` 只改 `status` + 记一条事件，
+  既不 `return` 也不 `raise`。
+- **提示符状态位 `goal:<status>`** 只在**有目标**时显示（同 taint 只在非 `none` 时显示的处理：
+  恒显一个值会让人不再看它）。状态值本身要露出来 —— `active` 与 `paused` 下面会发生完全不一样的事。
+- **判定无效单独一种打印样式**：它既不是成功也不是失败，却**最容易被人当成跑完了**（没有报错、
+  退出码 0、还有一段像结论的话）。判据原文永远印在判定结果旁边（S17 唯一的缓解手段）。
+
+### 4e.9 目标不进 system prompt（与 `plan` 同一纪律）
+
+四条理由逐条同 §4d 第 3 条：① `system` 是 `messages[0]`、在 `_PREFIX_LEN` 保护区内，变一次 = 整条
+前缀缓存永久失效；② 目标是会话中途创建的，注入就得**回改第 0 条**；③ `state.system_prompt` 渲染
+一次就进检查点，`--resume` 必须拿到当初那份；④ **可见性本来就够且更好** —— 创建那一刻的 kickoff
+消息是一条真实的 `user` 消息，判定与续跑文本都在会话尾部。
+
+**这是 M8 那个 elicitation gap 的正解形状**：引导必须出现在**目标被创建的那一刻**，那里恰好有一个
+天然的用户回合。**刻意不给 `DEFAULT_SYSTEM_PROMPT` 加 `{goal_hint}` 槽位**：加了就得按"注册了哪些
+工具"填（同 `_ASK_USER_HINT`），而目标工具在 CLI 两个入口都注册 → **每个单发会话**都要为"一个不存在
+的目标"付 token，且模型会去调一个注定失败的声明工具。
+
+`--resume` 时 `_reinject_goal(state)` 补投一次（与 `_reinject_plan` 同处、同形状、同理由：目标很可能
+已被 compact 裁掉）。**只补一次、不每轮贴** —— 每轮贴等于把"目标有没有变"变成"消息有没有变"。
+
+### 4e.10 `--goal`（只读）与不做的事
+
+- **`--goal` 与 `--plan` 完全同构**：读检查点里的一个字段就该够 → 不建会话、不要 key、不跑任务，
+  排在 `_build_llm` 之前（测试用"一调用就炸"的 `_build_llm` 替身钉住）。没有这条出口，REPL 里设的
+  目标在进程外**没有任何消费者**（本项目明确防这个）。输出**从事件里取**（`goal_check` 的
+  `output_tail`），不从 `last_check` 取 —— 后者只是给 `/goal status` 的摘要，存第二份就是第二个真相源。
+- **不做 `--goal/--check` 单发目标生命周期**：目标是"进程内跨回合"的能力，单发里连"下一个回合"
+  都不存在。但**完成检查天然生效**（它长在 `_run_loop` 里），这是白拿的、也是必须的。
+
+### 4e.11 如实标注（README S17–S20）
+
+| 编号 | 局限 |
+|---|---|
+| **S17** | **空转的检查命令**：判据是人给的，运行时只看退出码、**不评价它检查了什么**（`--check "true"` 永远通过）。缓解只有**可见性**（判定文案永远把命令原文印在结果旁边），**没有任何机制阻止** |
+| **S18** | **声明不是闸门，只是事后核验**：模型可以完全不声明就把活干完（目标停在 active、多花回合），也可以在毫无证据时声明（靠检查兜底）。防的是"谎报完成"，不防"判断失误" |
+| **S19** | **检查的副作用能替 agent 打开一道治理闸门**：检查走 `_gate_and_run` → PostToolUse hooks 生效 → 一条成功的 `pytest` 会写 `data/tests_pass.marker`，而它正是解锁 `git commit` 的那道门。轨迹上与模型自己跑同一条命令**不可区分** —— 复用同一条链的代价，不是疏漏 |
+| **S20** | **「判定无效」比 eval 弱一层**：eval 有 pytest 的退出码 2/3/4/5 认得出"压根没跑成"，**shell 没有这个信号** —— `exit 127`、`No module named pytest` 都会被记成**未通过**。只有门禁拦下 / 超时 / 工具异常才算无效 |
+
+另记：`/fork` 会连目标一起继承而检查跑在**当前**工作区上（对话分叉、文件不回滚 → 可能白捡一个通过）；
+通过即结束回合，模型没有机会补充「还有一件次要的事没做」（这是把判分权拿走的**代价**）；检查超时
+120s 是常量、没有旋钮；`state.task` 会被续跑文本覆写（目标本身才是权威）。
+
+### 4e.12 测试与真实验证
+
+- `tests/test_goal.py` **38 例** + `tests/test_repl.py` / `tests/test_session.py` 补契约；全量 **597 全绿**。
+  重点用例：创建时 `objective`/`check_command` **逐字落库**、`pause` 存原因 / `resume` **必须清
+  `pause_reason`**、`clear` → `None`（杀"实现成置 done"）、已有活跃目标时拒绝第二个、检查跑的是
+  `check_command` 原文、exit≠0 **保持 active 且本轮继续**、失败判定以 `user` 消息回喂、**门禁拦下 →
+  `invalid` 而非 `failed`**（且不记 `goal_completed`）、一次声明**恰好**跑一次检查、输出截到最后 40 行、
+  schema 扁平无 `$defs`、一拍自动跑多个回合、**`dump_state` → `load_state` 回来是 `Goal` 实例不是 `dict`**、
+  暂停跨进程往返后仍门住一拍、`--goal` 不碰 LLM（`_build_llm` 换成 boom）、`/help` 键集合恰好等于
+  `_COMMANDS`（计数 10）、真 `BashTool` + 真 permissions 下检查**真的**过门禁链（`gate_block` 带
+  `source`/`reason`）。
+- 变异测试 **20/20 被抓住**（`m9verify/mutate_m9_6.py`）。**一个如实标注的 MISS**：「人工回合不暂停」
+  实证 MISS，原因是**结构性的** —— `loop()` 进提示符前必先跑一拍 + `_run_goal_burst` 结尾必暂停 →
+  提示符处目标绝不为 active，那句 `_pause_goal` 命中的永远是拒绝分支。这是「一拍 = 一次授权」
+  不变式的推论，与动线 ④ 在纯 stdin 流程里不可观测**同源**。
+- **真实 LLM 端到端五条动线全部有日志**（DeepSeek 官方通路，真工作区 `m9verify/ws_m96_a|b|c|d|e/`，
+  真 pytest 真跑；`goal_a|b|b2|c|d|e.log` + 驱动脚本 `drive_m9_6.py` 的三个 case）。逐条证据与数字见
+  `TASKS.md` 的 M9-6 条目。**这五条的数字与既有单发/REPL 数字不可比** —— 自动续跑会把 `max_steps`
+  乘上 `goal_turns`。
+
+---
+
 ## 5. agent/state.py（★M1 完成）
 
 **文件**：`agent/state.py`
@@ -584,6 +880,7 @@ class AgentState:
     terminated_reason: str | None = None
     memory_blocks: list[str] = field(default_factory=list)  # 注入的 repo 记忆段落
     plan: list[dict] = field(default_factory=list)   # M8 [{"text": str, "status": str}]
+    goal: Optional["Goal"] = None                    # ★M9-6 进程内目标（见 §4e；TYPE_CHECKING 导入）
     last_usage: Usage | None = None                  # M3 provider 锚点（compact 后置 stale）
     usage_stale_reason: str | None = None            # "tool_output_truncated"|"snip_compact"|"llm_compact"
     taint: str = TAINT_NONE                          # M7 会话级污染标记（只升不降）
@@ -594,10 +891,16 @@ class AgentState:
 ```
 
 > `plan` **不是**从事件派生的值（对比 `taint`：那个由轨迹里的 `security_finding` 重放得出），
-> 它就是权威状态本身 —— 所以没有对应的 `derive_plan`。检查点是按 `dataclasses.fields()`
+> 它就是权威状态本身 —— 所以没有对应的 `derive_plan`。`goal`（★M9-6）同样如此：它是权威状态
+> 本身、随检查点走，**也没有** `derive_goal`（见 §4e.1 末：给一个没有第二个读者的东西加重放，
+> 只会多出一份可能对不上的真相）。检查点是按 `dataclasses.fields()`
 > **全字段**快照的，加字段自动进检查点；`tests/test_session.py` 有一条从 `fields()` 反推
 > 字段全集的往返测试，**加字段时它会失败**，提醒你把新字段填进测试的 `values`。
 > `emitter` 是唯一的例外（运行时对象，故意不落盘）。
+> ⚠️ **加字段时还有一处必改**：若它不是 JSON 原生类型，必须同时给 `agent/session.py` 的
+> `_FIELD_DECODERS` 补一行 —— `load_state` 走 `AgentState(**raw)` 而 dataclass **不做类型检查**，
+> 漏了的话字段会是个 `dict`，直到有人读它的属性才炸，而那个炸点被 `_run_loop` 的
+> `except Exception` 吞成 `terminated_reason="error"`，**看起来像引擎出错**（见 §9.3）。
 
 ### 5.3 边界
 
@@ -795,8 +1098,14 @@ class RunResult:
     steps: int
     usage: Usage
     events: list[dict]
-    terminated_reason: str          # "completed" | "max_steps" | "loop_detected" | "error" | "await_user"
+    terminated_reason: str          # 取值见 loop.TERMINATED_REASONS（"completed" | "max_steps" |
+                                    # "loop_detected" | "error" | "await_user" |
+                                    # ★M9-6 新增 "goal_done" | "goal_check_invalid"）
     task: str
+
+REASON_GOAL_DONE = "goal_done"                   # ★M9-6
+REASON_GOAL_CHECK_INVALID = "goal_check_invalid" # ★M9-6
+TERMINATED_REASONS = frozenset({...})            # ★M9-6 集中列举，见 §4e.6
 
 class QueryEngine:
     def __init__(self, llm: BaseLLM, registry: ToolRegistry, *,
@@ -841,7 +1150,9 @@ class QueryEngine:
         #   state.record_event("llm_call", tool_calls=[...], usage=..., step=state.step)
         #   if result.tool_calls:
         #      loop 检测（7.3）
+        #      ★ M9-6 批前复位：if state.goal is not None: state.goal.declaration = None
         #      execute_tool_calls(result.tool_calls, state, ctx)
+        #      ★ M9-6 批后判定：声明存在 → _verify_goal(...) 返回非 None 就 return（见 7.7）
         #      continue
         #   else:
         #      state.terminated_reason = "completed"
@@ -873,6 +1184,15 @@ class QueryEngine:
         # 每条：result = self._gate_and_run(call, state, ctx)
         #       state.record_event("tool_call", name, arguments, success, duration_ms, exit_code)
         # 结果消息：assistant_tool_calls(calls) 一条 + 每个 tool_result(call.id, result.output) 一条（顺序与 calls 对应）
+        # ★ M9-6 一个字符都没改它 —— 完成声明经由 state.goal.declaration 传递，见 §4e.2
+
+    # ---- 目标（★M9-6，实现细节见 §4e.4 / §4e.3）----
+    def _verify_goal(self, state, task, ctx) -> RunResult | None:
+        # 跑一次**人预先给定的**完成检查命令（合成 bash 调用 → _gate_and_run）。
+        # 返回 None = 未通过（回喂 user 消息、本轮继续）；否则返回已带
+        # REASON_GOAL_DONE / REASON_GOAL_CHECK_INVALID 的 RunResult。
+    def _goal_turn_result(self, state, task, reason, final_text) -> RunResult:
+        # checkpoint(force=True)，理由同 _awaiting_user（非步数原因退出）
 ```
 
 ### 7.2 默认 system prompt 模板（坍缩防护 + plan 少而精）
@@ -942,6 +1262,52 @@ DEFAULT_SYSTEM_PROMPT = f"""\
 
 `tests/test_loop.py` 里这五条各有一组用例（含 `ensure_tool_pairing` 的 4 条纯函数用例：
 healthy 不动 / 补全且紧跟已有结果 / 幂等 / 以普通文本收尾不误判）。
+
+### 7.7 目标判定（★M9-6）
+
+完整规格见 §4e（模块、工具、三态、命令族）。这里只记**它长在循环里的哪一处、以及为什么**：
+
+```python
+                if state.goal is not None:          # 批前复位
+                    state.goal.declaration = None
+                pending = self._execute_tool_calls(result.tool_calls, state, ctx)
+                if state.goal is not None and state.goal.declaration is not None:
+                    goal_end = self._verify_goal(state, task, ctx)   # 批后判定
+                    if goal_end is not None:
+                        return goal_end
+                if self.session is not None:
+                    self.session.checkpoint(state)
+                if pending is not None:
+                    return self._awaiting_user(state, task, pending)
+```
+
+**五个既有返回点、`_execute_tool_calls`、`_awaiting_user`、`budget_start` 语义全部不动。**
+插在 `_run_loop` 里 → 四条入口（`run` / `run_from` / `run_turn` / 控制台）一起拿到，
+理由同 `permissions.new_turn()` 的位置；headless 因为没注册工具 + 没目标，完全 no-op。
+
+| 判定 | 目标 | 回喂 | 事件 | `terminated_reason` | 回合 |
+|---|---|---|---|---|---|
+| 通过（exit 0） | `done` | 不喂 | `goal_check` + `goal_completed` | `goal_done`（新） | 结束 |
+| 未通过（exit≠0） | 保持 `active` | 判定 + 输出尾部 40 行 | `goal_check`(failed) | 不变 | **继续** |
+| 判定无效（门禁拦下/超时/工具异常） | 保持 `active` | 「命令没能执行，本次不计入」 | `goal_check`(invalid) + 门禁的 `gate_block` | `goal_check_invalid`（新） | 结束 |
+
+**同一步里既有声明又有 `ask_user` → 检查先跑**（`goal_done` 赢）：运行时的**事实**优先于模型的
+**陈述**；两个结论都进轨迹。有测试钉这条优先级。
+
+**目标与 `plan` 在系统提示词上的纪律完全一致**：一个字都不进 `messages[0]`（前缀缓存 + 回改第 0 条
+两笔账），可见性靠创建那一刻的 kickoff 消息与 `--resume` 时的一次补投。
+
+这些**位置的用例全在 `tests/test_goal.py` 里**（`tests/test_loop.py` **一条都没动** —— 这一项
+刻意没碰既有测试文件，见下）：`test_one_declaration_triggers_exactly_one_check`（批前复位 →
+一次声明恰好一次检查）、`test_check_beats_ask_user_in_the_same_step`（优先级）、
+`test_failed_check_keeps_active_and_feeds_back_via_user`（失败保持 active 且本轮继续）、
+`test_check_blocked_by_gate_is_invalid_not_failed` / `test_check_that_does_not_run_is_invalid`
+（三态）、`test_real_bash_check_runs_through_the_gate_chain`（真 `BashTool` + 真 permissions）、
+`test_goal_never_enters_messages_zero`（前缀缓存不变式）。工具面与命令族的用例见 §4e.12。
+
+> 为什么 `tests/test_loop.py` 不改：这一项往 `_run_loop` 里插的 4 行**没有改变任何既有行为**
+> （`state.goal is None` 时两条 `if` 都不进），而既有测试文件正是这一项用来证明「没动到别人」的
+> 基线 —— 让它保持逐字节不变，比往里补两条更说明问题。同理 `_execute_tool_calls` 一个字符没改。
 
 ---
 
@@ -1043,21 +1409,30 @@ permissions = PermissionsEngine(..., confirm=_confirm_prompt if review_edits els
 
 ```python
 class Repl:
-    def __init__(self, runtime: _Runtime, *, checkpoint_every=None, clear_taint=False): ...
+    def __init__(self, runtime: _Runtime, *, checkpoint_every=None, clear_taint=False,
+                 goal_turns=DEFAULT_GOAL_TURNS): ...   # ★M9-6 goal_turns: max(1, ...)，不进检查点
     def start(self, *, start_session_id=None, resume=False, step=None) -> None: ...
     def loop(self) -> None:            # 读一行 → 一个回合；只有 EOF / 提示符处 Ctrl+C / /exit 会离开
+                                       # ★M9-6 进提示符前先 `if goal_can_advance(...): _run_goal_burst()`
     def run_turn(self, text) -> RunResult | None:   # 只做显示与记账，循环逻辑在 engine.run_turn 里
     def _activate(self, session, state=None) -> None:   # ★ 三样一起换：session / state / **engine**
     def _dispatch(self, line) -> None:  # 斜杠命令分派
     def _report(self, result, before_usage, before_step) -> None:   # 本回合增量
     def _farewell(self, reason) -> None:   # 退出语：必须给可执行的续跑命令
     def _wrap_up(self) -> None:            # ★ 退出时强制落检查点 + 一次约定提炼
+    # ---- ★M9-6 目标 ----
+    def _run_goal_burst(self) -> None:     # 自动推进一拍，**结尾一定 _pause_goal(stop)**
+    def _pause_goal(self, reason, *, auto=True) -> None:   # 只改数据 + 记事件，不 return 不 raise
+    def _cmd_goal(self, arg) -> None:      # /goal 的四个子命令由它一个解析（_dispatch 只切第一段 token）
+    def _create_goal / _goal_status / _goal_pause / _goal_resume / _goal_clear(self) -> None: ...
 ```
 
-**提示符**：`codeagent [名字或 sid 前 8 位 · step 12 · high] › `（污染级别只在非 `none`
-时显示 —— 常显一个 "none" 会让人不再看这一段，等它真的变成 high 时也照样不看）。
+**提示符**：`codeagent [名字或 sid 前 8 位 · step 12 · high · goal:active] › `
+（污染级别只在非 `none` 时显示 —— 常显一个 "none" 会让人不再看这一段，等它真的变成 high 时
+也照样不看；★M9-6 的 `goal:<status>` 同理，**只在有目标时显示**，因为 `active` 与 `paused`
+下面会发生完全不一样的事）。
 
-**9 个斜杠命令**（每个都复用已有函数、零新机制）：
+**10 个斜杠命令**（每个都复用已有函数、零新机制）：
 
 | 命令 | 复用 |
 |---|---|
@@ -1067,9 +1442,15 @@ class Repl:
 | `/resume [id\|名字]` | `_resolve_session_ref` + `Session.from_checkpoint` |
 | `/fork [步]` | `cli._do_fork` |
 | `/plan` | `render_plan`（空清单不复用"已清空"文案 —— 那是 `update_plan` 清空动作的说法） |
+| `/goal …` | ★M9-6：`render_goal` + `Goal` 状态机 + `_run_goal_burst`（完整规格见 §4e.8） |
 | `/sessions` | `cli._print_sessions` |
 | `/rename <名>` | `set_session_name` |
 | `/clear-taint` | `state.clear_taint(reason="repl:/clear-taint")` —— **人的动作** |
+
+> ★M9-6 的 `/goal` 是**唯一一个有自己的状态机**的命令（其余九个都是"转发给已有函数"），
+> 但它同样没往 REPL 里引新机制：自动推进就是**连着调 `run_turn`**，暂停就是**改一个数据字段**。
+> 详见 §4e.8（含 `BURST_STOP_REASONS` 为什么不含 `"completed"`、以及「人敲一行字 = 隐式暂停」
+> 那条结构性事实）。
 
 **两条硬不变量**（各有测试钉着）：
 
@@ -1184,7 +1565,11 @@ class Session:
 
 DEFAULT_CHECKPOINT_EVERY = 5                 # 新会话的默认节拍；老检查点的回落实也在用它
 _SKIP_FIELDS = frozenset({"emitter"})        # 运行时对象，不落盘
-_FIELD_DECODERS = {"usage": ..., "last_usage": ...}   # JSON dict → Usage
+_FIELD_DECODERS = {"usage": ..., "last_usage": ..., "goal": lambda raw: Goal(**raw) if raw else None}
+                                             # JSON dict → 真类型。★M9-6 加了 goal：
+                                             # **给 AgentState 加非 JSON 原生类型的字段就必须在这里补一行**，
+                                             # 漏了不报错（见 §5.2 的警告 —— 那个炸点会被 loop 吞成
+                                             # terminated_reason="error"，看起来像引擎出错）
 _LEGACY_FLAT_KEYS: tuple[str, ...]           # M7 之前的平铺格式（冻结，只读老文件）
 
 def dump_state(state: AgentState) -> dict    # 全字段快照；不可序列化→报字段名

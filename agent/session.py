@@ -30,6 +30,7 @@ import time
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 
+from agent.goal import Goal
 from agent.llm import Usage
 from agent.security import TAINT_MEDIUM, TAINT_NONE, higher
 from agent.state import AgentState
@@ -45,9 +46,16 @@ DEFAULT_CHECKPOINT_EVERY = 5
 
 # 需要反序列化回类型的字段（JSON 里是 dict，dataclass 要的是对象）。
 # 其余字段按 JSON 原样传回 `AgentState(**raw)`。
+#
+# ⚠️ **给 AgentState 加一个 dataclass 字段时，如果它不是 JSON 原生类型，就必须
+# 在这里补一行。** `load_state` 走的是 `AgentState(**raw)`，而 dataclass 不做
+# 类型检查 —— 漏了这一行，字段会是个 `dict`，直到有人读它的属性才炸；而那个
+# 炸点被 `QueryEngine._run_loop` 的 `except Exception` 吞成
+# `terminated_reason="error"`，**看起来像引擎出错**（M9-6 的 `goal` 就属于这类）。
 _FIELD_DECODERS: dict[str, object] = {
     "usage": lambda raw: Usage(**raw),
     "last_usage": lambda raw: Usage(**raw) if raw else None,
+    "goal": lambda raw: Goal(**raw) if raw else None,
 }
 
 # M7 之前的落盘格式：state 字段平铺在 payload 顶层。这份名单是**冻结的**——

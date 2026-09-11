@@ -36,6 +36,18 @@ import typer
 if TYPE_CHECKING:                      # 只用于注解，避免与 app.cli 的导入成环
     from agent.loop import RunResult
 
+from agent.goal import (
+    DEFAULT_GOAL_TURNS,
+    GOAL_ACTIVE,
+    GOAL_DONE,
+    GOAL_PAUSED,
+    Goal,
+    goal_can_advance,
+    goal_continuation_message,
+    goal_kickoff_message,
+    render_goal,
+)
+from agent.loop import REASON_GOAL_CHECK_INVALID, REASON_GOAL_DONE
 from agent.security import TAINT_NONE
 from agent.session import (
     DEFAULT_CHECKPOINT_EVERY,
@@ -54,6 +66,7 @@ from app.cli import (
     _do_fork,
     _extract_learned,
     _print_sessions,
+    _reinject_goal,
     _reinject_plan,
     _resolve_session_ref,
     _session_label,
@@ -68,9 +81,40 @@ _COMMANDS: dict[str, tuple[str, str]] = {
     "/resume": ("_cmd_resume", "切到某个会话：id 或名字；省略 = 最近一个"),
     "/fork": ("_cmd_fork", "从当前会话的第 N 步分叉出去并切过去（省略 = 最近检查点）"),
     "/plan": ("_cmd_plan", "打印 agent 自己排的任务计划清单"),
+    "/goal": (
+        "_cmd_goal",
+        "设定并自动推进一个目标：/goal <目标> --check <命令>；"
+        "子命令 status / pause [原因] / resume / clear",
+    ),
     "/sessions": ("_cmd_sessions", "列出所有会话（名字/步数/检查点数/分叉来源）"),
     "/rename": ("_cmd_rename", "给当前会话起个人看得懂的名字"),
     "/clear-taint": ("_cmd_clear_taint", "复位本会话的污染标记（**人的动作**）"),
+}
+
+#: `/goal` 的子命令（不带 `--check` 时按它们解析）。**顺序无关**，只用于判"首词
+#: 是不是子命令"。
+_GOAL_SUBCOMMANDS: tuple[str, ...] = ("status", "pause", "resume", "clear")
+
+#: 自动推进碰到这些终止原因就停。**`"completed"` 刻意不在里面**：一个回合
+#: "正常跑完"（模型给出了文字、不再调工具）恰恰是自动推进要继续的情形 ——
+#: 目标的完成与否由人给的检查命令说了算，不由模型停不停下来说了算。
+#:
+#: 这份集合必须覆盖 `loop.TERMINATED_REASONS` 里除 `completed` 之外的全部取值，
+#: 有测试钉着（新增终止原因却忘了在这里停下 = 自动推进白烧预算，且不报错）。
+BURST_STOP_REASONS: frozenset[str] = frozenset({
+    "await_user", REASON_GOAL_CHECK_INVALID, REASON_GOAL_DONE,
+    "max_steps", "loop_detected", "error",
+})
+
+#: 一拍停下来时，把终止原因翻成给人看的一句暂停理由。**每个原因都要有话说**：
+#: 暂停是自动推进的唯一出口，理由说不清的话，人只会看到「它自己停了」。
+_STOP_REASONS: dict[str, str] = {
+    "await_user": "模型提问，等你回答",
+    REASON_GOAL_CHECK_INVALID: "完成检查无法执行（见上方判定）",
+    "max_steps": "本回合达到步数上限",
+    "loop_detected": "本回合触发了循环检测",
+    "error": "本回合出错",
+    "interrupted": "本回合被 Ctrl+C 打断",
 }
 
 
@@ -96,11 +140,16 @@ class Repl:
         *,
         checkpoint_every: int | None = None,
         clear_taint: bool = False,
+        goal_turns: int = DEFAULT_GOAL_TURNS,
     ) -> None:
         self.runtime = runtime
         self.workspace_root = runtime.workspace_root
         self.checkpoint_every = checkpoint_every
         self.clear_taint = clear_taint
+        # 一拍自动推进的回合上限。**刻意不进检查点** —— 它是交互策略，不是
+        # 会话事实（对比 `checkpoint_every`：那个是"这个会话怎么落的盘"，
+        # 恢复时必须沿用）。每次进 REPL 重新决定就好。
+        self.goal_turns = max(1, goal_turns)
         self.session: Session | None = None
         self.state = None
         self.engine = None
@@ -146,6 +195,7 @@ class Repl:
                 state.clear_taint(reason="repl:--clear-taint")
                 typer.secho("污染标记已复位为 none", fg=typer.colors.GREEN)
             _reinject_plan(state)
+            _reinject_goal(state)
             typer.secho(
                 f"恢复会话 {_session_label(self.workspace_root, session.session_id)}"
                 f"（step {state.step}）→ 交互模式",
@@ -166,13 +216,23 @@ class Repl:
             )
 
     def loop(self) -> None:
-        """读一行 → 一个回合。**只有** EOF / 提示符处 Ctrl+C / `/exit` 会离开。"""
+        """读一行 → 一个回合。**只有** EOF / 提示符处 Ctrl+C / `/exit` 会离开。
+
+        目标活跃时，**每一轮先自动推进一拍**再回到提示符（M9-6）。一拍结束
+        一定把它停下来（见 `_run_goal_burst`），所以下面这个 `if` 不会在同一
+        个提示符上反复触发 —— 这也是「暂停」在架构里真实存在的地方：
+        我们的架构里没有定时器，暂停的后果就是**这块不再自动跑**。
+        """
         typer.secho(
             "常驻交互模式：一行一个回合。`/help` 看命令，`/exit` 退出。",
             fg=typer.colors.BRIGHT_BLACK,
         )
         try:
             while not self._done:
+                if goal_can_advance(self.state.goal):
+                    self._run_goal_burst()
+                    if self._done:
+                        break
                 try:
                     raw = input(self._prompt())
                 except EOFError:
@@ -189,9 +249,73 @@ class Repl:
                 if raw.startswith("/"):
                     self._dispatch(line)
                 else:
+                    # ★ **人的一行输入 = 隐式暂停。** 这不是偏好，是结构性事实：
+                    # `input()` 是阻塞的，人只能在一拍停下时才拿到提示符；这一行
+                    # 若不暂停，回合结束后循环回到顶部、立刻又起一拍，
+                    # **人再也敲不进第二行**。
+                    #
+                    # 选暂停而不是"插一回合后继续"，还因为它是可逆的那一侧
+                    # （`/goal resume` 一句话恢复），而且它**不静默** ——
+                    # `_pause_goal` 会把原因和恢复方式打出来。
+                    self._pause_goal("人工回合（你敲了一行字，目标转为暂停）")
                     self.run_turn(line)
         finally:
             self._wrap_up()
+
+    # ---------- 目标的自动推进（M9-6） ----------
+
+    def _run_goal_burst(self) -> None:
+        """自动推进**一拍**：最多 `goal_turns` 个回合，然后一定停下来。
+
+        **上限必须有**：`input()` 是阻塞的、没有定时器，一拍期间人根本敲不进字
+        —— 无界推进 = 把人锁在门外直到烧完额度。一拍最多
+        `goal_turns × max_steps` 步，这个算术在 `/goal` 的输出里打给人看
+        （人得知道自己授权了多少）。
+
+        **结束时一定暂停**（而不是留着 active 回提示符）：否则循环顶部会立刻
+        再起一拍 —— 按一次回车、或者敲一条 `/help`，都会重新触发一轮自动推进，
+        那就等于无界。停下来这个动作让「一拍 = 一次授权」在结构上成立。
+        """
+        # 兜底理由：正常走到这里都是"跑满本拍上限"。
+        stop = f"本拍自动推进已达上限（{self.goal_turns} 回合）"
+        for index in range(self.goal_turns):
+            goal = self.state.goal
+            if not goal_can_advance(goal):
+                return  # 已经 done / paused / clear 掉了 —— 没有要停的东西
+            text = (
+                goal_kickoff_message(goal) if index == 0
+                else goal_continuation_message(goal)
+            )
+            goal.turns += 1
+            result = self.run_turn(text)
+            if result is None:  # Ctrl+C 打断
+                stop = _STOP_REASONS["interrupted"]
+                break
+            if result.terminated_reason in BURST_STOP_REASONS:
+                stop = _STOP_REASONS.get(
+                    result.terminated_reason, result.terminated_reason
+                )
+                break
+        self._pause_goal(stop)
+
+    def _pause_goal(self, reason: str, *, auto: bool = True) -> None:
+        """把当前目标停下来（数据变更 + 一条事件 + 一句给人看的话）。
+
+        **它是数据，不是控制流** —— 与 `ask_user` 的 `await_user` 同一个纪律：
+        暂停只是把 `status` 改掉，谁来读它、谁因此改变行为，是调用方的事。
+        所以这里既不 `return` 也不 `raise`。
+        """
+        goal = self.state.goal
+        if not goal_can_advance(goal):
+            return
+        goal.status = GOAL_PAUSED
+        goal.pause_reason = reason
+        self.state.record_event("goal_paused", reason=reason, auto=auto)
+        typer.secho(f"目标已暂停：{reason}", fg=typer.colors.MAGENTA, bold=True)
+        typer.secho(
+            "  （继续自动推进: /goal resume；查看进度: /goal status）",
+            fg=typer.colors.BRIGHT_BLACK,
+        )
 
     # ---------- 一个回合 ----------
 
@@ -279,6 +403,7 @@ class Repl:
         self._activate(session, state)
         self._announce_taint(state)
         _reinject_plan(state)
+        _reinject_goal(state)
         typer.secho(
             f"已切到 {_session_label(self.workspace_root, sid)}（step {state.step}）",
             fg=typer.colors.CYAN, bold=True,
@@ -314,6 +439,164 @@ class Repl:
         typer.echo(
             render_plan(self.state.plan) if self.state.plan else "（该会话没有计划清单）"
         )
+
+    _GOAL_USAGE = (
+        "用法:\n"
+        "  /goal <目标> --check <命令>   设定目标并自动推进（命令的退出码 0 才算完成）\n"
+        "  /goal          或  /goal status          看当前目标\n"
+        "  /goal pause [原因]                       停掉自动推进，回到你按行输入\n"
+        "  /goal resume                             恢复自动推进\n"
+        "  /goal clear                              丢弃目标（不是标记完成）"
+    )
+
+    def _cmd_goal(self, arg: str) -> None:
+        """`/goal` 命令族：设定 / status / pause / resume / clear（M9-6）。
+
+        `_dispatch` 用 `line.partition(" ")` 切键，所以键只能是第一段 token ——
+        四个子命令因此必须由**同一个 handler** 解析剩下的部分。
+
+        解析规则只有两条，且必须是确定的：
+        - **带 `--check` 一定是设定**；
+        - **不带 `--check` 且首词是已知子命令 → 子命令**；
+        - 两者都不是 → 用法错（只在这条命令内失败，不带走 REPL）。
+
+        已知边界（如实记）：目标文本里出现字面 ` --check ` 会被切开。**不做引号
+        解析** —— 加一层"半个 shell"只会造出第二个有歧义的解析器。
+        """
+        rest = arg.strip()
+        head, _, sub = rest.partition(" ")
+        head = head.lower()
+
+        # 判"带不带 --check"用带前导空格的版本：这样 `--check` 出现在最开头
+        # 也算数（那样 objective 为空 → 用法错），不会静默当成目标文本。
+        padded = f" {rest}"
+        if " --check " in padded:
+            objective, _, check = padded.partition(" --check ")
+            self._create_goal(objective.strip(), check.strip())
+            return
+
+        if not rest or head == "status":
+            self._goal_status()
+        elif head == "pause":
+            self._goal_pause(sub.strip())
+        elif head == "resume":
+            self._goal_resume()
+        elif head == "clear":
+            self._goal_clear()
+        else:
+            typer.secho(
+                f"未知的 /goal 用法: {head}（要设定目标请带上 --check）",
+                fg=typer.colors.YELLOW,
+            )
+            typer.echo(self._GOAL_USAGE)
+
+    def _create_goal(self, objective: str, check_command: str) -> None:
+        if not objective or not check_command:
+            # 只报"参数不对"模型/人会原样重试；把缺的那一半说出来就能改对。
+            missing = "目标文本" if not objective else "检查命令（--check 后面那段）"
+            typer.secho(f"缺 {missing}", fg=typer.colors.YELLOW)
+            typer.echo(self._GOAL_USAGE)
+            return
+        existing = self.state.goal
+        if existing is not None and existing.status in (GOAL_ACTIVE, GOAL_PAUSED):
+            # **拒绝静默替换**：旧目标的检查命令会无声消失，而它正是"完成与否"
+            # 的唯一判据 —— 那种丢失事后只能靠翻轨迹发现。
+            typer.secho(
+                f"已有一个未结束的目标（{existing.status}），先 `/goal clear` 再设新的",
+                fg=typer.colors.YELLOW,
+            )
+            typer.echo(render_goal(existing))
+            return
+        goal = Goal(
+            objective=objective,
+            check_command=check_command,
+            created_step=self.state.step,
+        )
+        self.state.goal = goal
+        self.state.record_event(
+            "goal_created",
+            objective=objective,
+            check_command=check_command,
+            step=self.state.step,
+        )
+        typer.secho("已设定目标:", fg=typer.colors.GREEN, bold=True)
+        typer.echo(render_goal(goal))
+        # **把授权额度打给人看**：自动推进会连跑若干回合、期间人敲不进字，
+        # 不说清"最多多少步"就等于让人签一张空白支票。
+        max_steps = getattr(self.engine, "max_steps", None)
+        budget = (
+            f"最多 {self.goal_turns} 回合 × 每回合 {max_steps} 步"
+            f" = {self.goal_turns * max_steps} 步"
+            if max_steps else f"最多 {self.goal_turns} 回合"
+        )
+        typer.secho(
+            f"开始自动推进（{budget}）；跑完这一拍会停下来把提示符还给你。"
+            "期间想插话就先 Ctrl+C，或者用 /goal pause。",
+            fg=typer.colors.BRIGHT_BLACK,
+        )
+
+    def _goal_status(self) -> None:
+        if self.state.goal is None:
+            typer.secho(
+                "本会话没有目标。用 /goal <目标> --check <命令> 设一个。",
+                fg=typer.colors.BRIGHT_BLACK,
+            )
+            return
+        typer.echo(render_goal(self.state.goal))
+
+    def _goal_pause(self, reason: str) -> None:
+        goal = self.state.goal
+        if goal is None:
+            typer.secho("本会话没有目标", fg=typer.colors.YELLOW)
+            return
+        if goal.status == GOAL_DONE:
+            typer.secho("目标已经完成，无需暂停", fg=typer.colors.YELLOW)
+            return
+        if goal.status == GOAL_PAUSED:
+            # 再次 pause 会**覆盖**掉原来的原因，而那个原因往往是唯一能解释
+            # "它为什么停了"的东西 —— 所以先说出来再拒绝。
+            typer.secho(
+                f"目标已经是暂停状态（原因: {goal.pause_reason or '未记录'}）",
+                fg=typer.colors.BRIGHT_BLACK,
+            )
+            return
+        # 人显式暂停：`auto=False`，轨迹里与"自动停下来"区分开。
+        self._pause_goal(reason or "人工暂停（/goal pause）", auto=False)
+
+    def _goal_resume(self) -> None:
+        goal = self.state.goal
+        if goal is None:
+            typer.secho("本会话没有目标", fg=typer.colors.YELLOW)
+            return
+        if goal.status == GOAL_DONE:
+            # 完成是**终态**：检查已经通过，再把它翻回 active 等于让同一个目标
+            # 可以反复"完成"一次。要接着干就设一个新目标。
+            typer.secho(
+                "目标已完成（检查已通过），不能恢复。要接着干请 /goal clear 后设新目标",
+                fg=typer.colors.YELLOW,
+            )
+            return
+        if goal.status == GOAL_ACTIVE:
+            typer.secho("目标本来就在推进中", fg=typer.colors.BRIGHT_BLACK)
+            return
+        goal.status = GOAL_ACTIVE
+        # ★ **必须清掉**：不清的话 `/goal status` 会永远显示一条过期的暂停原因，
+        # 而那条原因在恢复之后已经完全不成立了（比没有原因更误导）。
+        goal.pause_reason = None
+        self.state.record_event("goal_resumed", objective=goal.objective)
+        typer.secho("目标已恢复，继续自动推进", fg=typer.colors.GREEN)
+
+    def _goal_clear(self) -> None:
+        goal = self.state.goal
+        if goal is None:
+            typer.secho("本会话没有目标", fg=typer.colors.BRIGHT_BLACK)
+            return
+        # **置 None 而不是置 done**：两者差别是实质的 —— done 是"检查通过了"，
+        # 而 clear 是"我不要这个目标了"，把它写成 done 就会在轨迹里留下一句
+        # 没发生过的成功。
+        self.state.goal = None
+        self.state.record_event("goal_cleared", objective=goal.objective)
+        typer.secho(f"已丢弃目标: {goal.objective}", fg=typer.colors.GREEN)
 
     def _cmd_sessions(self, arg: str) -> None:
         _print_sessions(self.workspace_root)
@@ -384,6 +667,11 @@ class Repl:
             # 污染级别只在非 none 时显示：常显一个 "none" 会让人不再看这一段，
             # 等它真的变成 high 时也照样不看。
             bits.append(self.state.taint)
+        if self.state.goal is not None:
+            # 同理只在**有目标**时显示：目标不是默认状态，而它一旦存在就改变
+            # 了提示符的行为（可能被自动推进）。状态值本身要露出来 ——
+            # `active` 与 `paused` 下面会发生完全不一样的事。
+            bits.append(f"goal:{self.state.goal.status}")
         return f"codeagent [{' · '.join(bits)}] › "
 
     def _announce_taint(self, state) -> None:
@@ -415,6 +703,18 @@ class Repl:
                 "（直接输入你的回答即可 —— 它就是这个回合的回复）",
                 fg=typer.colors.BRIGHT_BLACK,
             )
+        elif result.terminated_reason == REASON_GOAL_CHECK_INVALID:
+            # 「判定无效」既不是成功也不是失败，而它**最容易被人当成跑完了**
+            # （没有报错、退出码 0、还有一段像结论的话）。所以它单独一种样式，
+            # 而且要把"该人出手了"说出来。
+            typer.secho(
+                "目标未完成：完成检查没能执行（本次判定不计入）",
+                fg=typer.colors.YELLOW, bold=True,
+            )
+            typer.echo(result.final_text or "（无说明）")
+        elif result.terminated_reason == REASON_GOAL_DONE:
+            typer.secho("★ 目标完成（完成检查通过）:", fg=typer.colors.GREEN, bold=True)
+            typer.echo(result.final_text or "（无结论）")
         else:
             typer.secho("结论:", fg=typer.colors.GREEN, bold=True)
             typer.echo(result.final_text or "（无结论）")
@@ -490,13 +790,19 @@ def run_repl(
     step: int | None = None,
     checkpoint_every: int | None = None,
     clear_taint: bool = False,
+    goal_turns: int = DEFAULT_GOAL_TURNS,
 ) -> None:
     """进入常驻交互模式（`app/cli.py --repl`）。
 
     `task` 非空时它**作为第一个回合**跑掉再进提示符 —— 这样"我有个任务，
     跑完接着聊"和"我进来随便看看"是同一条路径，而不是两个入口。
     """
-    repl = Repl(runtime, checkpoint_every=checkpoint_every, clear_taint=clear_taint)
+    repl = Repl(
+        runtime,
+        checkpoint_every=checkpoint_every,
+        clear_taint=clear_taint,
+        goal_turns=goal_turns,
+    )
     repl.start(start_session_id=start_session_id, resume=resume, step=step)
     if task.strip():
         repl.run_turn(task)

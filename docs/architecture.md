@@ -16,14 +16,15 @@
 ```mermaid
 flowchart TB
     subgraph ENTRY["入口层 app/"]
-        CLI["cli.py<br/>typer CLI · --resume · --plan · --repl"]
-        REPL["repl.py<br/>常驻交互（M9-5）：一行一个回合"]
+        CLI["cli.py<br/>typer CLI · --resume · --plan · --goal · --repl"]
+        REPL["repl.py<br/>常驻交互（M9-5）：一行一个回合<br/>+ 目标自动推进一拍（M9-6）"]
         UI["ui_streamlit.py<br/>实时事件 · 权限按钮 · 指标"]
         RP["replay.py<br/>检查点回放（纯函数）"]
     end
 
     subgraph CORE["核心层 agent/"]
-        LOOP["loop.py · QueryEngine"]
+        LOOP["loop.py · QueryEngine<br/>+ _verify_goal（M9-6）"]
+        GOALN["goal.py<br/>目标状态机 + 三态判定"]
         LLM["llm.py"]
         STATE["state.py"]
         CTX["context.py"]
@@ -44,6 +45,7 @@ flowchart TB
         FILES["files.py"]
         WEB["web.py<br/>联网 + SSRF 拦截"]
         SUB["subagent.py"]
+        GTOOL["goal.py<br/>declare_goal_done（M9-6）"]
     end
 
     subgraph EVAL["评估层 eval/"]
@@ -56,6 +58,7 @@ flowchart TB
     UI --> LOOP
     RP --> SESS
     LOOP --> LLM
+    LOOP --> GOALN
     LOOP --> STATE
     LOOP --> CTX
     LOOP --> SESS
@@ -68,6 +71,8 @@ flowchart TB
     BASE --> FILES
     BASE --> WEB
     BASE --> SUB
+    BASE --> GTOOL
+    GTOOL -. 只声明，不判定 .-> GOALN
     SUB -. 复用 QueryEngine .-> LOOP
     RUN --> GT
     RUN --> LOOP
@@ -106,7 +111,7 @@ sequenceDiagram
     Q-->>U: RunResult(max_steps)
 ```
 
-终止判定有五条出口，都会写进 `RunResult.terminated_reason`（轨迹和报告里可审计）：
+终止判定有七条出口，都会写进 `RunResult.terminated_reason`（轨迹和报告里可审计）。合法取值的**唯一清单**是 `agent/loop.py` 的 `TERMINATED_REASONS`（原先只有一行注释、没有集合 —— 加 M9-6 两个新值时补上，因为「一共有哪些值」这件事本身是真缺口）：
 
 | terminated_reason | 触发条件 | 语义 |
 |---|---|---|
@@ -115,6 +120,13 @@ sequenceDiagram
 | `loop_detected` | 最近 4 步工具签名集合完全一致 | 坍缩防护：原地打转 |
 | `error` | 循环内抛异常 | 明确失败，**不假装成功** |
 | `await_user` | 模型调了 `ask_user`（`ToolResult.await_user=True`） | **半程暂停**，不是结论：等人补充信息后 `--resume "回答"` 续跑 |
+| `goal_done` | **M9-6**：模型声明完成 + 人给的检查命令**退出码 0** | 目标达成，回合结束（把判分权拿走的代价见 README 末节） |
+| `goal_check_invalid` | **M9-6**：检查命令**压根没跑成**（门禁拦下 / 超时 / 工具异常） | 判定无效，**既不算完成也不算未通过**；回合结束（模型改不了判据，留着它只会重复空转） |
+
+> **`goal_check_invalid` 为什么不复用 `await_user`**：那个值连带两件事，两件都不对 —— `_extract_learned`
+> 会跳过约定提炼（而这里的轨迹是完整的），REPL 会打印「需要你补充信息」（而这里没有人被提问）。
+> 一个新值是诚实的代价。为什么**未通过**不在这张表里：它根本不是终止 —— 目标保持 `active`、
+> 判定以 `user` 消息回喂，模型在同一回合里接着修。
 
 > **`max_steps` 的语义（M9-5 变更）**：从「整个 state 的累计步数上限」改成
 > **「本次运行 / 本回合的步数预算」**。`state.step` 本身照样累计不重置（检查点文件名
@@ -127,7 +139,7 @@ sequenceDiagram
 
 ## 3. 核心层
 
-### 3.1 QueryEngine（`agent/loop.py`，681 行）
+### 3.1 QueryEngine（`agent/loop.py`，874 行）
 
 **只读工具并发，写工具串行** —— 直接照搬 Claude Code `query.ts` 的语义，也是与串行参考实现的主要差异：
 
@@ -155,7 +167,7 @@ flowchart LR
 `BaseLLM` 两个实现，**接口完全一致**，所以循环、子代理、评估层共用一套代码：
 
 - `DeepSeekClient`：走 openai SDK（DeepSeek 兼容 OpenAI 协议），`chat()` 返回 `LLMResult(content, tool_calls, usage)`，`complete()` 给 compact 摘要用。
-- `MockLLM`：`script(*responses)` 脚本化响应序列 / `text("...")` 固定响应 / `tool_then_text(...)`。**测试与无 key 演示都靠它**——559 个测试全部离线，不打网络。
+- `MockLLM`：`script(*responses)` 脚本化响应序列 / `text("...")` 固定响应 / `tool_then_text(...)`。**测试与无 key 演示都靠它**——597 个测试全部离线，不打网络。
 
 `Usage` 里单独保留 `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`——这是 DeepSeek 磁盘缓存的**实测**字段，整个缓存命中率指标和成本估算都建立在它之上（不是估算出来的）。
 
@@ -163,7 +175,13 @@ flowchart LR
 
 **OpenAI Chat Completion 格式的 dict 是 loop 与 LLM 之间的唯一契约**，`state.py` 用四个构造器保证格式 100% 合法：`system()` / `user()` / `assistant_text()` / `assistant_tool_calls()` / `tool_result()`。
 
-`AgentState` 是「数据面」，也是检查点落盘的对象：`messages` / `step` / `usage` / `events` / `terminated_reason` / `memory_blocks`，加上 M3 的两个记账字段 `last_usage`（provider 锚点）与 `usage_stale_reason`、M7 的 `taint`、M8 的 `plan`（agent 自己的任务计划）——**检查点按 `dataclasses.fields()` 全字段快照**，所以加字段自动落盘；唯一的例外是 `emitter`（运行时对象，故意不落盘）。
+`AgentState` 是「数据面」，也是检查点落盘的对象：`messages` / `step` / `usage` / `events` / `terminated_reason` / `memory_blocks`，加上 M3 的两个记账字段 `last_usage`（provider 锚点）与 `usage_stale_reason`、M7 的 `taint`、M8 的 `plan`（agent 自己的任务计划）、**M9-6 的 `goal`（人设的目标，见 §3.8）**——**检查点按 `dataclasses.fields()` 全字段快照**，所以加字段自动落盘；唯一的例外是 `emitter`（运行时对象，故意不落盘）。
+
+> ⚠️ **加字段不等于加完事**：`load_state` 走 `AgentState(**raw)`，而 **dataclass 不做类型检查** ——
+> 新字段必须在 `agent/session.py` 的 `_FIELD_DECODERS` 里补一行解码器，否则 `--resume` 之后
+> 它是个 `dict` 而不是对象，直到有人读 `.status` 才抛错，而那个炸点会被 `_run_loop` 的
+> `except Exception` 吞成 `terminated_reason="error"`，看起来像「引擎出错」。M9-6 的 `goal`
+> 有一条测试 + 一条变异体专门钉这一行。
 
 `record_event(type, **data)` 是唯一的埋点通道：事件进内存列表，**同时**经 `emitter` 回调写给 `Session`（JSONL + UI 实时流）。一处埋点，轨迹、控制台、评估三处消费。
 
@@ -320,8 +338,99 @@ engine/state 没换"是一个没有任何报错的错配：轨迹写进 A、你�
 python -m app.cli --repl                        # 进提示符
 python -m app.cli --repl "先跑一下测试"          # 带任务：它作为第一个回合
 python -m app.cli --repl --resume --session-id <sid>   # 恢复后接着聊
-# 提示符内：/help /exit /new /resume /fork /plan /sessions /rename /clear-taint
+python -m app.cli --repl --goal-turns 5         # 目标自动推进一拍最多几个回合（默认 3）
+# 提示符内：/help /exit /new /resume /fork /plan /goal /sessions /rename /clear-taint
 ```
+
+### 3.8 进程内目标（`agent/goal.py` + `agent/tools/goal.py`，M9-6）
+
+REPL 让「一个进程 = 很多回合」成立；**目标**让「下一个回合」在没人敲字的时候自动接上。
+
+> **它不是任务树。** TS 原版 ④ 的**唯一**证据是 `docs/reference/minicode-notes.md:141` 一行：
+> 「进程内 Goal（跨回合推进 + 暂停/恢复/完成检查）」+ `/goal` `/goal status` `/goal pause [reason]`
+> `/goal resume` `/goal clear` + `goal/context.ts`。那是一个**带状态机的目标对象**，没有任何层级结构。
+> `isComplete` / 停止条件 / 任务树 / `TodoWrite` 全仓零命中。「允许中途改结构」现有 `update_plan`
+> （全量覆盖）本来就能做。把"目标"想成树是很容易犯的错，因为名字听起来像 —— 但证据里没有树。
+
+**① 判分权在人手里。** 目标由人用 `/goal <目标> --check <命令>` 创建，`check_command` 是**人预先给的
+可执行判据**。模型只有一个工具 `declare_goal_done`——它**声明**"我觉得成了"，运行时随即去跑那条命令，
+**退出码说了算**。模型不能创建目标、不能改判据、不能暂停/清空（同 `clear_taint` 的纪律：**标记不由
+被标记者清除**）。工具刻意叫 `declare_...` 而不是 `complete_...`：它的 description 是这条能力在**唯一
+常驻请求**（工具 schema）里的全部说明，而 `complete_goal` 读起来像"调用它 = 完成"—— 正是要避免的误解。
+
+**② 完成检查的判定是三态，不是两态。**
+
+| 判定 | 目标 | 回喂 | 事件 | `terminated_reason` | 回合 |
+|---|---|---|---|---|---|
+| **通过**（exit 0） | `done` | 不喂 | `goal_check` + `goal_completed` | `goal_done` | 结束 |
+| **未通过**（exit≠0） | 保持 `active` | 判定 + 输出**尾部 40 行** | `goal_check`(failed) | **不变** | **继续** |
+| **判定无效**（门禁拦下 / 超时 / 工具异常） | 保持 `active` | 说明「命令没能执行，本次不计入」 | `goal_check`(invalid) + 门禁自己的 `gate_block` | `goal_check_invalid` | 结束 |
+
+这条三态来自 eval 的 `JudgeResult.executed` 教训：命令**压根没跑成**的时候，「算完成」和「算没完成」
+都是错的。**通过为什么结束回合**：让模型看到"检查通过"再自己写结论，完成就又变成模型说的话了 ——
+恰是本项的反面。**无效为什么也结束回合**：检查命令坏了模型**没有任何办法**修（它不能改
+`check_command`），留着它继续只会重复声明、每次一条无效判定、烧步数。
+
+**③ 暂停/恢复只有在"有东西在自动跑"时才不是装饰。** 我们的架构里没有定时器，所以 `paused` 这个状态
+必须有真实后果 —— 它的后果是 **REPL 不再自动续跑这个目标**（`app/repl.py::_run_goal_burst`）。
+反过来，「人在提示符敲了一行字」是一次**隐式暂停**：那一行是人接手的意思。
+
+```python
+    # app/repl.py::loop —— 进提示符前必先跑一拍
+    while not self._done:
+        if goal_can_advance(self.state.goal):
+            self._run_goal_burst()                      # 一拍自动推进，然后必然 _pause_goal
+        raw = input(self._prompt())
+        ...
+```
+
+**REPL 的结构不变量**：`_run_goal_burst` 结尾**一定** `_pause_goal(stop)`（唯一的提前 return 是
+`goal_can_advance` 为 False）。所以**人拿到提示符时目标绝不可能是 `active`** → else 分支里那次
+「人工回合顺便暂停一下」永远是 no-op，`/goal pause` 在纯 stdin 流程里**结构上不可达**。
+这不是 bug，是「**一拍 = 一次授权**」这条不变式的推论（想现场验证 `/goal pause` 得用交互终端）。
+
+**一拍的上限不是优化，是防锁死**：`input()` 是阻塞的、没有定时器，一拍期间人**根本敲不进字** ——
+无界推进 = 把人锁在门外直到烧完额度。所以 `--goal-turns`（默认 `DEFAULT_GOAL_TURNS = 3`）可调，
+但调不掉这条约束本身；`/goal` 的输出把「最多 3 回合 × 每回合 25 步 = 75 步」**打给人看**，
+否则人不知道自己授权了多少。
+
+**目标一个字都不进 system prompt**（同 `plan` 的纪律）：`system` 是 `messages[0]`、在 `_PREFIX_LEN`
+保护区内，变一次 = 整条前缀缓存永久失效；而目标是会话中途创建的，注入就得**回改第 0 条**。
+引导改放在**目标被创建的那一刻**（`goal_kickoff_message`）—— 那里天然有一个用户回合。
+这正是 M8 那个 elicitation gap 的正解形状（`update_plan` 当年就是工具实现了但 prompt 一字未提，
+模型 6 步一次没调）。
+
+**检查复用 `_gate_and_run` 而不是 `bash.run`**：这样 PreToolUse 的 block-at-submit、权限 deny、
+危险命令 ask、**污染天花板**一并生效，并且「检查被拦下」有一个明确判据（`gate_block` 事件带
+`source` / `reason`）而不是靠猜。代价如实记在 README 的 S19（检查跑成功的 `pytest` 会写
+`data/tests_pass.marker`，从而**替 agent 解锁 `git commit`**）。合成的 `ToolCall.id` 只活在这一次
+调用里 —— **绝不伪造** `assistant(tool_calls=[...]) + tool(...)` 消息对：那等于写下一个模型从没发出过
+的调用，与 `PAIRING_FILLER`「必须说实话」的纪律直接冲突。判定以 **`user` 消息**回喂，同
+`_reinject_plan` 的先例。
+
+**`_execute_tool_calls` 一个字符都没改。** 声明经由 `state.goal.declaration` 传递而不是照抄
+`await_user` 的 `ToolResult` 标志 —— 批结束时那个 `ToolResult` 已经不存在了（`_execute_tool_calls`
+内部就 `compact_batch` 成字符串 append 成消息），要带出第二个标志就得**改它的返回类型**，而那是
+4 个入口共用的核心循环契约。所以 M9-6 只在 `_run_loop` 里插了 4 行：
+
+```python
+                # ★ 批前复位：结构性地保证「一次声明只触发一次检查」
+                if state.goal is not None:
+                    state.goal.declaration = None
+                pending = self._execute_tool_calls(result.tool_calls, state, ctx)
+                # ★ 判定在这里（模型只能声明）。批后：「跑测试 → 声明」是同一步最常见的形状；
+                #   在 checkpoint 之前：让这一步的检查点带上判定后的目标状态
+                if state.goal is not None and state.goal.declaration is not None:
+                    goal_end = self._verify_goal(state, task, ctx)
+                    if goal_end is not None:
+                        return goal_end
+                if self.session is not None:
+                    self.session.checkpoint(state)
+```
+
+插在 `_run_loop` 里 → **四条入口一起拿到**（同 `permissions.new_turn()` 的位置理由）；headless 因为
+没注册工具 + 没目标，完全 no-op。同一步里既有声明又有 `ask_user` → **检查先跑**（`goal_done` 赢）：
+运行时的**事实**优先于模型的**陈述**，两个结论都进轨迹。
 
 ## 4. 治理层
 
@@ -413,6 +522,7 @@ class Tool:
 | `subagent` | research 子代理（下节） |
 | `ask_user` | **半程暂停**：返回 `ToolResult(await_user=True)` 就结束本回合，问题交给用户。**不进 `default()`**——headless 评测里没人在，模型一提问 eval 就提前终止 |
 | `update_plan` | agent 自己的任务计划，写 `state.plan` 随检查点落盘；**每次传完整清单**；**不注入每轮消息**（那会破坏前缀缓存） |
+| `declare_goal_done` | **M9-6**：模型**声明**当前目标完成（写 `state.goal.declaration`），**不是判定** —— 运行时随即跑**人预先给定的**检查命令，退出码说了算（见 §3.8）。参数扁平（内联 `array`，**不能**用嵌套模型：`base.py` 的 `raw.pop("$defs")` 会把 `$defs` **静默**削掉，模型收到的参数说明就是错的）。`is_read_only() = False`（它改变的是**控制流**）。**不进 `default()`**——eval 用的正是 `default()`，而 headless 里没人能创建目标 → 模型只会看到一个永远失败的诱饵 |
 | `load_skill` | 按需取 `SKILL.md` 正文；只读、可并发。名字来自 system prompt 里那份**只含 name+简介**的索引 |
 
 ### 改动前复核（M9-1）
@@ -612,6 +722,11 @@ flowchart LR
 
 `data/` 与 `workspace/` 全部 gitignore——**产物是运行出来的，不进仓库**。
 
+**M9-6 新增的事件**（都进 `data/sessions/{sid}.jsonl`，回放与审计共用）：`goal_created` / `goal_paused` / `goal_resumed` / `goal_cleared` / `goal_check`（带 `verdict` / `exit_code` / `output_tail` / `output_chars`）/ `goal_completed`。
+**权威记录在事件里**，`Goal.last_check` 只是给 `/goal status` 用的一份缓存 —— 它没有第二个判据依赖它，
+所以刻意**不做** `derive_goal(events)`（对比 `taint`：污染标记有第二个判据依赖，必须有重放）。
+给一个没有第二个读者的东西加重放，只会多出一份可能对不上的真相。
+
 ## 8. 与 Claude Code 的逐层映射
 
 | Claude Code 机制 | CodeAgent 实现 | 差异 |
@@ -628,6 +743,7 @@ flowchart LR
 | MCP 工具接入 | `agent/mcp.py` | 手写同步客户端 + `Transport` 抽象（官方 SDK 是 async，与同步循环阻抗大）；stdio 与 Streamable HTTP 两种传输共用同一套协议层；MCP 工具走同一套权限/hooks |
 | （无） | `eval/` | Claude Code 没有内置评估；本项目加了轨迹驱动评估 |
 | CONTEXT_COLLAPSE 等五种压缩 | `context.py` 三级 compact | 只做 分级截断 + snip + LLM 摘要（复杂度/收益比最优） |
+| ④ 进程内 Goal（`/goal` 命令族 + `goal/context.ts`） | `agent/goal.py` + `agent/tools/goal.py` + `app/repl.py` | **不是任务树**（原版也没有树，见 §3.8）；补了原版没有的一件事：**完成判据由人预先给定、模型只能声明**，退出码说了算 |
 
 ## 9. 关键决策与权衡
 
@@ -641,3 +757,6 @@ flowchart LR
 | 隐藏测试 | 用现成测试判定 | 现成测试在 agent 的工作区里 = 开卷；hidden tests 只在 judge 时写回 |
 | 失败一律文本回喂 | 抛异常终止 | 模型自修复能力很强，把错误原文给它往往比运行时硬编码处理更有效 |
 | 不做向量 RAG | 加检索层 | Claude Code 自己就是 grep/glob/read 检索——**代码检索用精确匹配比向量更准**，且省掉一整层依赖 |
+| **完成判据由人给、模型只能声明**（M9-6） | 让模型自己判断做完了 | 让模型自评 = 让考生自己批卷。改成「人预先给一条命令 + 运行时只看退出码」之后，完成与否变成一个**可复现的事实**，而不是一句描述。代价（检查命令可能空转、通过即结束回合、模型没机会补充次要事项）如实记在 README 的 S17–S20 |
+| **打断建模成数据标志** | 抛异常 / 阻塞式 `input()` | 从这个项目第一天起的一致选择（`ToolResult.await_user`、`_pause_goal` 只改数据、不返回不抛出）。数据标志能被检查点带走、能被重放、能被子代理忽略；阻塞控制流三条都做不到 |
+| **三态完成判定**（通过 / 未通过 / 判定无效） | 通过 / 未通过 | 命令**压根没跑成**时，两个选项都是错的 —— 同 `eval` 的 `JudgeResult.executed` 教训。多一个值的成本是几行分支，少一个值的成本是**伪造结论** |

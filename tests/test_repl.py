@@ -416,9 +416,9 @@ def test_help_lists_exactly_the_commands_that_exist():
     """命令表与帮助是**同一份数据**生成的 —— 不这样迟早出现"帮助里有、实际没有"。"""
     text = help_text()
     for name in ("/help", "/exit", "/new", "/resume", "/fork", "/plan",
-                 "/sessions", "/rename", "/clear-taint"):
+                 "/sessions", "/rename", "/clear-taint", "/goal"):
         assert name in text
-    assert len([ln for ln in text.splitlines() if ln.strip().startswith("/")]) == 9
+    assert len([ln for ln in text.splitlines() if ln.strip().startswith("/")]) == 10
 
 
 def test_command_names_are_case_insensitive(tmp_path, monkeypatch):
