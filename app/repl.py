@@ -47,7 +47,7 @@ from agent.goal import (
     goal_kickoff_message,
     render_goal,
 )
-from agent.loop import REASON_GOAL_CHECK_INVALID, REASON_GOAL_DONE
+from agent.loop import REASON_ABORTED, REASON_GOAL_CHECK_INVALID, REASON_GOAL_DONE
 from agent.security import TAINT_NONE
 from agent.session import (
     DEFAULT_CHECKPOINT_EVERY,
@@ -104,6 +104,11 @@ _GOAL_SUBCOMMANDS: tuple[str, ...] = ("status", "pause", "resume", "clear")
 BURST_STOP_REASONS: frozenset[str] = frozenset({
     "await_user", REASON_GOAL_CHECK_INVALID, REASON_GOAL_DONE,
     "max_steps", "loop_detected", "error",
+    # M9-7：**结构上不可达，但方程要求它在。** `"aborted"` 是 worker 专有的终止
+    # 原因（父会话的取消走 Ctrl+C，是 `BaseException`，到不了任何返回点）。上面
+    # 那条方程是"新增终止原因却忘了让自动推进停下来 → 必须变红"的守卫，它的
+    # 价值在于**逼人做一次判断**，而不是在于每一个成员都真会出现。如实记着。
+    REASON_ABORTED,
 })
 
 #: 一拍停下来时，把终止原因翻成给人看的一句暂停理由。**每个原因都要有话说**：
@@ -115,6 +120,8 @@ _STOP_REASONS: dict[str, str] = {
     "loop_detected": "本回合触发了循环检测",
     "error": "本回合出错",
     "interrupted": "本回合被 Ctrl+C 打断",
+    # 同 BURST_STOP_REASONS 里那条：worker 专有，REPL 里到不了。
+    REASON_ABORTED: "本回合被取消",
 }
 
 

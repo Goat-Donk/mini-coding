@@ -47,7 +47,7 @@ from agent.tools.base import ToolRegistry
 from agent.tools.goal import build_goal_tools
 from agent.tools.plan import render_plan
 from agent.tools.skills import build_skill_tools
-from agent.tools.subagent import SubagentTool
+from agent.tools.subagent import build_subagent_tools
 
 app = typer.Typer(no_args_is_help=True)
 
@@ -79,10 +79,28 @@ class EventPrinter:
             line = self._format_goal_check(event)
         elif etype == "goal_completed":
             line = f"  [{event.get('step')}] ★ 目标完成（完成检查通过）"
+        elif etype == "subagent_settled":
+            # M9-7：子代理在回合边界被结算掉。**这条必须到达人眼前** ——
+            # 它是"你派出去的东西的结论被丢了"的唯一通路。模型那边看不到它
+            # （事件不进 messages），所以不印出来就真的没人知道。
+            line = self._format_subagent_settled(event)
         else:
             return  # llm_call 等事件太吵，不逐条打印（轨迹 JSONL 里都有）
         with self._lock:
             typer.echo(line)
+
+    @staticmethod
+    def _format_subagent_settled(event: dict) -> str:
+        notes = event.get("notes") or []
+        head = (
+            f"  [{event.get('step')}] ■ 子代理结算："
+            f"{len(event.get('killed') or [])} 个被叫停、"
+            f"{len(event.get('unclaimed') or [])} 个结论没被取走"
+        )
+        if event.get("still_running"):
+            head += f"、{len(event['still_running'])} 个仍在后台跑"
+        detail = "\n".join(f"      {note}" for note in notes)
+        return head + ("\n" + detail if detail else "")
 
     def _format_goal_check(self, event: dict) -> str:
         verdict = event.get("verdict")
@@ -362,11 +380,15 @@ def _build_runtime(
     """
     llm = _build_llm(mock)
     registry = ToolRegistry.default(workspace_root)
-    registry.register(SubagentTool(llm, workspace_root))  # M4-2 research 子代理
+    # M4-2 / M9-7 子代理工具族：subagent（阻塞便捷入口）+ spawn_agent /
+    # list_agents / wait_agent / close_agent（句柄式并发）。五个共用一份构造点
+    # （`build_subagent_tools`）—— "怎么造一个子代理"只有一处实现。
+    for subagent_tool in build_subagent_tools(llm, workspace_root):
+        registry.register(subagent_tool)
     # ask_user：**刻意不进 ToolRegistry.default()** —— eval/runner.py 用的正是
     # default()，而 headless 评测里没有人能回答，模型一提问 eval 就提前终止：
     # 完成率被一个"没人在那儿"的机制拉低，而且是静默的（judge 只跑测试）。
-    # 与 SubagentTool 一样按入口注册（构造点见 build_ask_tool）。
+    # 与子代理工具族一样按入口注册（构造点见 build_ask_tool）。
     registry.register(build_ask_tool())
     # M9-6 目标：**同样刻意不进 `default()`** —— eval 用的正是 default()，而
     # headless 里没有任何入口能创建目标（`/goal` 是 REPL 的命令），模型会拿到

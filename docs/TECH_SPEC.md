@@ -828,7 +828,7 @@ BURST_STOP_REASONS = {"await_user", REASON_GOAL_CHECK_INVALID, REASON_GOAL_DONE,
 
 ### 4e.12 测试与真实验证
 
-- `tests/test_goal.py` **38 例** + `tests/test_repl.py` / `tests/test_session.py` 补契约；全量 **597 全绿**。
+- `tests/test_goal.py` **38 例** + `tests/test_repl.py` / `tests/test_session.py` 补契约；全量 **597 全绿**（M9-6 当时的数字；M9-7 之后为 623）。
   重点用例：创建时 `objective`/`check_command` **逐字落库**、`pause` 存原因 / `resume` **必须清
   `pause_reason`**、`clear` → `None`（杀"实现成置 done"）、已有活跃目标时拒绝第二个、检查跑的是
   `check_command` 原文、exit≠0 **保持 active 且本轮继续**、失败判定以 `user` 消息回喂、**门禁拦下 →
@@ -1743,31 +1743,126 @@ class MemoryManager:
   真实模式任务后 `extract_and_learn(result.events)`（mock 保持脚本确定性）。
 - 测试：tests/test_memory.py（19 个：发现顺序/@include 全部拒绝路径/循环/去重/预算/提取/consolidation/落盘往返）。
 
-### 9.5 agent/tools/subagent.py（M4-2 已实现：research 子代理）
+### 9.5 agent/tools/subagent.py（M4-2 建，**M9-7 扩成 5 个工具族**）
+
+**唯一构造点** `build_subagent_tools(llm, workspace_root) -> list[Tool]`（仿 `build_goal_tools`）。
+五个工具共用**一个** `_SubagentRunner`，于是"怎么造一个子代理"只有一份实现：受限 registry
+的构建、步数上限、系统提示词、abort 接线、落盘 store。
+
+| 工具 | 参数 | 语义 |
+|---|---|---|
+| `subagent` | `task`, `tools`, `max_steps` | 阻塞便捷入口：spawn + 无限等。**M4-2 的签名一字未改** |
+| `spawn_agent` | `task`, `tools`, `max_steps` | 立刻返回句柄 `sa-1`；满了返回 `ToolResult.fail` + 花名册（不排队） |
+| `list_agents` | — | 花名册（id / 状态 / 任务摘要 / 终局 reason） |
+| `wait_agent` | `ids`(可省=全部**还没交回**的), `timeout_ms` | 等；**超时只回报最新状态、不关闭** |
+| `close_agent` | `id` | abort + 等它真停；对已终结的幂等 |
 
 ```python
-class SubagentInput(BaseModel):
-    task: str
-    tools: list[str] = ["glob", "grep", "read"]   # 只读白名单
-    max_steps: int = 10
+class _SubagentToolBase(Tool):
+    def __init__(self, runner: _SubagentRunner) -> None: ...
+    @staticmethod _session_id(ctx) -> str        # 落盘目录用的父会话标识
 
-class SubagentTool(Tool):
-    name = "subagent"  # is_read_only() = False（串行执行，避免嵌套并发）
-    def __init__(self, llm, workspace_root): ...
-    def execute(self, args, ctx) -> ToolResult: ...
-    @staticmethod _restricted_registry(requested: list[str]) -> ToolRegistry
+class _SubagentRunner:
+    def build(*, task, tool_names, max_steps, cwd, parent_session_id
+              ) -> Callable[[AbortToken], WorkerOutcome]
+    #   registry = _restricted_registry(tool_names)
+    #   steps    = min(max(1, max_steps), MAX_SUBAGENT_STEPS)      # 上限 10
+    #   store    = ToolResultStore(workspace_root, f"{parent_session_id}-sa{self._seq}")
 ```
 
 - **独立上下文**：子代理用全新 AgentState + `SUBAGENT_SYSTEM_PROMPT`（只读定位），
   主循环 messages/usage/compact 全不共享；内部复用 QueryEngine（同一 LLM），代码零重复。
-- **只读受限**：默认 glob/grep/read，写工具/bash 一律不给；`_restricted_registry` 永不包含
-  subagent 自身 → 天然禁止递归嵌套；未知名字静默忽略。
-- **返回**：`ToolResult.ok(结论报告)`（主上下文只收 Z tokens）；子代理失败/超步如实
-  `ToolResult.fail("[子代理 max_steps，N 步] …")`，不假装成功，主模型可据此调整。
-- **接入**：cli/ui 引擎组装处 `registry.register(SubagentTool(llm, workspace_root))`
-  （不能进 ToolRegistry.default——需要 llm/workspace 构造参数）。
-- 测试：tests/test_subagent.py（6 个：跑通回报告/只读白名单+不改文件/max_steps 兜底/
-  system prompt 定位/禁止递归/串行注册）。
+- **只读受限**：默认 glob/grep/read，写工具/bash 一律不给；`_restricted_registry` 是**白名单**、
+  永不包含任何子代理工具 → 天然禁止递归嵌套；未知名字静默忽略（**黑名单在"以后加了新工具"时
+  会静默失效**，所以用白名单）。
+- **五个全部 `is_read_only() == False`**（含纯读的 `list_agents`）。理由**不是"子代理危险"，
+  是调度**：只读工具走并发池（`loop._execute_tool_calls` 的 `executor.map`），而 `map` 保证的是
+  **输出顺序**、不是**开始顺序** —— 一批 `[spawn(A), spawn(B), wait([A,B])]` 若进并发池，
+  `wait_agent` 可能在两个 spawn 注册 id **之前**就跑起来，模型会看到自己刚派出去的 id 报"未知"。
+  先例：`agent/tools/goal.py` 的 `DeclareGoalDoneTool` 同为 `False`，理由写着「它改变的是**控制流**」。
+- **`ctx.workers is None`**（引擎没接管理器）时五个工具都 `ToolResult.fail` 并**说明这是接线缺口**，
+  不抛异常、不假装成功（同 `DeclareGoalDoneTool` 的「不静默降级」）。
+- **不进 `ToolRegistry.default()`**：同 `ask_user` / goal 的理由，外加一条更硬的 ——
+  `eval/runner.py` 用的正是 `default()`，而子代理会把 README 的 token/成本/缓存数字**悄悄变得不可比**。
+- **系统提示词带 `{workspace_root}` 槽位**：`_render_system_prompt` 对自定义 prompt 也做替换，
+  加一行就让 worker 知道自己在哪个沙箱里，零新机制。
+- **worker 刻意不给的四样**：`session`（`Session.checkpoint` 没有锁，两个 worker 同 session_id 会
+  互相覆盖检查点文件）、`on_event`（否则 worker 的工具调用渲染成父的、步号也对不上）、
+  `permissions` / `hooks`（只读白名单已保证不写，接上反而是多一条要推理的路径，且它们读的是**父**的
+  污染标记，语义不对）、`context`（worker 上下文短且只活一个回合）。
+- **给**：显式 `ToolResultStore(ws, f"{父sid}-sa{n}")` —— 补上 M3-2 在子代理里的缺口
+  （`_store_for` 在无 session 时返回 `None`，超大的 read/grep 结果会**无界**进 worker 的 messages）。
+  `session_id` **必须每个 worker 不同**，否则两个 worker 撞同一批落盘文件、后写的覆盖先写的。
+- 测试：tests/test_subagent.py（**32 个**，三段：工具面 8 / 并发契约 14 / 接线与循环契约 10）。
+
+### 9.5b agent/subagents.py（**M9-7 新建**：并发子代理管理器）
+
+**必须是叶子模块**：`agent/tools/subagent.py` 在模块级 `import agent.loop`，而 `loop.py` 需要它来做
+回合边界结算 —— 反向 import 即成环。所以管理器**不 import `loop.py`**：
+`spawn(task, runner: Callable[[AbortToken], object])`，**跑什么由工具模块构造的闭包决定**。
+
+```python
+MAX_SUB_AGENTS = 3
+AGENT_RUNNING, AGENT_DONE, AGENT_FAILED, AGENT_CLOSED = "running", "done", "failed", "closed"
+TERMINAL_STATUSES = frozenset({AGENT_DONE, AGENT_FAILED, AGENT_CLOSED})
+SETTLE_TIMEOUT = 1.5          # 回合边界 join 的预算
+NOTE_CHARS = 400              # 结算事件里结论尾部的截断长度
+
+class AbortToken(threading.Event):
+    """就是一个**命名过的 Event**：子类化而不是包一层 —— 取消本来就只有
+    "置位 / 查询 / 等待"三个动作，包装类只会多一层要读的间接。"""
+    # set() / is_set() / wait(timeout=None) 全部继承自 threading.Event
+
+@dataclass
+class AgentHandle:            # 可变；全部读写走 AgentWorkers 的那把锁
+    id; task; status=AGENT_RUNNING
+    result=None; error=None; usage=None      # Usage | None：被杀/崩掉的报"用量未知"，不报 0
+    reason=None                              # 终局 terminated_reason（"aborted" 在这里，不在 status 里）
+    started_at=0.0; finished_at=None
+    token: AbortToken; finished: threading.Event
+    reported=False                           # 「结论已经交付过」—— 见 wait 的语义
+    usage_counted=False                      # 恰好合并一次
+
+@dataclass(frozen=True)
+class AgentSnapshot: ...      # list()/wait()/close() 返回的**冻结副本**；**刻意不含 thread 字段**
+
+class TooManyAgents(RuntimeError)   # 管理器抛；工具翻译成人话 + 花名册
+class UnknownAgent(LookupError)     # 带 known_ids（仿 session.SessionNotFound 的 available）
+
+@dataclass(frozen=True)
+class SettleReport:           # killed / unclaimed / still_running / usage
+    @property any -> bool; as_event() -> dict
+```
+
+- **`spawn` 立刻返回**：`threading.Thread(daemon=True)` + `start()`，不 join。
+  **刻意不用 `ThreadPoolExecutor`** —— 它的线程**非 daemon**，`concurrent.futures.thread` 装了
+  `atexit` join 钩子，一个卡在 120s `llm.chat` 里的 worker 会让**解释器退出被拖住最多两分钟**
+  （症状是"为什么 CLI 退不出去"）。worker 的输出只经句柄交付，所以拆掉它是结构上安全的。
+- **id 确定性**：`sa-1` / `sa-2`（管理器本地计数器）。测试要能逐字断言，模型要能从工具输出里
+  原样抄进 `wait_agent`。
+- **一把 `threading.Lock`** 保护句柄的迁移与快照 —— 否则 `wait()` 会看到 `status == "done"`
+  而 `result is None` 的**撕裂读**，工具输出就成了「完成了，但没结论」。
+- **容量只数非终态**（running）；数 `len(self._handles)` 会让一次长会话在成功跑过 3 个子代理之后
+  **永久锁死**，而表现只是"子代理坏了"。
+- **`wait(ids=None)` 的"还没交付"语义**：`not (is_terminal and reported)` —— 在跑的，**加上跑完了
+  但没人取过的**。判据是 `reported` 而不是 `status`：一次 `[spawn×3, wait]` 里，第一个 worker
+  完全可能在 `wait_agent` 跑起来之前就自己跑完了，只取 running 会让它被跳过、**结论静默丢失**。
+  已交付过的不再返回（同一条信息出现第二次，白占 token 还破坏前缀缓存）。
+- **`settle()` 的三元口径互斥**（`killed` / `unclaimed` / `still_running`）：
+  - `killed` = 我们动手时还在跑、**且确实停下来了**（`not _thread_alive`）→ 跑到一半被杀，没有结论
+  - `still_running` = 我们动手时还在跑、**但没停下来**（`_thread_alive`）→ 如实说没清干净
+  - `unclaimed` = 在我们动手**之前**就已经自己跑完、且从没被取走 → 有结论，但丢了
+  - `unclaimed` 必须排除被叫停的（`h.id not in interrupted`），否则同一个 id 会同时出现在
+    `killed`（"没有结论"）和 `unclaimed`（"结论尾部: …"）里，**事件自相矛盾**。
+- **`close(id)` = set token + join（有界）**；对已终结的幂等，且**改写状态时会如实报告它其实跑完了**
+  （不把已完成的抹成 `closed`）。
+- **用量只在父线程合并**：`Usage.__iadd__` 是四个字段各一次 read-modify-write、**不是原子的**，
+  在 worker 线程里合并会丢更新，也会与 `loop.py` 的 `state.usage += result.usage` 赛跑。
+  `AgentWorkers(on_usage=...)` 是**唯一**通路，每个 handle 一个 `usage_counted`、恰好合并一次
+  （`wait` 合并它报的那些，`settle()` 合并剩下的）。
+- **绝不动 `state.last_usage` / `usage_stale_reason`** —— 那是驱动 compact 的 provider 锚点，
+  锚在一个 worker 的 token 上等于描述父会话**没有**的消息。
+- 测试：见 9.5 末尾（两节共用 `tests/test_subagent.py`）。
 
 ### 9.6 eval/golden_tasks.py（M5-1 已实现：SWE-bench 思路的黄金任务集）
 

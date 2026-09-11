@@ -4,7 +4,7 @@
 
 ## 项目定位
 
-求职作品集：**CodeAgent** —— 参考 [pengchengneo/Claude-Code](https://github.com/pengchengneo/Claude-Code) 源码架构，用 Python 从零实现的小型 AI Coding Agent（10,113 行 / 28 模块 / 597 测试）。核心循环手写（不套 Agent SDK），支撑层用成熟库（openai / pydantic / streamlit / typer / pytest）。差异化：cache-aware 上下文 + 缓存省钱指标、step 级检查点恢复 + **step 级分叉/会话命名**、**常驻交互模式（REPL，一行一个回合）**、**进程内目标 + 显式完成检查（判分权在人手里）**、block-at-submit hooks、轨迹驱动评估（真实 tinydb 提交 + 隐藏测试）、记忆自进化、MCP 工具接入（**stdio + Streamable HTTP 两种传输**）、注入文本检测 + 会话污染天花板、联网工具 + SSRF 拦截、skills 渐进披露、计划清单跨回合、提问暂停/续答、改动前 diff 复核。
+求职作品集：**CodeAgent** —— 参考 [pengchengneo/Claude-Code](https://github.com/pengchengneo/Claude-Code) 源码架构，用 Python 从零实现的小型 AI Coding Agent（11,207 行 / 29 模块 / 623 测试）。核心循环手写（不套 Agent SDK），支撑层用成熟库（openai / pydantic / streamlit / typer / pytest）。差异化：cache-aware 上下文 + 缓存省钱指标、step 级检查点恢复 + **step 级分叉/会话命名**、**常驻交互模式（REPL，一行一个回合）**、**进程内目标 + 显式完成检查（判分权在人手里）**、**并发子代理（句柄式 spawn/wait/close + 回合边界结算）**、block-at-submit hooks、轨迹驱动评估（真实 tinydb 提交 + 隐藏测试）、记忆自进化、MCP 工具接入（**stdio + Streamable HTTP 两种传输**）、注入文本检测 + 会话污染天花板、联网工具 + SSRF 拦截、skills 渐进披露、计划清单跨回合、提问暂停/续答、改动前 diff 复核。
 
 > 数字口径（改数字时请沿用）：**源码 = `agent/` + `app/` + `eval/` 下非空 `.py` 文件的全部行数**（含空行；不含 `eval/repos/` 的克隆仓，它被 gitignore）；**模块数 = 其中非空的 `.py` 文件数**（4 个空 `__init__.py` 不计）；**测试 = `tests/` 行数 / pytest 用例数**。**按文件系统数，不按 git 跟踪数** —— 新文件在提交前也该算进去（M9-6 的 `agent/goal.py`(232) `agent/tools/goal.py`(118) `tests/test_goal.py`(927) 当时尚未提交）。
 
@@ -41,7 +41,7 @@
 
 **模块 docstring 要注明机制出处**（先例 `agent/tool_result.py`、`agent/tools/plan.py`），与本项目「参考与来源」的惯例一致。
 
-**M9 向 TS 原版对齐（进行中，排序见 `TASKS.md`）**：核实后 TS 原版 12 项核心能力全部真实现（逐条对照与 file:line 证据在 `docs/reference/minicode-notes.md` §10），本项目按「先小后大」分四批靠。**只剩压轴的 M9-7 ② sub-agent 并发**（唯一会动核心循环契约的一项）。**已做 M9-1 改动前 diff 复核**，机制是：
+**M9 向 TS 原版对齐（2026-09-11 完成，排序见 `TASKS.md`）**：核实后 TS 原版 12 项核心能力全部真实现（逐条对照与 file:line 证据在 `docs/reference/minicode-notes.md` §10），本项目按「先小后大」分四批靠。**M9-1 ~ M9-7 全部完成，12 项核心能力清单全部落地**（唯一剩下的 **M9-8 工作区 rewind 快照**是 2026-09-11 新立的条目、尚未开工，不属于这 12 项）。**已做 M9-1 改动前 diff 复核**，机制是：
 - `Tool.preview(arguments, ctx) -> str | None`（`agent/tools/base.py`）声明**将要做什么**，默认 None；目前只有 `write`/`edit` 实现。
 - **它必须是纯函数**（绝不写盘），且**只能有一份**匹配语义：`EditTool._plan` 同时供 `preview` 与 `execute` 用 —— 各判一遍就会出现「预览说能改、执行说匹配不唯一」，而那时人已经照着预览点过允许了（**两个真相源**）。
 - `_gate_and_run` 里 `details = self._preview(...)` **必须在 `permissions.check()` 之前**取。位置就是这一项的全部意义：人看到 diff 时磁盘上还是旧内容。**挪到 check() 之后不会报任何错**，所以有测试专门钉住确认回调被调用那一刻文件仍是原文。
@@ -105,6 +105,22 @@
 - **真跑五条动线全部有日志**（`m9verify/goal_*.log`）。**这些数字与既有单发/REPL 数字不可比**：自动续跑会把 `max_steps` 乘上 `goal_turns`，同一个任务换个 `--goal-turns` 能差一个量级 —— 所以只记动线是否走通，**不引用 token 数字下任何结论**。
 - **真跑暴露的是我自己的测试素材错误，不是产品缺陷**：这次真跑用的工作区里有一份我手写的 `m9verify/ws_m96_b/tests/test_extra.py`（**验证素材，不在仓库的 `tests/` 里**），其中 `assert median_word_length("a ccc") == 1.5` 数学上不可能成立（词长 `[1,3]` → 中位数 2.0）。模型算对 2.0、看不懂测试，一整个回合反复探测烧掉 **151,038 token** 撞 `max_steps`；两次 `/goal resume` 又各烧 356,906 / 752,135。**模型始终没有谎报完成**（一直说"测试失败、我还没修好"）—— 这正是 `declare_goal_done` 那条纪律想要的行为。断言已改成 `median_word_length("a cc") == 1.5`。**教训：agent 卡住时先怀疑任务和判据，再怀疑 agent。**
 
+**已做 M9-7 并发子代理（`agent/subagents.py` + `agent/tools/subagent.py` + `loop.py` 的取消/结算）**，机制是：
+- **形状抄自 TS 原版**（`src/agents/manager.ts` + `src/tools/sub-agents.ts`）：`MAX_SUB_AGENTS = 3`；`spawn` **立刻返回句柄**、后台跑；**满了直接抛不排队**；`wait` **超时只返回最新状态、不关闭**（「等」和「关」是**分开的两件事**）；`close` = abort + **等它真停**。Python 侧用 `threading.Thread(daemon=True)`，**不用 `ThreadPoolExecutor`** —— 它的线程非 daemon，`atexit` 里 join，一个卡在 120s `llm.chat` 里的 worker 会把**解释器退出拖住两分钟**（症状是"CLI 退不出去"）。
+- **`agent/subagents.py` 必须是叶子模块**：`agent/tools/subagent.py` 在**模块级** `import agent.loop`，而 `loop.py` 要做结算 —— 反向 import 即成环。所以管理器 `spawn(task, runner)` 收一个**闭包**，"跑什么"由工具模块决定。
+- **`wait(ids=None)` 收的是「还没交回」而不是「还在跑」**（判据是 `reported` 而不是 `status`）。**这是写测试时被逼出来的真 bug**：一次 `[spawn×3, wait]` 里第一个 worker 完全可能在 `wait_agent` 跑起来之前就自己跑完了，只取 running 会让它被跳过、**结论静默丢失**。已交付过的不再返回（同一条信息出现第二次 = 白占 token + 破坏前缀缓存）。
+- **`settle()` 的三元口径互斥**：`killed`（跑着被杀，无结论）/ `unclaimed`（跑完没人取，有结论但丢了）/ `still_running`（没停下来，用量不计入本回合）。**另一个被单测逼出来的真 bug**：`unclaimed` 原先没排除被叫停的 worker → 同一个 id 既"没有结论"又给出"结论尾部"，**事件自相矛盾**。
+- **回合边界结算 = 一个 `finally`**（`_run_loop` 里），**一处覆盖 6 个返回点 + `KeyboardInterrupt`**。`except Exception` **抓不到 `KeyboardInterrupt`**（`BaseException`），而 Ctrl+C 恰恰是最需要结算的那一刻。**join 有界（`SETTLE_TIMEOUT = 1.5s`）**，与 `close()` 的「等到真停」**刻意不同**：回合边界不该阻塞在网络调用上，且它可能正跑在 `KeyboardInterrupt` 的传播路径上（用户按第二下 Ctrl+C 会在 `finally` 里再抛 → 一个 worker 都没被 join）。**一个会抛的 `finally` 会顶掉正在返回的 `RunResult`**，所以结算内部再包一层 try。
+- **取消只有两个检查点，没有第三个**（不去打断 `llm.chat` 和 `subprocess.run`：客户端没有 per-call timeout，`BashTool` 没有 cancel token）：① `_run_loop` 的 `while` 体首句（`_prepare_messages` 与 `llm.chat` **之前** —— 不能写进 `while` 条件，条件求值时 `_prepare_messages` 已经跑完一整轮上下文整理的活）；② `invoke()` 顶部。串行批逐调用；**并发批的粒度是整批**（`executor.map` 一次性提交，检查对每个都是 False）—— **如实记，不声称批内逐调用粒度**。
+- **不变式（有测试钉住）**：abort token **只由 `AgentWorkers.spawn` 创建、只装在每个 worker 那一次性引擎上**。常驻 REPL 的引擎**跨回合复用**，给它装 token 会让**后续每个回合**在第一个检查点就返回 `aborted` —— 用户看到的是"我说话它不理"，且完全无法解释。
+- **串行路径命中 abort 必须补配对**：`assistant_tool_calls(calls)` 在批末才 append、覆盖**全部** `calls`，少一条 `tool` 消息就是孤儿 id，直接 400，而报错点在**下一轮**。
+- **`"aborted"` 是 worker 专有的终止原因**：父引擎拿不到它（Ctrl+C 是 `BaseException`，在 `llm.chat` 里就抛穿了）。`app/repl.py` 那两处是「**方程要求它存在、但结构上不可达**」—— `tests/test_goal.py` 的两条方程（`set(BURST_STOP_REASONS) | {"completed"} == TERMINATED_REASONS`）逐字逼着加。**同样理由：`_extract_learned` 不加 `aborted` 守卫** —— 那是永远执行不到的分支，加了就是本项目的头号缺陷类。
+- **用量只在父线程合并**（`Usage.__iadd__` 不是原子的），每个 handle 一个 `usage_counted`、**恰好一次**；**绝不动 `state.last_usage` / `usage_stale_reason`**（那是驱动 compact 的 provider 锚点）。**代价如实记**：worker 的 prompt 大多缓存未命中 → 父会话的**缓存命中率被稀释**（README S26）。
+- **五个工具全部 `is_read_only() = False`**（含纯读的 `list_agents`）—— 理由**不是"子代理危险"而是调度**：只读工具走并发池，`executor.map` 保证**输出顺序**不保证**开始顺序**，`wait_agent` 会在两个 spawn 注册 id 之前跑起来。先例是 `DeclareGoalDoneTool`（「它改变的是**控制流**」）。
+- **刻意不做（写进注释，不假装实现了）**：父→子**级联 abort 的独立通路**（靠 `settle()` 在回合边界实现，是对 TS 契约的**偏离**）；`closeAll()` 与 `settle()` 分开；`"closing"` 中间态；worker 再 spawn worker。
+- **一处对计划的偏离（要主动说）**：**没做 `/agents` 斜杠命令、也没做 `_prompt` 的 `agents:N` 状态位**。理由是它们**结构上恒不触发**：`AgentWorkers` 每回合新建、`settle()` 在 `finally` 里跑，所以**回合之间活跃 worker 恒为 0** —— `/agents` 永远打印"（没有子代理）"，`agents:N` 永远是 `agents:0`，而"恒显一个值会让人不再看它"。两个都正是本项目头号缺陷类的形状（机制在、没人能触达）。替代的可见性出口是 `EventPrinter` 里那条 `subagent_settled`。
+- **真实验证**：① 前置探针 `m9verify/probe_concurrent_llm.py`（真联网）—— 4 条并发 `chat()` 共用同一个 `DeepSeekClient`：**无串台、无异常、usage 各自可信**；**第一版测出"并发比串行慢 3.6 倍"是冷启动假象**（第一条真请求付了 39.92s 的 DNS+TLS+连接池成本，全落在先跑的那批头上），**预热后 1.88x**。这是"先把测量方法里的混淆项排掉再下结论"的实例。② 端到端四条动线（`m9verify/drive_m9_7.py` + `m9verify/ws_m97/`，日志 `m9verify/drive_m9_7_*.log`）：**并发 17.4s vs 串行 29.2s（1.68x）**；**`spawn_agent` 各耗时 0/5/0/0ms 而串行 `subagent` 是 5540/7686/7426ms**（句柄契约的现场）；**`close_agent` 1140ms 返回、状态 `closed`、无结论**（"等它真停"的实测代价）；**`abandon` 动线里 `subagent_settled` 真的到达 `EventPrinter`**（`■ 子代理结算：1 个被叫停、0 个结论没被取走`），且模型自己主动提醒"子代理只活这一个回合"。**变异 29/29**。
+
 ## 硬约束（不可违反）
 
 - LLM 只用 DeepSeek（国内 API）；生产 `deepseek-chat`，测试用 MockLLM
@@ -116,10 +132,11 @@
 
 | 模块 | 文件 | 职责 |
 |---|---|---|
-| 循环 | agent/loop.py | QueryEngine：think→tool→observe→finish，只读并发/串行，终止判定+循环检测（含 M9-6 的目标判定 `_verify_goal`） |
+| 循环 | agent/loop.py | QueryEngine：think→tool→observe→finish，只读并发/串行，终止判定+循环检测（含 M9-6 的目标判定 `_verify_goal`）；M9-7 加 `abort` 取消检查点 ×2 与回合边界的 `_settle_workers` |
+| 子代理 | agent/subagents.py | M9-7 并发子代理管理器：`AgentWorkers`（spawn/列表/等/关/结算）+ `AgentHandle`/`AgentSnapshot` + `AbortToken`。**叶子模块，不 import `agent.loop`**（`agent/tools/subagent.py` 模块级 import loop，反向即成环）—— 跑什么由调用方传进来的闭包决定 |
 | 目标 | agent/goal.py | 进程内目标状态机（active/paused/done）+ 三态完成判定 + 渲染（M9-6） |
 | LLM | agent/llm.py | BaseLLM → DeepSeekClient / MockLLM；usage+cache 采集 |
-| 工具 | agent/tools/ | base(基类+schema+`preview` 预览钩子) / bash / files(read·write·edit·glob·grep) / web(fetch·search + SSRF) / subagent / ask / plan / **goal(declare_goal_done)** / skills |
+| 工具 | agent/tools/ | base(基类+schema+`preview` 预览钩子+`ToolContext.workers`) / bash / files(read·write·edit·glob·grep) / web(fetch·search + SSRF) / **subagent(5 个工具族：subagent·spawn_agent·list_agents·wait_agent·close_agent，唯一构造点 `build_subagent_tools`)** / ask / plan / **goal(declare_goal_done)** / skills |
 | 状态 | agent/state.py | 消息构造（OpenAI 格式）+ AgentState（含 `plan`、`goal`） |
 | 上下文 | agent/context.py | provider-usage-first 记账 + cache-aware 布局 + 分级截断/snip/LLM compact（M3·M8） |
 | 工具结果 | agent/tool_result.py | 超大工具结果落盘 + 预览替换 + 批预算（M3） |

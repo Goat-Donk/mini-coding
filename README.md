@@ -4,7 +4,7 @@
 **核心循环手写**（不套 LangGraph / Agent SDK），支撑层用成熟库（openai SDK / pydantic v2 / streamlit / typer / pytest）。
 
 > **一句话**：把 Claude Code 的架构用 Python 重写一遍——不是移植代码，是移植设计。
-> 10,113 行源码 / 28 个模块 / 597 个测试。真实跑分见[评估章节](#评估eval)。
+> 11,207 行源码 / 29 个模块 / 623 个测试。真实跑分见[评估章节](#评估eval)。
 📄 文档：[技术方案 `docs/TECH_SPEC.md`](docs/TECH_SPEC.md) · [架构详解 `docs/architecture.md`](docs/architecture.md) · [任务清单 `TASKS.md`](TASKS.md) · [参考笔记 `docs/reference/`](docs/reference/)
 
 ---
@@ -22,7 +22,7 @@
 | **block-at-submit hooks** | `PreToolUse` 包裹 `git commit`，`data/tests_pass.marker` 不存在就**阻断**——逼 agent 进入「测试并修复」循环；marker 只在**测试命令真跑成功**时由 `PostToolUse` 写入，失败即清除 | Hooks（block-at-submit） |
 | **真·轨迹驱动评估** | 从 tinydb 真实 git history 挖 bug 修复提交构造黄金任务，隐藏测试判分，出完成率/成本回归报告 | SWE-bench 思路 |
 | **分层记忆 + 自进化** | `CODEAGENT.md` / `CLAUDE.md` / `.codeagent/rules/*.md` 分层 + `@include` + hash 去重 + 预算；任务后提取约定写回，**下次会话自动生效** | CLAUDE.md 机制 |
-| **research 子代理** | 把 `(X+Y)×N` 的探索外包，主上下文只收结论 `Z`；子代理只读、无 subagent 工具（天然禁递归） | SubAgent 上下文经济学 |
+| **并发研究子代理（句柄式）** | 把 `(X+Y)×N` 的探索外包，主上下文只收结论 `Z`。**一次派三个、一次收齐**：`spawn_agent` 立刻返回句柄（`sa-1`），`wait_agent` 收结论，`close_agent` = abort + **等它真停**。最多同时 3 个，满了**直接失败不排队**（并把花名册回喂给模型）。子代理只读（glob/grep/read 白名单）、无 subagent 工具（**天然禁递归**）；**只活一个回合**——回合边界上 `finally` 无条件结算，没被取走的结论会以 `subagent_settled` 事件到达人眼前而不是静默消失（详见「已知边界」S21–S26） | SubAgent 上下文经济学 + 多智能体编排 |
 | **MCP 客户端** | 手写 MCP 客户端，**两种传输**（stdio 子进程 / Streamable HTTP）与协议层**分开**——加 HTTP 时协议层一行未改；三种能力面（tools / resources / prompts），能力声明与列表**都非空**才注册工具面，描述里列出可用 uri 与提示词参数。**第三方工具照样过权限与 hooks**，且**默认不放行**——必须列进 `mcp.json` 的 `allow` 才免确认 | MCP（工具接入标准） |
 | **第三方工具授权** | `Tool.is_external()` → 权限引擎单独归类，默认 `ask`（无交互确认 → 拒绝），拒绝文案带出处与解除方式；子进程环境按名清洗凭据类变量 | 权限与安全审查 |
 | **注入文本检测 + 会话污染标记** | `agent/security.py` 对已知文本模式做**概率性**检测（只出告警）；`high` 标记让**三类不可逆动作**（网络外发 / 读凭据 / 写记忆文件）在 `PermissionsEngine` 的**后置天花板**上从 allow 降为 ask —— 该位置在记忆之后，`allow_always` 短路不了它 | 权限与安全审查 |
@@ -363,7 +363,7 @@ python -m eval.runner --limit 2 --mock           # 无 key 冒烟：只验证管
 **测试**：
 
 ```bash
-python -m pytest tests/                  # 597 passed
+python -m pytest tests/                  # 623 passed
 ```
 
 ---
@@ -430,19 +430,20 @@ $ python -m eval.runner --limit 2
 
 | 层 | 文件 | 行数 |
 |---|---|---|
-| 核心循环 | `agent/loop.py` `llm.py` `state.py` `context.py` `tool_result.py` `session.py` | 2,593 |
+| 核心循环 | `agent/loop.py` `llm.py` `state.py` `context.py` `tool_result.py` `session.py` | 2,726 |
 | 目标 | `agent/goal.py` | 232 |
+| 子代理 | `agent/subagents.py` | 540 |
 | 治理 | `agent/permissions.py` `hooks.py` `memory.py` `security.py` | 1,519 |
 | 技能 | `agent/skills.py` | 281 |
-| 工具 | `agent/tools/base.py` `bash.py` `files.py` `web.py` `subagent.py` `ask.py` `plan.py` `goal.py` `skills.py` | 1,889 |
+| 工具 | `agent/tools/base.py` `bash.py` `files.py` `web.py` `subagent.py` `ask.py` `plan.py` `goal.py` `skills.py` | 2,280 |
 | MCP | `agent/mcp.py` | 961 |
-| 入口 | `app/cli.py` `repl.py` `ui_streamlit.py` `replay.py` | 2,148 |
+| 入口 | `app/cli.py` `repl.py` `ui_streamlit.py` `replay.py` | 2,178 |
 | 评估 | `eval/golden_tasks.py` `runner.py` | 490 |
-| **源码合计** | **28 个模块** | **10,113** |
-| 测试 | `tests/` | 10,962（597 个用例） |
+| **源码合计** | **29 个模块** | **11,207** |
+| 测试 | `tests/` | 11,809（623 个用例） |
 
 > 口径：源码 = `agent/` + `app/` + `eval/` 下**非空** `.py` 文件的**全部行数**（含空行；不含 `eval/repos/` 下的克隆仓，它被 gitignore）；模块数 = 其中**非空**的 `.py` 文件数（4 个空 `__init__.py` 不计）。
-> **按文件系统数，不按 git 跟踪数** —— 新文件在提交前也该算进去（M9-5 的 `app/repl.py`(503) 与 `tests/test_repl.py`(785) 当时尚未提交）。
+> **按文件系统数，不按 git 跟踪数** —— 新文件在提交前也该算进去（M9-5 的 `app/repl.py`(503) 与 `tests/test_repl.py`(785)、M9-6 的 `agent/goal.py`(232) 与 M9-7 的 `agent/subagents.py`(540) 当时都尚未提交）。
 
 ---
 
@@ -533,7 +534,20 @@ coding_agent/
 
 另外三条一并写在这里：**①** `/fork` 会连目标一起继承，而检查跑在**当前**工作区上 —— 对话分叉、文件不回滚，所以可能白捡一个通过；**②** 检查通过即结束回合，模型**没有机会**补充「还有一件次要的事没做」（这是把判分权拿走的代价）；**③** 检查超时 120s 是常量、没有旋钮。
 
-**这份清单会过时**：它不是「设计上不允许」，是「截至 `a455dda`（S17–S20 截至 M9-6，尚未提交）还没做」。逐条修掉其中任何一条，都应该同时改这张表。
+### 三之三、并发子代理（M9-7）
+
+这几条是「worker 只活一个回合 + 取消只在检查点生效」这两个设计的**代价**：
+
+| # | 边界 | 说明 |
+|---|---|---|
+| S21 | **worker 只活一个回合** | `AgentWorkers` 的生命周期 = 一次 `_run_loop`。模型 spawn 完**不 wait 就直接给最终答复**的话，它跑到一半会被结算掉 —— **token 已经花了、结论丢了**。有一条 `subagent_settled` 事件到达人眼前（`EventPrinter` 那条接线），但**事件不影响它已经花掉的钱**。这不是缺陷是刻意的：回合边界是唯一一个"父一定还在"的时刻 |
+| S22 | **`close_agent` 最坏要等约 120 秒** | 界线是 worker 当时正卡在哪一次操作里：`llm.chat` 的客户端超时是 120s、`bash` 默认也是 120s、而只读**并发批**要等整批跑完。取消只在两个检查点生效，**不打断**正在飞的网络调用与子进程（客户端没有 per-call timeout，`BashTool` 没有 cancel token）。工具 description 里明写了这一点，免得模型以为它卡死了 |
+| S23 | **`settle()` 的 join 有界（1.5s）** | 回合边界**不阻塞**在网络调用上 —— 超时未停的 worker 被如实报成「仍在后台运行」（`still_running`），**不假装清干净了**。代价：极端情况下它可能在进程退出前还在跑（daemon 线程，不拖住解释器退出） |
+| S24 | **父→子没有级联 abort 的独立通路** | 对 TS 原版契约的**偏离**：原版是父 signal abort → 级联 cancel，我们靠 `settle()` 在回合边界完成（只是延迟到回合边界）。写在契约注释里，不假装实现了 |
+| S25 | **worker 的完整轨迹不进父会话 JSONL** | 只留一条摘要事件。理由是父轨迹会进检查点，全量塞进去会让检查点膨胀；代价是**事后无法从父会话回放 worker 的每一步**（要查得靠 worker 自己的落盘目录） |
+| S26 | **用量计入父会话 → 缓存命中率被稀释** | 子代理的 prompt 是独立 system prompt + 独立轨迹，**大多缓存未命中**。所以本 README 的 M9-6 缓存命中率数字只在**没用过子代理的会话**上可比。这是「计入父会话」这个选择的直接后果（另一个选择是单独记账，但那样父会话的成本报告就不完整了） |
+
+**这份清单会过时**：它不是「设计上不允许」，是「截至 `a455dda`（S17–S20 截至 M9-6，S21–S26 截至 M9-7，均尚未提交）还没做」。逐条修掉其中任何一条，都应该同时改这张表。
 
 ### 四、这些是**真跑过真实 LLM** 验出来的（不是单测）
 
@@ -547,12 +561,15 @@ coding_agent/
 | **不锁定** | agent 自己写含载荷的测试文件、再读回、再跑 `pytest` | 8 次工具调用、**0 次 `gate_block`**、任务正常完成 —— 这是「只收紧不可逆动作」这条误报政策的验收点 |
 | **远程 HTTP MCP**（M9-4） | 真网络 + 真第三方 server：DeepWiki 的 Streamable HTTP 端点，`mcp.json` 里只写 `url` | 握手拿到 `protocolVersion 2025-06-18` / `serverInfo DeepWiki 2.14.3`；DeepSeek 实际调用 `read_wiki_structure(repoName=pallets/flask)` 成功（1 步、2425ms、prompt 6190 token、缓存命中 45%），答案与直连该端点拿到的一致。该 server 是**无状态**的（不回 `Mcp-Session-Id`），客户端照常工作 |
 | **进程内目标**（M9-6） | `--repl` 里用 DeepSeek 官方通路真跑五条动线：① 建目标 → 自动续跑推进 → 声明 → 检查真跑通过 ② 给一条**一开始必然失败**的检查 → 判定未通过 → 回喂 → 继续修 → 再声明 → 通过 ③ `pause` / `resume` ④ 人敲一行字 ⑤ `--resume` 一个有活跃目标的会话 | 五条动线**全部有真实日志**。② 里模型收到 `【完成检查未通过】` + 输出尾部 40 行后真的接着改并再次声明；⑤ 证明检查确实长在 `_run_loop` 里（进程外恢复也照跑） |
+| **并发子代理**（M9-7） | `--repl` 里用 DeepSeek 官方通路真跑四条动线：① `spawn_agent`×3 + 一次 `wait_agent` 收齐 ② 串行 `subagent`×3 作基线 ③ 派一个长任务后**立刻** `close_agent` ④ spawn 后**不等**就回答 | **并发 17.4s vs 串行 29.2s（1.68x）**；`spawn_agent` 各耗时 **0 / 5 / 0 / 0ms**，而串行 `subagent` 是 **5540 / 7686 / 7426ms** —— 这是「句柄立刻返回」在真实会话里的现场，不是单测断言；`close_agent` **1140ms** 返回、状态 `closed`、**无结论**；④ 里 `EventPrinter` 打出 `■ 子代理结算：1 个被叫停、0 个结论没被取走` —— **「结论被丢」这件事真的到达了人眼前**，而且模型自己主动补了一句「子代理只活这一个回合…它的结论会丢失」。两条动线**各自独立**地都找出了 `pkg/beta.py` 里 `except OutOfStock` 不捕获 `ValueError` 的回滚缺口 —— 子代理不是在敷衍 |
 
 > **⚠️ 这一条只覆盖到"传输"这一半，如实标注**：`resources` / `prompts` 两个能力面**只对着本地假 server 验证过**。试过的一批公开远端 server 里**没有一个能连上且暴露非空的 resources/prompts**（DNS 不通 / 超时 / 只有 2 个 tools）。两个能力面的**代码路径**是真的（真 socket、真 JSON-RPC、变异测试覆盖），但「接一个真远程 server 读资源」这件事**没跑过**，别讲成跑过。
 > 有意思的是这次真跑给我们的注册条件提供了实证：DeepWiki 在 `initialize` 里**声明了** `resources` 与 `prompts` 两种能力，但两个列表都是空的（原文 `{"resources": []}`）—— 只判能力声明的话，它就会拿到一个**永远调不通**的工具，而「声明了且列表非空」两条都判，它就被正确地跳过了。
 
 > **⚠️ M9-6 这一条要如实拆开讲**：**④ 的现场记录只证明「人敲一行字之后目标不再自动推进」，不证明「那一行暂停了目标」。** 按 `app/repl.py` 的结构，一拍结束时一定已经 `_pause_goal(stop)` 了，所以人拿到提示符时目标**不可能是 `active`** —— 那个「人工回合顺便暂停一下」的分支在纯 stdin 流程里**结构上不可达**。同理 `/goal pause` 在纯 stdin 流程里也敲不到（想验证它得用交互终端）。这不是 bug，是「一拍 = 一次授权」这条不变式的推论。
 > **这五条动线的步数 / token / 缓存数字与既有的单发、REPL 数字不可比**：自动续跑会把 `max_steps` 乘上 `goal_turns`，同一个任务在不同的 `--goal-turns` 下能差出一个量级。所以只记动线是否走通，不引用 token 数字下任何结论。
+
+> **⚠️ M9-7 这四条同样要如实拆开讲**：**① 并发与串行是两条不同的会话**，所以 44% vs 64% 的缓存命中率只能当「同向现象」读，**不是受控对照**（受控对照要同一个会话、只切换那一处）。**② 1.68x 是这一批任务、这台机的观测值** —— 三个子任务都是「读几个文件、写一份结论」的短活，**不要把 1.68x 当常数引用**；真正的成本形状是「**最慢的那个 worker 决定墙钟**」，子任务越不均匀并发收益越小。**③ 这四条也不是压测**：并发上限 3、动线里只派了 3 个，没有触发过 `TooManyAgents`（那条只有单测覆盖）。
 
 **这轮验证挖出并修掉了两个真 bug**（都在 `a455dda`，各带一条回归测试）：
 

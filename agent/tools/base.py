@@ -17,6 +17,7 @@ from pydantic import BaseModel, ValidationError
 
 if TYPE_CHECKING:
     from agent.state import AgentState
+    from agent.subagents import AgentWorkers
 
 
 @dataclass
@@ -65,6 +66,12 @@ class ToolContext:
     # 用字符串注解 + TYPE_CHECKING：base 是 tools 包的底座，不该在运行期
     # 依赖 agent.state（虽然目前没有环，但底座依赖上层是反的）。
     state: "AgentState | None" = None
+    # M9-7：本回合的子代理管理器（`agent.subagents.AgentWorkers`）。**引擎每回合
+    # 新建一个**，所以工具拿到的是"这一个回合的" —— 子代理活不过派发它的那一个回合。
+    # 读它的只有子代理工具族（`agent/tools/subagent.py`），它们**只在 `ctx.workers`
+    # 非 None 时才工作**、为 None 时如实返回失败（同 `DeclareGoalDoneTool` 的
+    # 「不静默降级」：接了引擎却没接管理器是一种接线缺口，不能装作没事）。
+    workers: "AgentWorkers | None" = None
 
     def __post_init__(self) -> None:
         if self.cwd is None:

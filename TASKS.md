@@ -357,7 +357,7 @@ step 5  完成
     - **C（`--review-edits` 现场验收 `new_turn`）**：① 首回合改 `longest_word` 的 docstring → 确认框弹出（带 diff）→ 答「**2) 本回合允许**」→ 生效（**6 步 / 19,547 token / 命中 82%**）；② 第二回合**同一个 `edit` 工具、同一个文件** → **确认框重新弹出**，再答「2」→ 生效（**2 步 / 7,692 token / 命中 96%**）。权限的记忆键是 `_classify` 给的 `arguments["path"]`，两回合都是字面量 `textstat.py`，**键相同** —— 所以"重新问一次"只可能来自回合边界上的清空。**这正是 `_turn` 从不清空那个契约缺口在没有单测介入下的现场复现**（改动前，第二回合会被静默自动放行）。
     - **检查点计数对上了设计**：A 会话停在 step 9、盘上 8 个检查点（`step-1..5,7,8,9`）—— 前 5 个是工具步的节拍产物，第 8 个（`step-9.json`）是**退出时那次强制落盘**写出来的，而它在 REPL 的实时显示里**并不存在**（那一行报的是"检查点 7 个"）。这一条同时验证了 `_wrap_up` 的强制落盘确实在跑，也说明"实时计数"与"退出后盘上计数"本来就会差一个。C 会话同理（实时 6 个 → 盘上 7 个）。
     - **三个会话在盘上都可核对**：`data/checkpoints/s20260911-161113|161157|161252/`、`data/sessions/*.jsonl|.meta.json`；`.codeagent/rules/learned.md` 三轮累计提炼出 10 条仓库约定 —— 其中一条是"查找函数定义优先用 `grep` 的 `include` 参数限定文件名，比 `path` 更可靠"，来自 C 首回合模型自己那次**失败的** `grep(pattern=def longest_word, path=textstat.py)`（轨迹里是 ✗）。这是真实轨迹的产物。
-  - **如实说明未做**：① **不是全屏 TUI**（`TASKS.md` 已有决定，⑥ 明确不做）—— 行式输入，没有 ANSI 控制、没有历史滚动；多行输入缓冲 / 历史文件 `readline` / 自动补全也都不做，那是纯终端体验的体力活，对这份作品集要回答的问题（循环、上下文、权限、可恢复性）不加分。② **`/fork` 是对话分叉，工作区文件不回滚**（沿用 M9-3 的语义）—— 这一点在 **B 的真实跑里直接看到了后果**：分叉点是 step 2（修 bug 之前），但盘上文件已经是修好的，于是新分支的模型 `read` 到的是"已经修好"的文件、却又在结论里说了一遍"修好了失败的测试"。REPL 与 CLI 都会把这句话打印出来，但**它不会阻止人误判**。③ 并发多回合（同一个 state 被两个回合同时推进）没有做，也没有测试 —— 当前设计里一个 `Repl` 一次只有一个活跃回合。
+  - **如实说明未做**：① **不是全屏 TUI**（`TASKS.md` 已有决定，⑥ 明确不做）—— 行式输入，没有 ANSI 控制、没有历史滚动；多行输入缓冲 / 自动补全也都不做，那是纯终端体验的体力活，对这份作品集要回答的问题（循环、上下文、权限、可恢复性）不加分。**⚠ 其中「历史文件 `readline`」这一项已于 2026-09-11 从"不做"里摘出来单独放行**（见 ⑥ 的第二条）：它只有几十行、不引入新状态，且吃掉观感差距的大半 —— 这里原文把它和"多行缓冲 / 自动补全"一起划掉是**过度收缩**，M9-5 当时确实没做，但它不属于"明确不做"。**尚未实现。**② **`/fork` 是对话分叉，工作区文件不回滚**（沿用 M9-3 的语义）—— 这一点在 **B 的真实跑里直接看到了后果**：分叉点是 step 2（修 bug 之前），但盘上文件已经是修好的，于是新分支的模型 `read` 到的是"已经修好"的文件、却又在结论里说了一遍"修好了失败的测试"。REPL 与 CLI 都会把这句话打印出来，但**它不会阻止人误判**。③ 并发多回合（同一个 state 被两个回合同时推进）没有做，也没有测试 —— 当前设计里一个 `Repl` 一次只有一个活跃回合。
   - **顺带收益已兑现**：面试稿 §12 的演示动线不再全是单发命令（`/sessions` → `/fork` → `/rename` → 接着聊 是一条能一口气演完的连续动线）。
 - [x] **M9-6 ④ Goal**：进程内 Goal + 暂停/恢复 + **显式完成检查**（后者的判分思路与我们的评估层呼应）
 
@@ -377,7 +377,7 @@ step 5  完成
   - **`_FIELD_DECODERS` 那一行是载荷性细节**：`load_state` 走 `AgentState(**raw)`，而 dataclass **不做类型检查** —— 漏了 `"goal"` 这一行，`state.goal` 会是个 `dict`，直到有人读 `.status` 才抛错，而那个炸点被 `_run_loop` 的 `except Exception` 吞成 `terminated_reason="error"`，**看起来像引擎出错**。一条测试 + 一条变异体专门钉它，并把这条纪律写进 `session.py` 的注释。
   - **`/goal` 的解析规则只有两条且必须确定**：带 `--check` 一定是设定；不带 `--check` 且首词是已知子命令（`status`/`pause`/`resume`/`clear`）→ 子命令；两者都不是 → 用法错（**只在命令内失败，不带走 REPL**，有测试钉着）。**已知边界如实记**：目标文本里出现字面 ` --check ` 会被切开 —— **不做引号解析**，加一层"半个 shell"只会造出第二个有歧义的解析器。`/goal X` 在已有未结束目标时**拒绝**（防旧目标的检查命令无声消失，而它是"完成与否"的唯一判据）；`/goal clear` 置 `None` 而**不是**置 `done`（后者会在轨迹里留下一句没发生过的成功）；`/goal resume` 在 `done` 时**拒绝**（完成是终态，能反复"完成"一次的目标等于没有检查）。
   - **`_STOP_REASONS` 每个原因都要有话说**：暂停是自动推进的唯一出口，理由说不清的话人只会看到「它自己停了」。而 `BURST_STOP_REASONS` 里 **`"completed"` 刻意不在**：一个回合"正常跑完"（模型给了文字、不再调工具）恰恰是自动推进要继续的情形 —— 目标的完成与否由人给的检查命令说了算，不由模型停不停下来说了算。
-  - **测试**：`tests/test_goal.py` **38 例**（创建/暂停恢复/清除、三态判定、门禁拦下→invalid、批前复位、截断 40 行、schema 扁平无 `$defs`、REPL 一拍多回合与人工暂停、`dump_state`→`load_state` 回来是 `Goal` 实例、暂停跨进程往返仍门住一拍、`--goal` 不碰 LLM、`/help` 键集合等于 `_COMMANDS`）+ `tests/test_repl.py` / `tests/test_session.py` 补契约。全量 **597 全绿**（原 559）。
+  - **测试**：`tests/test_goal.py` **38 例**（创建/暂停恢复/清除、三态判定、门禁拦下→invalid、批前复位、截断 40 行、schema 扁平无 `$defs`、REPL 一拍多回合与人工暂停、`dump_state`→`load_state` 回来是 `Goal` 实例、暂停跨进程往返仍门住一拍、`--goal` 不碰 LLM、`/help` 键集合等于 `_COMMANDS`）+ `tests/test_repl.py` / `tests/test_session.py` 补契约。全量 **597 全绿**（原 559；**这是 M9-6 当时的数字**，M9-7 之后为 623）。
   - **变异测试 20/20 被抓住**（`m9verify/mutate_m9_6.py`）：声明直接当完成 / 检查不走门禁链 / 无效→失败 / 无效→通过 / 失败也结束回合 / 通过不结束回合 / 判定不回喂 / 批前不复位 / 跑目标文本而非命令 / 无超时上限 / 漏解码器 / 输出不截断 / 暂停照样推进 / `clear` 实现成 done / 声明能自造目标 / 人工回合不暂停 / 到期不停止 / 恢复时每回合重投。
     - **一个如实标注的 MISS（不是缺陷，是不变式的推论）**：「人工回合不暂停」这个变异体实证 **MISS**，而原因是**结构性的** —— `loop()` 在进提示符前一定先跑一拍，而 `_run_goal_burst` 结尾一定 `_pause_goal(stop)`，所以**人拿到提示符时目标绝不可能是 active**，那句 `_pause_goal` 命中的永远是"已经暂停/已完成"的拒绝分支。这是「一拍 = 一次授权」不变式的直接推论，与动线 ④ 在纯 stdin 流程里不可观测**同源**（见下）。
   - **真实 LLM 端到端五条动线全跑**（DeepSeek 官方通路，真工作区 `m9verify/ws_m96_a|b|c|d|e/`，真 pytest 真跑；日志 `goal_a|b|b2|c|d|e.log` + 驱动脚本 `drive_m9_6.py` 的三个 case）：
@@ -393,27 +393,80 @@ step 5  完成
 
 ### 压轴 · 价值最高，但唯一会动核心循环契约
 
-- [ ] **M9-7 ② sub-agent 并发 3 + wait/close**
-  - 现状：工具协议是「同步 `execute` → `ToolResult`」（`agent/tools/base.py`），要引入「后台任务 + 句柄」就得**改这个契约**
-  - 还要与已有的「只读并发 / 写串行」语义协调，并防递归（我们现在的做法是 `_restricted_registry` 永不包含 subagent 自身，从结构上禁掉）
-  - 形状参照 `agents/manager.ts`：并发上限 + `wait` + `close` + 独立上下文 + 受限工具集 + 可取消
+- [x] **M9-7 ② sub-agent 并发 3 + wait/close**（2026-09-11 完成并真跑验证；用户拍板：**保留 `subagent` 作为阻塞便捷入口 + 加 4 个句柄工具**、**子代理用量计入父会话**）
+  - **开工前的现状勘察（下面这一段是 M9-7 开工**之前**的样子，留档用）**：`agent/tools/subagent.py:56` 已经有 `subagent` 工具，但它是**同步阻塞单发**（`engine.run(...)` 跑完才返回），`MAX_SUBAGENT_STEPS=10`，只读 registry，且 `_restricted_registry` **永不包含 subagent 自身** → 结构上禁递归。这个形状与 Python 版的 `task` 工具相同，要变成句柄式就得动工具契约
+  - **形状（2026-09-11 读了 TS 原版真代码后更新，`src/agents/manager.ts` + `src/tools/sub-agents.ts`）**：
+    - `MAX_SUB_AGENTS = 3`（`agents/types.ts:1`）；`spawn` 时 `runningCount >= max` **直接抛**，不是排队
+    - `spawn(task, parentSignal?)` **立刻返回句柄**（`id/status/startedAt`），后台跑 `runAgentTurn`，独立 `messages`（system 由 `buildSubAgentPrompt(cwd)` 生成）+ 自己的 `AbortController`
+    - 父 signal abort → 级联 cancel：置 `status='closed'` + `abort`
+    - `wait(ids, timeoutMs=30_000)` 用 `Promise.race` → `{timedOut, agents}`；**超时只返回最新状态、不关闭** ——「等」和「关」是**分开的两件事**，这个区分要抄
+    - `close(id)` = abort + **`await completion`**（等它真的停下才返回）；另有 `closeAll()`
+    - 四个工具：`spawn_agent` / `list_agents` / `wait_agent` / `close_agent`；**只读靠传进去的 registry 保证**，不靠权限提示
+  - 我这边的真实成本（比"改个返回类型"小，但不是零）：
+    - 我的引擎是**同步**的、没有 async → 后台要用 `ThreadPoolExecutor` + 句柄注册表；`spawn_agent` 仍然可以**同步返回一个 `ToolResult`**（句柄序列化进 output），所以 `_execute_tool_calls` 的返回类型**未必需要改**。真正新增的是**取消**这条通路 —— 现在 `_run_loop` 没有 abort 信号，而 `close_agent` 必须能真的停下一个回合
+    - **必须先验证 LLM 客户端的多线程安全性**：原版是 promise、天然并发，我的 `BaseLLM` 共享实例跑在两条线程上是**新假设**。按 M7 的教训 —— **先怀疑自己的调用方式，再归因给库**
+    - **回合边界上的 worker 结算**（原版叫 `settleWorkers`）：不做的话 worker 会**活过它的回合**、结论无处可去 —— 那正是本项目的头号缺陷类（静默丢失 / wiring drift）
+    - REPL 目前假设「一次只有一个活跃回合」（M9-5 的如实标注 ③）
+  - **一条可以直接讲的对照**：Python 版**声明**了 `SUBAGENT_START` / `SUBAGENT_STOP` 两个 hook 事件，但全仓**没有任何触发点**（只有声明和测试）—— 那正是我们花了四个里程碑在防的「机制在、没人接线」；它的 sub-agent 也是同步单发，没有并发
   - **这是简历上最值钱的一条**（多智能体编排是 Agent 岗最热的考点），但它不该是起步项
+  - **实现**：新叶子模块 `agent/subagents.py`（540 行，**不 import `agent.loop`** —— `loop.py` 要反过来用它做结算，反向 import 即成环，所以跑什么由工具模块构造的闭包决定）；`agent/tools/subagent.py` 加 `build_subagent_tools` 单一构造点，5 个工具共用一个 `_build_runner`；`agent/loop.py` 加 `abort` 两处检查点 + `finally` 结算；`app/repl.py` 的 `BURST_STOP_REASONS` / `_STOP_REASONS` 加 `"aborted"`。
+  - **单测**：`tests/test_subagent.py` **32 例**（原 6 例）。全量 `623 passed in 90.86s`（`python -m pytest tests/ -o addopts="" -q`，无 skip）。
+  - **变异测试 29/29**（`m9verify/mutate_m9_7.py`，日志 `m9verify/mutate_m9_7.log`）。**两条是牙齿检查逼出来的修正，如实记**：
+    1. **「超时顺手关掉」最初 MISS**，而**我的第一次修法也是错的**。第一层原因：该用例的 runner（`_blocking_runner`）docstring 自己写着"交结论时**不看 token**"（模拟卡在网络调用里），token 置位对它是个 no-op。第二层原因（第一次修完仍 MISS 才发现）：那条变异锚在 `remaining <= 0` 分支上，而它**在逐个 handle 的循环里** —— **只有一个 handle 时循环只走一圈，超时全被 `finished.wait(remaining)` 吃掉，那条分支根本到不了**。修法：改成**三个** token-aware worker（前一个慢的耗光预算，后面的才会走到那条分支）。不是断言太松，是**场景压根没覆盖到**。
+    2. **「用量在 worker 线程合并」原本是 SKIP（锚点没找到）** —— 锚点写成了 16 空格缩进，而真代码在 `with self._lock:` 体内是 12 空格。**它从来没真正跑过**，却会被读成"这条覆盖了"。修好锚点后 OK。**教训：SKIP 和 MISS 一样要当失败看**，否则一个坏锚点会伪装成覆盖。
+    3. 顺带把**「等而不等」的抓法从"靠竞态"改成"确定性"**：原用例先 `gate.open()` 再 `wait()`，worker 有起跑优势，重跑可能翻盘。改成 `threading.Timer(0.2, gate.open)` —— 若 `wait()` 不等就返回，拿到的是 `running`，裕度远大于抖动。
+    - 脚本另加了子串过滤器（`python m9verify/mutate_m9_7.py <子串>`）用于改完测试后单独复验；**留档的 29/29 是不带参数跑出来的**。
+  - **真实 LLM 端到端四条动线**（DeepSeek 官方 `deepseek-chat`，无 mock；工作区 `m9verify/ws_m97/`，素材是三者互不相干的 `pkg/{alpha,beta,gamma}.py`；日志 `m9verify/drive_m9_7_{concurrent,serial,close,abandon}.log`）：
+
+    | 动线 | 墙钟 | 步数 | 子代理工具调用 | prompt（命中/未命中） | completion | 命中率 |
+    |---|---|---|---|---|---|---|
+    | 并发 `spawn×3 + wait` | **17.4s** | 3 | 4 | 27936（12416/15520） | 5500 | 44% |
+    | 串行 `subagent×3` | **29.2s** | 4 | 3 | 34382（22144/12238） | 5547 | 64% |
+    | `close`：派长任务→立刻叫停 | 5.5s | 3 | 2 | 12890（8832/4058） | 479 | 69% |
+    | `abandon`：spawn 后不等就回答 | 4.8s | 2 | 1 | 9790（8832/958） | 449 | 90% |
+
+    - **加速比 29.2 / 17.4 = 1.68x**（同一台机、两条动线背靠背跑，机器无其他负载）。
+    - **`spawn_agent` 真的立刻返回，这次有真数字**：四条动线里 `spawn_agent` 各耗时 **0ms / 5ms / 0ms / 0ms**，而串行动线里 `subagent` 是 **5540ms / 7686ms / 7426ms**。这是「句柄」这条契约在真实会话里的现场，不是单测断言。
+    - **`close_agent` 真停**：`spawn_agent`(0ms) → `close_agent`(**1140ms**) 返回，状态 `closed`、**没有结论**；模型如实回报"它在跑到一半时被取消，报告没有生成"。1140ms 是"等它真停"的实测代价（远小于最坏 ~120s —— 界线是它当时卡在哪一次操作里）。
+    - **结算事件真的到达人眼前**：`abandon` 动线里 `EventPrinter` 打出 `■ 子代理结算：1 个被叫停、0 个结论没被取走` + `sa-1「…」跑到一半被杀，没有结论`。**这是「结论被丢」这件事在真实会话里到达人眼前的证据**（即替代 `/agents` 的那个可见性出口）。
+    - **模型自己读懂了「只活一个回合」**：`abandon` 里模型在没被提示的情况下主动补了一句「子代理只活这一个回合，如果现在直接结束对话，它的结论会丢失 —— 需要的话我可以用 `wait_agent(ids=["sa-1"])` 把结果取回来」。工具 description 里那两条错题写对了。
+    - 两个动线的调查结论都**实质正确**（alpha 的"先打折后计税"、beta 的 `reserve_all` 为什么要回滚、gamma 的状态机与"delivered 不能退款"），且**并发与串行两条动线各自独立地**都指出了 beta 里 `except OutOfStock` 不捕获 `ValueError` 的那个回滚缺口 —— 子代理不是在敷衍。
+  - **如实标注（README S21–S26 已写）**：**worker 只活一个回合**；`close_agent` 最坏卡 ~120s；`settle()` 的 join **有界 1.5s**（超时未停的如实报"跑到一半被杀"，`abandon` 动线看到的就是这一支）；父→子**没有独立级联 abort 通路**（对 TS 契约的偏离，靠 `settle()` 在回合边界实现）；worker 完整轨迹**不进**父会话 JSONL，只留一条摘要事件；**用量计入父会话 → 缓存命中率被稀释**（并发 44% vs 串行 64% 是同向的现象，但**两条动线是不同会话，不能当受控对照读**）。
+  - **一处如实记的计划偏离**：**`/agents` 斜杠命令与 `_prompt` 的 `agents:N` 状态位没有做**，理由是**结构性的**、已在代码里核实：`workers = AgentWorkers(...)` 在 `loop.py:357`（`_run_loop` 内，每回合新建），`self._settle_workers(workers, state)` 在 `loop.py:486` 的无条件 `finally` 里（覆盖 6 个返回点 + `KeyboardInterrupt`）→ **回合之间活跃 worker 恒为 0**。于是 `/agents` 永远打印"（没有子代理）"、`agents:N` 永远是 `agents:0` —— 两个都是本项目头号缺陷类的形状（机制在、没人 routing），而恒显一个值的状态位会让人不再看它。可见性改由 `subagent_settled` → `EventPrinter`（`app/cli.py:82-86`）承担，**这一条已由 `abandon` 动线真跑验收**。对照值得讲：`--plan`/`--goal` 能落盘导出是因为它们**跨回合存活**，worker 是进程内瞬时的、盘上什么都没有。
+
+- [ ] **M9-8 工作区 rewind 快照**（新增，2026-09-11 立条目，尚未开工）
+  - **它把一条已写进五处文档的"如实标注"变成"已修"**：`TASKS.md:290`、`docs/architecture.md:286`、`docs/interview_guide.md:134`、`docs/TECH_SPEC.md:1656`、`CLAUDE.md:33` 都写着**「`/fork` 只分叉对话，工作区文件不回滚」**。M9-5 的 B 动线真跑**直接看到了后果**（`TASKS.md:360` 原话）：分叉点是 step 2（修 bug 之前），但盘上文件已经是修好的 —— 于是新分支的模型 `read` 到的是"已经修好"的文件、**却又在结论里说了一遍"修好了失败的测试"**。这不是"缺个功能"，是**一个已知会咬人的边界一直挂在文档里**，而且它咬的方式是让模型说出一句它没有做过的事。
+  - **挂在我们已有的 step 级检查点上**（`--rewind --step K`），**不是**"回退最近 N 次编辑"：Python 移植版是后者，我们是前者 —— step 与检查点、`/fork --step K` 共用**同一个坐标系**，而"最近 N 次编辑"要另立一套账（还得处理"一次编辑被后续编辑部分覆盖"）。
+  - **要老实回答的难点（开工前必须先想清楚，不然会做成一个假的 rewind）**：① 只读工具与 `bash` 的副作用**不可回滚**（`pytest` 写的 `.pyc`、`git` 改的状态、任意命令的任意后果）—— 快照只能覆盖**我们自己经 `write`/`edit` 写的文件**，这一点必须写在命令输出里，不能让人以为"回滚了 = 什么都没发生"；② 快照存哪（`Session` 目录旁边 vs 工作区内的 `.codeagent/`）—— 存工作区内会被自己快照进自己；③ 与 `subagent` 的关系：**worker 的写操作在 M9-7 之后不存在**（只读白名单），所以快照不必跨线程，但**要有一条断言钉住这个前提**（否则哪天白名单松了，rewind 会静默漏掉 worker 写过的文件）。
 
 ### 明确不做（理由留痕）
 
-- **⑥ 全屏 TUI**：纯终端渲染的体力活，面试加分有限；我们已有 Streamlit 控制台可演示（且已在真实浏览器里跑通过）
-- **⑤ Loop**：价值低（本质是个定时器）；REPL 做出来之后顺手做，**不单独排期**
+- **⑥ 全屏 TUI**：**不做。但理由是"第二套状态机"，不是"体力活"。** 原先这里写的是「纯终端渲染的体力活，面试加分有限」—— 那低估了成本，是错的（2026-09-11 逐文件核实）。
+  - 真成本在于**第二个前端自带一整套状态机**：TS 原版自己的 `src/tui/` 只有 **8 个 .ts**（`chrome/index/input-parser/input/markdown/screen/transcript/types`），而 Python 移植版 `F:\MiniCode-Python-main\minicode\tui\` 长成了 **19 个 .py / 4,941 行**（多出 `event_flow` / `input_handler` / `navigation` / `runtime_control` / `session_flow` / `state` / `theme` / `tool_helpers` / `tool_lifecycle` / `ui_hints` —— 全是"状态与流程"，不是"画字符"）。
+  - **Windows 上还得真写平台代码**（不是夸张，是移植版里的原样）：`screen.py:60-74` 用 `ctypes.windll.kernel32` + `GetStdHandle`/`GetConsoleMode`/`SetConsoleMode` 打开 `ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004`（不开的话 ANSI 全打在屏幕上）；`input_handler.py:63-73` 用 `msvcrt.kbhit()`/`getwch()` 逐键读，还要把扫描码手工翻成 ANSI 转义序列（文件里有一张映射表）。**这些都不是"渲染体力活"，是平台适配 + 一整套输入状态机。**
+  - 行式 REPL 已经把"流式渲染 + 工具卡片 + 状态位"做完了，TUI 换不来新的**能力**，只换观感。我们已有 Streamlit 控制台可演示（且已在真实浏览器里跑通过）。
+  - **单独放行一小块（从上面这个结论里摘出来，不连带否掉）**：行式 REPL 加 **`readline` 输入历史**（↑/↓ 翻历史、Ctrl+R 搜索）。几十行，吃掉观感差距的大半，且不引入任何新状态。它不在"不做"里。
+- **⑤ Loop**：**真不做，理由不是"价值低"。** 原先这里写的是「价值低（本质是个定时器）；REPL 做出来之后**顺手做，不单独排期**」—— 那是**缓做**，却挂在一个叫「明确不做（理由留痕）」的标题下面。**让一个还没做的决定冒充已做的决定，比不做更糟**（这条本身就是本项目在防的缺陷类：文档与实现漂移）。
+  - 真理由：**它与 Goal 抢同一个回合执行器。** TS 原版为此在 `src/runtime/session-runtime.ts` 里写了**五处 throw + 一个 busy 谓词**（2026-09-11 逐行核实）：
+    - `:84` 起 Loop 时若 goal 活着 → `'Pause or clear the Goal before starting a Loop; answer or clear any pending Goal question.'`
+    - `:132` 起/恢复 Goal 时若 loop 活着 → `'Stop the Loop before starting or resuming a Goal.'`（`assertIdle`）
+    - `:34` Loop 自己的 `busy` 谓词里含 `this.goal.enabled`（`busy: () => this.turns.busy || this.turns.awaitingUser || this.goal.enabled || ...`）
+    - `:62` / `:68` 起一个回合时若 loop 在跑 / goal 活着 → 各自 throw
+    - `:133` `assertIdle` 第二句：回合忙 / goal 在跑 → `'Wait for the current turn to stop.'`
+    - 也就是说：**两个都想驱动同一台回合执行器，于是互斥只能靠外部断言维持，而且要在每个入口都写一遍。** 实现它 = 多维护这一整套互斥不变式，并会把 M9-6 那条**「一拍 = 一次授权」**（`_run_goal_burst` 结尾必 `_pause_goal`）变复杂。
+  - 一句话口径：**定时器人人写得出来，贵的是那一整套互斥不变式。**
 - **⑧ context collapse**：**测过同类机制收益不达预期，所以不做**。分级截断与本项同为「改动 `_PREFIX_LEN` 之后窗口」的机制，实测（P7-d）：单次省 5,128 token ↔ 多付 **45,304 miss token（8.8 倍）**，代价形状是后缀失效。这与我们**唯一的缓存亮点**直接冲突 —— 拿一个反例数据说明「不做」，比照着原版补上更值得讲
 
 ---
 
 ## 进度快照
 
-- 当前里程碑：**M9 进行中**（第一批 M9-1、M9-2 已完成并真跑验证；第二批 M9-3 fork + rename、M9-4 MCP 远程 HTTP + resources/prompts 已完成并真跑验证；第三批 M9-5 常驻交互模式 REPL、**M9-6 ④ Goal 已完成并真跑验证（五条动线全部有真实日志）**；只剩压轴的 M9-7 ② sub-agent 并发 3 + wait/close）
+- 当前里程碑：**M9 完成**（第一批 M9-1、M9-2；第二批 M9-3 fork + rename、M9-4 MCP 远程 HTTP + resources/prompts；第三批 M9-5 常驻交互模式 REPL、M9-6 ④ Goal；**压轴 M9-7 ② sub-agent 并发 —— 2026-09-11 完成，变异 29/29、四条动线真跑、623 测试全绿**）。**12 项核心能力清单全部落地。** 只剩 **M9-8 工作区 rewind 快照**（2026-09-11 立条目，尚未开工）
 - 上一里程碑：**M8 完成**（P1–P7 全部完成；四项真实验证已跑，见上节）
 - 上一里程碑：**M7 完成**（M7-1~M7-6 + Part C 全部完成；四条真实 LLM 端到端验证 V1–V4 已全跑，工作区 `m7verify/`、`m7verify-nolock/` 已 gitignore）
-- 代码状态：**10,113 行源码 / 28 模块 / 597 测试全绿**（`python -m pytest tests/ -o addopts="" -q` → `597 passed`）
-  - 口径：源码 = `agent/` + `app/` + `eval/` 下的非空 `.py`（不含 `eval/repos/` 克隆仓），模块数 = 其中非空的 `.py` 文件数。**按文件系统数，不按 git 跟踪数** —— 新文件在提交前也该算进去（M9-5 时 `app/repl.py`(503) 与 `tests/test_repl.py`(785) 尚未提交，按 git 数会各少一份，这正是上一条从 8,310 跳到 9,139 里的一部分；M9-6 的 `agent/goal.py`(232) / `agent/tools/goal.py`(118) / `tests/test_goal.py`(927) 同理，目前也尚未提交）。
+- 代码状态：**11,207 行源码 / 29 模块 / 623 测试全绿**（`python -m pytest tests/ -o addopts="" -q` → `623 passed in 90.86s`，无 skip）
+  - 口径：源码 = `agent/` + `app/` + `eval/` 下的非空 `.py`（不含 `eval/repos/` 克隆仓），模块数 = 其中非空的 `.py` 文件数。**按文件系统数，不按 git 跟踪数** —— 新文件在提交前也该算进去（M9-5 时 `app/repl.py`(503) 与 `tests/test_repl.py`(785) 尚未提交，按 git 数会各少一份，这正是上一条从 8,310 跳到 9,139 里的一部分；M9-6 的 `agent/goal.py`(232) / `agent/tools/goal.py`(118) / `tests/test_goal.py`(927)、M9-7 的 `agent/subagents.py`(540) / `tests/fake_llm.py` 同理，目前也尚未提交）。
+  - `tests/` 合计 **11,809 行**（上一版 11,760；M9-7 的 `test_subagent.py` 6 例 → 32 例）。
 - **M8 期间发现并修复的真 bug（真跑挖出来的，不是单测挖的）**：
   1. **`update_plan` 的引导缺失（elicitation gap）**：工具实现了、测试全绿、计划也能落盘 —— 但 system prompt 里**一个字都没提它**，模型 6 步跑完一次都没调。修法：prompt 里写明"任务复杂时先调 `update_plan` 排一份 3~6 步的简短计划"。修前 0 次 / 修后 2 次（同 P7-c 表）
   2. **`--resume` 静默丢掉 `checkpoint_every`**：`from_checkpoint` 的默认值是 5，而 `--resume` 这条路径没转发 → `--resume --checkpoint-every 1` 静默回落成"每 5 步一次"。后果不是报错，而是**恢复出来的这一段一步都不落盘**（kill 在 step 5，续跑到 step 9，检查点数还是 5）。修好后同一段跑出 `[1..10]`

@@ -23,8 +23,9 @@ flowchart TB
     end
 
     subgraph CORE["核心层 agent/"]
-        LOOP["loop.py · QueryEngine<br/>+ _verify_goal（M9-6）"]
+        LOOP["loop.py · QueryEngine<br/>+ _verify_goal（M9-6）<br/>+ abort 检查点 ×2 / _settle_workers（M9-7）"]
         GOALN["goal.py<br/>目标状态机 + 三态判定"]
+        SUBS["subagents.py<br/>并发子代理管理器（M9-7）"]
         LLM["llm.py"]
         STATE["state.py"]
         CTX["context.py"]
@@ -44,7 +45,7 @@ flowchart TB
         BASH["bash.py"]
         FILES["files.py"]
         WEB["web.py<br/>联网 + SSRF 拦截"]
-        SUB["subagent.py"]
+        SUB["subagent.py<br/>5 个工具（M9-7）<br/>唯一构造点 build_subagent_tools"]
         GTOOL["goal.py<br/>declare_goal_done（M9-6）"]
     end
 
@@ -111,7 +112,7 @@ sequenceDiagram
     Q-->>U: RunResult(max_steps)
 ```
 
-终止判定有七条出口，都会写进 `RunResult.terminated_reason`（轨迹和报告里可审计）。合法取值的**唯一清单**是 `agent/loop.py` 的 `TERMINATED_REASONS`（原先只有一行注释、没有集合 —— 加 M9-6 两个新值时补上，因为「一共有哪些值」这件事本身是真缺口）：
+终止判定有八条出口，都会写进 `RunResult.terminated_reason`（轨迹和报告里可审计）。合法取值的**唯一清单**是 `agent/loop.py` 的 `TERMINATED_REASONS`（原先只有一行注释、没有集合 —— 加 M9-6 两个新值时补上，因为「一共有哪些值」这件事本身是真缺口）：
 
 | terminated_reason | 触发条件 | 语义 |
 |---|---|---|
@@ -122,6 +123,15 @@ sequenceDiagram
 | `await_user` | 模型调了 `ask_user`（`ToolResult.await_user=True`） | **半程暂停**，不是结论：等人补充信息后 `--resume "回答"` 续跑 |
 | `goal_done` | **M9-6**：模型声明完成 + 人给的检查命令**退出码 0** | 目标达成，回合结束（把判分权拿走的代价见 README 末节） |
 | `goal_check_invalid` | **M9-6**：检查命令**压根没跑成**（门禁拦下 / 超时 / 工具异常） | 判定无效，**既不算完成也不算未通过**；回合结束（模型改不了判据，留着它只会重复空转） |
+| `aborted` | **M9-7**：`abort` token 已 set（在 `llm.chat` 之前、或串行批里的工具调用之前） | **worker 专有**：子代理被 `close_agent` 叫停。见下面的如实标注 |
+
+> **`aborted` 是 worker 专有的（如实标注）**：它由 `AgentWorkers.spawn` 建的那一次性引擎产生。
+> **父引擎拿不到它** —— 父会话唯一的取消是 `Ctrl+C`，那是 `BaseException`，在 `llm.chat` 里就
+> 抛穿了 `except Exception`，走不到任何返回点。所以 `app/repl.py` 的 `BURST_STOP_REASONS` /
+> `_STOP_REASONS` 里那两个 `"aborted"` 是「**方程要求它存在、但结构上不可达**」：`tests/test_goal.py`
+> 的 `set(BURST_STOP_REASONS) | {"completed"} == TERMINATED_REASONS` 逐字逼着加 —— 那两条方程
+> 本身正在做它们该做的事（防"新终止原因漏进 REPL 的判定"）。**也正因如此，`app/cli.py` 的
+> `_extract_learned` 不加 `aborted` 守卫** —— 那是永远执行不到的分支，加了就是本项目的头号缺陷类。
 
 > **`goal_check_invalid` 为什么不复用 `await_user`**：那个值连带两件事，两件都不对 —— `_extract_learned`
 > 会跳过约定提炼（而这里的轨迹是完整的），REPL 会打印「需要你补充信息」（而这里没有人被提问）。
@@ -167,7 +177,7 @@ flowchart LR
 `BaseLLM` 两个实现，**接口完全一致**，所以循环、子代理、评估层共用一套代码：
 
 - `DeepSeekClient`：走 openai SDK（DeepSeek 兼容 OpenAI 协议），`chat()` 返回 `LLMResult(content, tool_calls, usage)`，`complete()` 给 compact 摘要用。
-- `MockLLM`：`script(*responses)` 脚本化响应序列 / `text("...")` 固定响应 / `tool_then_text(...)`。**测试与无 key 演示都靠它**——597 个测试全部离线，不打网络。
+- `MockLLM`：`script(*responses)` 脚本化响应序列 / `text("...")` 固定响应 / `tool_then_text(...)`。**测试与无 key 演示都靠它**——623 个测试全部离线，不打网络。
 
 `Usage` 里单独保留 `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`——这是 DeepSeek 磁盘缓存的**实测**字段，整个缓存命中率指标和成本估算都建立在它之上（不是估算出来的）。
 
@@ -432,6 +442,78 @@ REPL 让「一个进程 = 很多回合」成立；**目标**让「下一个回�
 没注册工具 + 没目标，完全 no-op。同一步里既有声明又有 `ask_user` → **检查先跑**（`goal_done` 赢）：
 运行时的**事实**优先于模型的**陈述**，两个结论都进轨迹。
 
+### 3.9 并发子代理（`agent/subagents.py` + `agent/tools/subagent.py`，M9-7）
+
+**形状**：`spawn` **立刻返回句柄**（`sa-1`），工作在后台的 daemon 线程上跑；模型可以一次派三个，
+再用**一次** `wait_agent` 把三份结论一起收回来。这一项回答的是「多智能体编排」——
+把 (X+Y)×N 的深度探索外包出去，只把结论 Z tokens 带回主上下文。
+
+**两条真正新增的通路**（不是"改个返回类型"）：
+
+1. **取消**。全仓原先没有任何 abort/cancel token：唯一的取消是 `KeyboardInterrupt`
+   （`BaseException`，从 `llm.chat` 里直接抛穿 `except Exception`）。现在
+   `QueryEngine.__init__(..., abort=AbortToken)`，**两个检查点，没有第三个**：
+
+   | # | 位置 | 覆盖 |
+   |---|---|---|
+   | 1 | `_run_loop` 的 `while` 体首句（`_prepare_messages` 与 `llm.chat` **之前**） | 唯一一次可能阻塞 120s 的操作前的最后一刻 |
+   | 2 | `_execute_tool_calls` 的 `invoke()` 顶部 | 串行批逐调用；并发批的粒度是**整批**（`executor.map` 一次性提交，检查对每个都是 False）—— **如实记，不声称批内逐调用粒度** |
+
+   > **必须被测试钉住的不变式**：token **只由 `AgentWorkers.spawn` 创建、只装在每个 worker 那
+   > 一次性引擎上**。常驻 REPL 的引擎是**跨回合复用**的（`app/repl.py` 设一次、每回合
+   > `run_turn`），给它装 token 会让**后续每一个回合**在第一个检查点就返回 `aborted` ——
+   > 用户看到的是"我说话它不理"，且完全无法解释。
+
+   串行路径命中 abort → **必须补配对**：`assistant_tool_calls(calls)` 在批末才 append、覆盖
+   **全部** `calls`，少一条 `tool` 消息就是孤儿 id，直接 400，而报错点在**下一轮**（复用既有的
+   skipped 模式逐条补 `ToolResult.fail`）。
+
+2. **回合边界结算**（原版叫 `settleWorkers`）。不做的话 worker 会**活过它的回合、结论无处可去**
+   —— 正是本项目的头号缺陷类（静默丢失 / wiring drift）。
+
+```python
+workers = AgentWorkers(on_usage=...)   # 每回合新建一个：生命周期 = 一次 _run_loop
+ctx = ToolContext(..., state=state, emitter=state.emitter, workers=workers)
+try:
+    while ...:                         # 现有循环，6 个返回点原样不动
+        ...
+except Exception as exc:
+    ...
+finally:
+    self._settle_workers(workers, state)   # ← 一个 finally 覆盖 6 个返回点 + KeyboardInterrupt
+```
+
+**`settle()` 的四条契约**（每条一个测试）：
+
+1. **没 spawn 过就是免费的** —— 不建线程、不加锁、不记事件、不写盘（否则每个普通回合都多一条
+   事件噪音）。真正的行为守卫是 `if report.any`，不是那句提前 return —— **后者只是省成本，
+   删掉行为完全一样**（变异测试里如实记为"证明后不设的候选"）。
+2. **join 有界**（`SETTLE_TIMEOUT = 1.5s`），与 `close()` 的「等到真停」**刻意不同**：回合边界
+   不该阻塞在网络调用上；而且它可能正跑在 `KeyboardInterrupt` 的传播路径上 —— 用户按第二下
+   Ctrl+C 会在 `finally` 里再抛，**于是一个 worker 都没被 join**。报告如实说还差几个没停。
+3. **异常免疫，但失败要可见**：外层 `try/except Exception`；内层记事件时再包一层
+   （`record_event` → `Session.emit` 是文件 IO，自己会抛）。**一个会抛的 `finally` 会顶掉正在
+   返回的 `RunResult`，也会顶掉正在传播的 `KeyboardInterrupt`。**
+4. **不静默，且区分情形**：记 `subagent_settled`，文案分开写「跑到一半被杀，**没有结论**」与
+   「跑完了但结论**从没被取走**」—— 后者是常见情形，把截断的 `final_text` 放进事件让轨迹可追。
+   **不自动把结论塞回 `messages`**（模型没要过的内容、塞在它已给出终局答复之后）。
+
+**三元口径互斥**（`killed` / `unclaimed` / `still_running`）：跑着被杀（无结论）/ 跑完没人取
+（有结论但丢了）/ 没停下来（用量不计入本回合）。三者必须互斥，否则事件会自相矛盾
+（同一个 id 既"没有结论"又给出"结论尾部"）。这条是被首跑的单测**逼出来的**：`unclaimed`
+原先没排除被叫停的 worker。
+
+**与 TS 契约的两处刻意偏离**（写在注释里，不假装实现了）：
+
+- **父→子没有级联 abort 的独立通路**。原版是父 signal abort → 级联 cancel；我们靠 `settle()`
+  在回合边界实现（只是延迟到回合边界）。
+- **`closeAll()` 并入 `settle()`** —— 同一个操作，两种报告口径就是「两处各写一遍 → 漂移」。
+
+**为什么 worker 是 daemon 线程而不是 `ThreadPoolExecutor`**：后者的线程**非 daemon**，
+`concurrent.futures.thread` 装了 `atexit` join 钩子，一个卡在 120s `llm.chat` 里的 worker 会让
+**解释器退出被拖住最多两分钟**（症状是"为什么 CLI 退不出去"）。worker 的输出只经句柄交付，
+所以拆掉它是结构上安全的。
+
 ## 4. 治理层
 
 | 模块 | 机制 | 对应的 Claude Code 设计 |
@@ -519,7 +601,7 @@ class Tool:
 | `edit` | **唯一匹配**语义（匹配到 0 处或 >1 处都失败并回喂原因）+ 返回 diff；失败信息足够模型自己修正。**改动落盘前**先经 `preview` 把 diff 交给人（M9-1，见下） |
 | `glob` / `grep` | 结果截断 + 明确提示「还有更多」（照搬 CC 的 `TRUNCATED_MESSAGE`——**截断必须可感知**，否则模型以为看全了） |
 | `web_fetch` / `web_search` | 联网取网页与搜索（M9-2，见下）；**先解析域名再判结果 IP**，每一跳重定向重查；`Accept-Encoding: identity` + 真解压（服务端可能不听） |
-| `subagent` | research 子代理（下节） |
+| `subagent` / `spawn_agent` / `list_agents` / `wait_agent` / `close_agent` | 研究子代理的**五个工具族**（M4-2 建、M9-7 扩，见 §3.9）：阻塞入口 + 句柄式并发。**五个全部 `is_read_only() = False`** —— 理由**不是"子代理危险"而是调度**：只读工具走并发池，而 `executor.map` 保证的是**输出顺序**不是**开始顺序**，一批 `[spawn(A), spawn(B), wait([A,B])]` 里 `wait_agent` 可能在两个 spawn 注册 id **之前**就跑起来。五个**不进 `default()`** —— eval 用的正是 `default()`，而子代理会把 README 的 token/成本/缓存数字**悄悄变得不可比** |
 | `ask_user` | **半程暂停**：返回 `ToolResult(await_user=True)` 就结束本回合，问题交给用户。**不进 `default()`**——headless 评测里没人在，模型一提问 eval 就提前终止 |
 | `update_plan` | agent 自己的任务计划，写 `state.plan` 随检查点落盘；**每次传完整清单**；**不注入每轮消息**（那会破坏前缀缓存） |
 | `declare_goal_done` | **M9-6**：模型**声明**当前目标完成（写 `state.goal.declaration`），**不是判定** —— 运行时随即跑**人预先给定的**检查命令，退出码说了算（见 §3.8）。参数扁平（内联 `array`，**不能**用嵌套模型：`base.py` 的 `raw.pop("$defs")` 会把 `$defs` **静默**削掉，模型收到的参数说明就是错的）。`is_read_only() = False`（它改变的是**控制流**）。**不进 `default()`**——eval 用的正是 `default()`，而 headless 里没人能创建目标 → 模型只会看到一个永远失败的诱饵 |

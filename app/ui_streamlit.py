@@ -34,7 +34,7 @@ from agent.skills import discover_skills
 from agent.tools.ask import build_ask_tool
 from agent.tools.base import ToolRegistry
 from agent.tools.skills import build_skill_tools
-from agent.tools.subagent import SubagentTool
+from agent.tools.subagent import build_subagent_tools
 from app.replay import (
     list_checkpoint_sessions,
     list_checkpoint_steps,
@@ -105,9 +105,10 @@ def run_task(
     try:
         llm = build_llm(mock)
         registry = ToolRegistry.default(workspace)
-        registry.register(SubagentTool(llm, workspace))  # M4-2 research 子代理
+        for subagent_tool in build_subagent_tools(llm, workspace):
+            registry.register(subagent_tool)  # M4-2 / M9-7 子代理工具族
         # ask_user：与 CLI 共用同一处构造（见 build_ask_tool 的 docstring）。
-        # 同 SubagentTool 一样**不进 default()** —— eval/runner 用 default()，
+        # 同子代理工具族一样**不进 default()** —— eval/runner 用 default()，
         # 而 headless 评测里没有人能回答。
         registry.register(build_ask_tool())
         # skills：与 CLI 共用同一套发现与构造（索引进提示词，正文按需 load_skill）

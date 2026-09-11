@@ -38,11 +38,12 @@ from agent.state import (
     tool_result,
     user,
 )
+from agent.subagents import AbortToken, AgentWorkers
 from agent.tool_result import ToolResultStore, compact_batch
 from agent.tools.base import Tool, ToolContext, ToolRegistry, ToolResult
 
 
-#: 目标（M9-6）相关的终止原因。
+#: 目标（M9-6）与取消（M9-7）相关的终止原因。
 #:
 #: 前缀 `REASON_` 是**刻意**的：`agent/goal.py` 里 `GOAL_DONE` 是**状态**（"done"），
 #: 这里是**终止原因**（"goal_done"），两个词都在本模块被 import —— 同名会让
@@ -52,16 +53,39 @@ from agent.tools.base import Tool, ToolContext, ToolRegistry, ToolResult
 REASON_GOAL_DONE = "goal_done"
 REASON_GOAL_CHECK_INVALID = "goal_check_invalid"
 
+#: 子代理被取消（M9-7）。**它是 worker 专有的，父引擎结构上拿不到。**
+#:
+#: 父引擎的取消路径是 Ctrl+C —— 那是 `BaseException`，在 `llm.chat` 里就抛出去
+#: 了，走不到 `_run_loop` 的任何返回点（父会话被中断的终止原因是 `"interrupted"`，
+#: 由 `app/repl.py` 的 `run_turn` 在 `except KeyboardInterrupt` 里给，不是这里）。
+#: 只有 worker 引擎装了 `abort` token，所以只有它会返回这个值。
+#:
+#: 那为什么还要让 `app/repl.py` 的 `BURST_STOP_REASONS` / `_STOP_REASONS` 覆盖它？
+#: 因为 `tests/test_goal.py` 有两道方程逼着那个集合等于本集合 —— **那是它们该做
+#: 的事**（"新增终止原因却忘了让自动推进停下来"必须变红）。所以那两条在 REPL 里
+#: 是"方程要求它存在、但结构上不可达"的条目，如实记着，而不是假装它会在那儿发生。
+REASON_ABORTED = "aborted"
+
 #: 一轮 `_run_loop` 可能给出的**全部**终止原因。
 #:
-#: 存在的理由是一个真实的缺口：原先这七个值只散落在各个返回点上，没有任何
+#: 存在的理由是一个真实的缺口：原先这些值只散落在各个返回点上，没有任何
 #: 地方列举它们。于是"新增一个终止原因、但忘了让 REPL 的自动推进在它上面停
 #: 下来"不会有任何东西变红 —— 表现只是 burst 白烧预算（`tests/test_goal.py`
 #: 有一条测试用 `BURST_STOP_REASONS` 钉住这个集合，那是它的第二个读者）。
 TERMINATED_REASONS = frozenset({
     "completed", "max_steps", "loop_detected", "error", "await_user",
-    REASON_GOAL_DONE, REASON_GOAL_CHECK_INVALID,
+    REASON_GOAL_DONE, REASON_GOAL_CHECK_INVALID, REASON_ABORTED,
 })
+
+#: 被取消时回填给模型的工具结果文本。**必须占位、不能省**：`assistant_tool_calls`
+#: 在批末一次性 append 覆盖**全部** `calls`，少一条对应的 `tool` 消息就是孤儿 id，
+#: 端点直接 400 —— 而报错发生在**下一次请求**时，看起来与这次取消毫无关系
+#: （同 `state.PAIRING_FILLER` / `loop` 里 ask_user 跳过时的回填，同一个理由）。
+#: 文案与 `PAIRING_FILLER` 一样要说实话：这次调用**没有执行**。
+ABORTED_TOOL_OUTPUT = (
+    "[已取消] 这条工具调用没有执行 —— 子代理被要求停止，"
+    "在它之前就结束了本回合。如需它的结果，请重新派发。"
+)
 
 
 @dataclass
@@ -164,6 +188,7 @@ class QueryEngine:
         context: object | None = None,             # M3 接 ContextManager
         session: object | None = None,             # M3 接 session（轨迹/检查点）
         on_event: Callable[[dict], None] | None = None,  # 实时事件回调（CLI 流式输出）
+        abort: AbortToken | None = None,           # M9-7 取消标志（**仅 worker**）
     ) -> None:
         self.llm = llm
         self.registry = registry
@@ -182,6 +207,18 @@ class QueryEngine:
         self.context = context
         self.session = session
         self.on_event = on_event
+        # ★ M9-7 取消标志。**只有 `AgentWorkers.spawn` 会传它，只有 worker 引擎
+        # 会拿到它。** 这不是建议、是硬约束：常驻 REPL 的引擎是**跨回合复用**的
+        # （`app/repl.py` 的 `_activate` 设一次、每个回合 `run_turn`），给它装一个
+        # token 意味着某一回合把它 set 了之后，**后续每一个回合**都会在第一个检查点
+        # 就返回 `aborted` —— 用户看到的是"我说话它不理"，而且没有任何东西能解释
+        # 这件事。`tests/test_subagent.py` 有一条测试专门钉住"不带 token 的常驻
+        # 引擎不受影响"。
+        #
+        # 它的语义是**协作式取消**，不是抢占：只在两个检查点上生效（见 `_run_loop`
+        # 与 `_execute_tool_calls`），所以一个正卡在 `llm.chat`（客户端超时 120s）
+        # 或 `bash` 里的 worker 最长还要跑完那一次调用才会停。
+        self.abort = abort
         self.system_prompt = system_prompt or DEFAULT_SYSTEM_PROMPT
 
     def run(self, task: str, *, cwd: Path | None = None) -> RunResult:
@@ -304,6 +341,21 @@ class QueryEngine:
                 state, self.skills, render_skills_block(self.skills)
             )
 
+        # M9-7：本回合的子代理管理器。**每回合新建一个**（生命周期 = 一次
+        # `_run_loop`），所以 worker 活不过派发它的那一个回合 —— 这是刻意的，
+        # 也是下面 `finally` 能放心结算它的前提。
+        #
+        # `on_usage` 是**唯一**把 worker 用量并进父会话的通路，且它只在父线程被
+        # 调用（`AgentWorkers` 的契约）：`Usage.__iadd__` 不是原子的，在 worker
+        # 线程里合并会与下一行的 `state.usage += result.usage` 赛跑。
+        #
+        # ⚠️ **这让父会话的缓存命中率被稀释**（worker 的 prompt 大多缓存未命中），
+        # README 的缓存数字只在"没用过子代理的会话"上可比 —— 如实记着。
+        def _count_subagent_usage(usage: Usage) -> None:
+            state.usage += usage
+
+        workers = AgentWorkers(on_usage=_count_subagent_usage)
+
         ctx = ToolContext(
             workspace_root=self.workspace_root,
             cwd=cwd,
@@ -314,12 +366,21 @@ class QueryEngine:
             # 写 plan 的通道，`emitter` 与 `state.emitter` 是同一个回调。
             state=state,
             emitter=state.emitter,
+            workers=workers,
         )
         signatures_window: deque[list[str]] = deque(maxlen=self.loop_detection_window)
         empty_retry_count = 0
 
         try:
             while state.step - budget_start < self.max_steps:
+                # ★ M9-7 取消检查点 #1（两个之一）。位置是**唯一正确的那一处**：
+                # 不能写进 `while` 条件 —— 条件在上一行求值，而 `_prepare_messages`
+                # 已经先跑完了一整轮上下文整理（compact / 截断）的活。
+                #
+                # 也不能更晚：再往下就是 `llm.chat` —— 全循环唯一一次可能阻塞
+                # 120 秒（客户端超时）的操作。
+                if self.abort is not None and self.abort.is_set():
+                    return self._aborted_result(state, task)
                 messages = self._prepare_messages(state)
                 result = self.llm.chat(messages, self.registry.schemas())
                 state.usage += result.usage
@@ -414,6 +475,15 @@ class QueryEngine:
                 terminated_reason="error",
                 task=task,
             )
+        finally:
+            # ★ M9-7 回合边界结算。**一个 `finally` 覆盖上面 6 个返回点 +
+            # `KeyboardInterrupt`** —— 逐个返回点去结算，漏掉一个就是"worker
+            # 活过它的回合、结论无处可去"，而那正是本项目的头号缺陷类。
+            #
+            # 这也是它必须写在 `finally` 而不是某个返回点上的原因：`except
+            # Exception` **抓不到 `KeyboardInterrupt`**（`BaseException`），
+            # 而 Ctrl+C 恰恰是最需要结算的那一刻。
+            self._settle_workers(workers, state)
 
         state.terminated_reason = "max_steps"
         return RunResult(
@@ -521,6 +591,25 @@ class QueryEngine:
 
         def invoke(call: ToolCall) -> tuple[str, str, bool]:
             """返回 (tool_call_id, output, await_user)。单条调用无论成败都封包成文本回喂模型。"""
+            # ★ M9-7 取消检查点 #2。放在这里而不是调用点，是因为**串行与并发
+            # 两条路都经过它**，且不用给任何签名加参数。
+            #
+            # 粒度要如实说：串行路是**逐调用**生效的（一个 5 步的写工具批在
+            # 中途被取消，后面的不再跑）；**并发路是整批** —— `executor.map`
+            # 一次性提交全部任务，等它返回时每一个 `invoke` 都已经跑过了，
+            # 这个检查对整批来说恒为 False。不声称批内逐调用粒度。
+            if self.abort is not None and self.abort.is_set():
+                state.record_event(
+                    "tool_call",
+                    name=call.name,
+                    arguments=call.arguments,
+                    success=False,
+                    duration_ms=0,
+                    exit_code=None,
+                    await_user=False,
+                    aborted=True,   # 与"真跑了但失败"、与 skipped 都分开
+                )
+                return call.id, ABORTED_TOOL_OUTPUT, False
             result = self._gate_and_run(call, state, ctx)
             state.record_event(
                 "tool_call",
@@ -587,6 +676,50 @@ class QueryEngine:
         for tool_call_id, output in pairs:
             state.messages.append(tool_result(tool_call_id, output))
         return pending
+
+    def _aborted_result(self, state: AgentState, task: str) -> RunResult:
+        """子代理被取消（M9-7）：如实收尾，**不假装完成、也不假装出错**。
+
+        与 `"error"` 分开是刻意的：取消是**人（或父回合边界）要求的**，不是
+        出了故障；把它混进 `"error"` 会让父模型以为子代理崩了并据此换个策略，
+        而正确的动作是"要么重新派、要么别派了"。
+        """
+        state.terminated_reason = REASON_ABORTED
+        state.record_event("aborted", step=state.step)
+        return RunResult(
+            final_text=(
+                f"子代理已被取消（在第 {state.step} 步停下），没有结论。"
+            ),
+            steps=state.step,
+            usage=state.usage,
+            events=state.events,
+            terminated_reason=REASON_ABORTED,
+            task=task,
+        )
+
+    def _settle_workers(self, workers: AgentWorkers, state: AgentState) -> None:
+        """回合边界结算（M9-7）。**整个方法异常免疫，绝不向外抛。**
+
+        它在 `_run_loop` 的 `finally` 里被调用，而那个位置正压着两样东西：
+        一个是即将返回的 `RunResult`，另一个可能是正在传播的 `KeyboardInterrupt`。
+        **一个会抛的 `finally` 会把前者换成异常、把后者换成别的异常** —— 用户
+        按的 Ctrl+C 变成一个看不懂的 traceback，而子代理的结论照样丢了。
+        两样都比"结算失败"更糟，所以这里兜住。
+
+        但**兜住不等于静默**：失败也尽力记一条事件。只有连事件通道本身（
+        `Session.emit` 是文件 IO）都坏了才会真的沉默 —— 那时也没有别的通路了。
+        """
+        try:
+            report = workers.settle()
+            if report.any:
+                state.record_event("subagent_settled", **report.as_event())
+        except Exception as exc:
+            try:
+                state.record_event(
+                    "subagent_settle_failed", error=f"{type(exc).__name__}: {exc}"
+                )
+            except Exception:
+                pass
 
     def _awaiting_user(self, state: AgentState, task: str, question: str) -> RunResult:
         """收尾本轮并交还控制权给用户（`ask_user` 的回合语义）。
