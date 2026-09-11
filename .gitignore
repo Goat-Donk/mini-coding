@@ -52,3 +52,8 @@ m7verify-nolock/
 # 与 m7verify/ 同理不进仓库（真实对话轨迹 + 为制造 token 压力放的样本数据）。
 # 数字与结论记录在 TASKS.md 的 P7 小节，工作区本地留档。
 m8verify/
+
+# --- M9 向 TS 原版对齐的真实验证工作区 ---
+# m9verify/：--review-edits 的真实 CLI 轨迹、检查点，以及 M9-1 的变异测试脚本
+# （牙齿检查：逐个打断机制，确认对应测试变红）。与 m7verify/ 同理不进仓库。
+m9verify/

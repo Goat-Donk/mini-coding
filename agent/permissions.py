@@ -110,6 +110,17 @@ def _irreversible_kind(tool_name: str, arguments: dict) -> str | None:
     纯函数（不读引擎状态），所以 `check()` 与 `denial_hint()` 可以各自独立
     算一遍而不担心并发下互相串味。
     """
+    # web 工具**本身就是网络外发**，不看内容：判据是「这个工具做什么」，
+    # 而不是「这次参数里有什么」—— `web_fetch` 无论抓哪个 URL 都会把请求发出去。
+    #
+    # 位置在取 `raw` **之前**是有原因的：下面只取 command/path/pattern 三个键，
+    # 而 web 工具的参数是 url/query，取不到 → `if not raw` 直接 return None。
+    # 放在后面写等于这两支永远不生效 —— 那正好就是 M9-2 之前的原状：
+    # 天花板的三类动作里，「网络外发」这一类只能靠 bash 命令行里的 curl|wget 命中，
+    # 而 `ToolRegistry.default()` 里一个联网工具都没有。
+    if tool_name in ("web_fetch", "web_search"):
+        return "网络外发"
+
     raw = str(
         arguments.get("command")
         or arguments.get("path")
@@ -220,11 +231,32 @@ class PermissionsEngine:
 
     # ---------- 主入口 ----------
 
-    def check(self, tool_name: str, arguments: dict, ctx: ToolContext) -> Decision:
-        """判定一次工具调用：allow / deny / ask（ask 且有 confirm 时直接内联确认）。"""
-        return self._decide(tool_name, arguments, ctx)
+    def check(
+        self,
+        tool_name: str,
+        arguments: dict,
+        ctx: ToolContext,
+        *,
+        details: str | None = None,
+    ) -> Decision:
+        """判定一次工具调用：allow / deny / ask（ask 且有 confirm 时直接内联确认）。
 
-    def _decide(self, tool_name: str, arguments: dict, ctx: ToolContext) -> Decision:
+        `details`：这次调用**将要做什么**的可读预览（M9-1，如 edit/write 的 diff），
+        由调用方从 `tool.preview()` 取。它**不参与判定**，只被带进确认文案给人看。
+
+        刻意不做成"引擎自己去算"：那会让权限引擎持有第二套"这次编辑是否合法"的
+        判断，与工具的"唯一匹配"语义成为两个真相源。理由详见 `Tool.preview`。
+        """
+        return self._decide(tool_name, arguments, ctx, details=details)
+
+    def _decide(
+        self,
+        tool_name: str,
+        arguments: dict,
+        ctx: ToolContext,
+        *,
+        details: str | None = None,
+    ) -> Decision:
         """决策链本体：硬 deny → 记忆 → 规则 → **后置天花板** → 人工确认。
 
         天花板摆在哪里是这里最要紧的一件事，两个方向都不能错：
@@ -258,20 +290,41 @@ class PermissionsEngine:
 
         # 6) ask → 回调确认（人的决定在最后）
         if decision is Decision.ASK and self.confirm is not None:
-            return self._confirm_and_record(tool_name, arguments, kind, target)
+            return self._confirm_and_record(
+                tool_name, arguments, kind, target, details=details
+            )
         return decision
 
-    def ask(self, tool_name: str, arguments: dict, ctx: ToolContext) -> Decision:
+    def ask(
+        self,
+        tool_name: str,
+        arguments: dict,
+        ctx: ToolContext,
+        *,
+        details: str | None = None,
+    ) -> Decision:
         """强制人工确认（CLI/控制台在 ASK 且无 confirm 回调时调用）。"""
         kind, target = self._classify(tool_name, arguments)
-        return self._confirm_and_record(tool_name, arguments, kind, target)
+        return self._confirm_and_record(
+            tool_name, arguments, kind, target, details=details
+        )
 
-    def describe(self, tool_name: str, arguments: dict) -> str:
+    def describe(
+        self,
+        tool_name: str,
+        arguments: dict,
+        *,
+        details: str | None = None,
+    ) -> str:
         """构造确认问题文本（供 confirm 回调/UI 展示）。
 
         污染天花板触发的确认会**额外写明原因**。这很重要：控制台里用户看到的
         是一个弹窗，如果它和普通弹窗长得一样，用户只会觉得"怎么又问一遍"，
         然后条件反射地点允许 —— 一个不说理由的确认框，训练出的是不看理由的人。
+
+        `details`（M9-1）是"要改什么"，紧跟在问句之后；天花板说明是"为什么
+        又问一遍"，排在最后 —— 顺序是「问什么 → 改什么 → 为什么问」，
+        把最该被看见的内容放在最不容易被折叠的位置。
         """
         kind, target = self._classify(tool_name, arguments)
         if kind == "command":
@@ -289,6 +342,8 @@ class PermissionsEngine:
             f"是否允许 {what}？"
             "(allow_once/allow_turn/allow_always/deny_once/deny_always)"
         )
+        if details:
+            question += f"\n\n{details}"
         if self._taint == TAINT_HIGH:
             label = _irreversible_kind(tool_name, arguments)
             if label is not None:
@@ -457,9 +512,19 @@ class PermissionsEngine:
         return False
 
     def _confirm_and_record(
-        self, tool_name: str, arguments: dict, kind: str, target: str
+        self,
+        tool_name: str,
+        arguments: dict,
+        kind: str,
+        target: str,
+        *,
+        details: str | None = None,
     ) -> Decision:
-        choice = self.confirm(self.describe(tool_name, arguments)) if self.confirm else None
+        choice = (
+            self.confirm(self.describe(tool_name, arguments, details=details))
+            if self.confirm
+            else None
+        )
         decision, memory = self._apply_choice(choice)
         if memory == "turn":
             self._turn[target] = decision

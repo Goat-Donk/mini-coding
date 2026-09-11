@@ -8,6 +8,7 @@ from agent.loop import DEFAULT_SYSTEM_PROMPT, QueryEngine
 from agent.session import Session
 from agent.tools.ask import build_ask_tool
 from agent.tools.base import ToolRegistry
+from pydantic import BaseModel
 
 
 def make_engine(tmp_path: Path, llm: MockLLM, **kwargs) -> QueryEngine:
@@ -461,10 +462,10 @@ def test_denied_ask_user_does_not_pause(tmp_path):
     from agent.permissions import Decision
 
     class DenyAll:
-        def check(self, name, arguments, ctx):  # noqa: ANN001 - 引擎接口
+        def check(self, name, arguments, ctx, *, details=None):  # noqa: ANN001 - 引擎接口
             return Decision.DENY
 
-        def describe(self, name, arguments):  # noqa: ANN001
+        def describe(self, name, arguments, *, details=None):  # noqa: ANN001
             return "全部拒绝（测试替身）"
 
     captured: list[str] = []
@@ -485,3 +486,143 @@ def test_denied_ask_user_does_not_pause(tmp_path):
 
     assert result.terminated_reason == "completed", "被拒的提问不该终止本轮"
     assert any("权限拒绝" in text for text in captured), captured
+
+
+# ---------- M9-1：改前 diff review —— 人看到的必须是"改之前" ----------
+
+def test_edit_diff_is_available_before_the_write(tmp_path):
+    """确认回调被调用的**那一刻**，磁盘上必须仍是原文。
+
+    这是 M9-1 的全部意义所在，也是它唯一会悄悄失效的地方：把预览挪到
+    `_gate_and_run` 里 check() 之后、或者挪进 execute() 里，功能照样"能跑"、
+    确认框照样显示 diff —— 只是那份 diff 已经是**事后**的了，人看着一份
+    改完的 diff 点"允许"。没有任何东西会报错，所以必须由这条测试钉住。
+
+    断在两个时刻之间：回调里读一次盘，执行完再读一次。
+    """
+    from agent.permissions import PermissionsEngine
+
+    path = tmp_path / "calc.py"
+    path.write_text("def add(a, b):\n    return a - b\n", encoding="utf-8")
+    seen: dict[str, object] = {}
+
+    def confirm(question: str) -> str:
+        seen["question"] = question
+        seen["content_at_confirm"] = path.read_text(encoding="utf-8")
+        return "allow_once"
+
+    engine = make_engine(
+        tmp_path,
+        MockLLM.script(
+            MockLLM.tool(
+                "edit",
+                {"path": "calc.py", "old_string": "a - b", "new_string": "a + b"},
+            ).responses[0],
+            LLMResult(content="改好了"),
+        ),
+        permissions=PermissionsEngine(
+            tmp_path, confirm=confirm, rules={"tools": {"edit": "ask"}}
+        ),
+    )
+    result = engine.run("修掉这个减法 bug")
+
+    assert result.terminated_reason == "completed"
+    # 1) 人拿到的确实是 diff
+    assert "-    return a - b" in seen["question"]
+    assert "+    return a + b" in seen["question"]
+    # 2) 而那一刻文件还是旧的 —— 没有这一条，整项功能等于没做
+    assert seen["content_at_confirm"] == "def add(a, b):\n    return a - b\n"
+    # 3) 人点允许之后才真的落盘
+    assert path.read_text(encoding="utf-8") == "def add(a, b):\n    return a + b\n"
+
+
+def test_preview_failure_does_not_break_the_turn(tmp_path):
+    """预览抛异常 → 记事件 + 忽略，本轮照常跑完。
+
+    （注意要装一个权限引擎：没有确认交互时预览**根本不会被计算**，
+    见下面那条测试。headless 评测就属于这种情形，这是有意省下的开销。）
+
+    `preview` 是**信息**不是**判定**，所以它和权限链的处理方式相反：权限链
+    算不出来必须大声失败（漏一次判定就是漏一次门禁），预览算不出来只该退回到
+    原来的确认框。实现方的 bug 不该变成用户的"任务做不下去"。
+    """
+    from agent.permissions import PermissionsEngine
+    from agent.tools.base import Tool, ToolContext, ToolResult
+
+    class BoomInput(BaseModel):
+        pass
+
+    class ExplodingPreview(Tool):
+        name = "boom"
+        description = "预览会炸的写工具（测试用）"
+        input_model = BoomInput
+
+        @classmethod
+        def is_read_only(cls) -> bool:
+            return False
+
+        def preview(self, arguments: dict, ctx: ToolContext) -> str | None:
+            raise RuntimeError("预览实现有 bug")
+
+        def execute(self, args, ctx: ToolContext) -> ToolResult:
+            return ToolResult.ok("照常执行了")
+
+    engine = make_engine(
+        tmp_path,
+        MockLLM.script(
+            MockLLM.tool("boom", {}).responses[0],
+            LLMResult(content="完成了"),
+        ),
+        permissions=PermissionsEngine(tmp_path),
+    )
+    engine.registry.register(ExplodingPreview())
+    result = engine.run("跑一个预览会炸的工具")
+
+    assert result.terminated_reason == "completed"
+    calls = [e for e in result.events if e["type"] == "tool_call"]
+    assert calls[0]["success"] is True, "预览失败不该影响执行"
+    failures = [e for e in result.events if e["type"] == "preview_failed"]
+    assert failures and "RuntimeError" in failures[0]["error"]
+
+
+def test_preview_is_not_computed_without_a_permissions_engine(tmp_path):
+    """没有权限引擎 = 没有任何确认交互 → 不该白算一份 diff。
+
+    headless（`eval/runner.py`）走的就是这条路：那里没人能看预览，算了纯属
+    浪费 —— 而 `edit` 的预览要把整个文件读进来做 diff，在评测里是实打实的
+    每步开销。所以 `_preview` 挂在权限块**内部**，这条测试钉住那个位置。
+    """
+    from agent.tools.base import Tool, ToolContext, ToolResult
+
+    class RecordingInput(BaseModel):
+        pass
+
+    calls: list[dict] = []
+
+    class Recording(Tool):
+        name = "rec"
+        description = "记录 preview 是否被调用（测试用）"
+        input_model = RecordingInput
+
+        @classmethod
+        def is_read_only(cls) -> bool:
+            return False
+
+        def preview(self, arguments: dict, ctx: ToolContext) -> str | None:
+            calls.append(arguments)
+            return "不该被算出来"
+
+        def execute(self, args, ctx: ToolContext) -> ToolResult:
+            return ToolResult.ok("执行了")
+
+    engine = make_engine(
+        tmp_path,
+        MockLLM.script(
+            MockLLM.tool("rec", {}).responses[0], LLMResult(content="完成了")
+        ),
+    )
+    engine.registry.register(Recording())
+    result = engine.run("跑一下")
+
+    assert result.terminated_reason == "completed"
+    assert calls == [], "没有确认交互却算了预览"

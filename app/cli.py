@@ -6,6 +6,8 @@ M6-6：事件实时流式打印（不必等任务结束才看到进度）。
       第三方/MCP 工具须在 mcp.json 的 allow 里显式授权，否则 ask；
       CLI 无确认交互，故 ask 由 loop 按安全默认拒绝）。hooks 走 default_engine()
       （block-at-submit：git commit 前需 data/tests_pass.marker，由测试成功自动写入）。
+      `--review-edits` 是唯一例外：它给 CLI 装上确认回调，并把 edit/write 抬成 ask，
+      于是改动落盘前人能看到 diff（M9-1）。默认关闭 —— 打开它会让每次改动都停下来问。
 """
 from __future__ import annotations
 
@@ -86,6 +88,47 @@ def _default_workspace() -> Path:
     return Path(os.environ.get("WORKSPACE_ROOT", "workspace")).resolve()
 
 
+#: 确认菜单：编号 → 权限引擎的粒度串（见 agent/permissions.GRANULARITY）。
+#: 键与文案对齐 TS 原版 `permissions.ts` 的 `requestApproval` 选项表。
+_CONFIRM_CHOICES: dict[str, str] = {
+    "1": "allow_once",
+    "2": "allow_turn",
+    "3": "allow_always",
+    "4": "deny_once",
+    "5": "deny_turn",
+    "6": "deny_always",
+}
+
+
+def _confirm_prompt(question: str) -> str | None:
+    """控制台确认回调（`--review-edits`）：把问题**连同 diff** 显示出来，读一个选择。
+
+    这个回调只负责"显示 + 读数"，不重新解释 `question` —— 里面已经带了这次调用
+    **将要做什么**（M9-1：edit/write 的 diff，由 `Tool.preview` 产出）。
+    权限引擎与预览的分工是固定的：引擎判"要不要问"，工具说"改完什么样"。
+
+    读不到输入（管道、Ctrl-C、EOF）一律返回 None → 引擎按安全默认拒绝。
+    非交互环境下"卡住等输入"比"拒绝"糟得多：前者看起来像死机。
+
+    直接回车默认拒绝而**不是**允许：确认框的默认值就是用户不假思索按下的那个，
+    它必须选更安全的那个方向。
+    """
+    typer.echo()
+    typer.secho("─" * 68, fg=typer.colors.BRIGHT_BLACK)
+    typer.secho(question, fg=typer.colors.YELLOW)
+    typer.secho(
+        "  1) 允许一次      2) 本回合允许     3) 一直允许\n"
+        "  4) 拒绝一次      5) 本回合拒绝     6) 一直拒绝",
+        fg=typer.colors.BRIGHT_BLACK,
+    )
+    try:
+        raw = typer.prompt("选择 (1-6)", default="4", show_default=False)
+    except (EOFError, KeyboardInterrupt, typer.Abort):
+        typer.secho("（读不到输入，按拒绝处理）", fg=typer.colors.BRIGHT_BLACK)
+        return None
+    return _CONFIRM_CHOICES.get(str(raw).strip())
+
+
 def _build_llm(mock: bool) -> BaseLLM:
     if mock:
         # 确定性演示：glob 真实执行 → 模型（Mock）给最终回答
@@ -156,6 +199,10 @@ def run(
         False, "--clear-taint",
         help="复位本会话的污染标记（**人的动作**；误报被收紧时用它解锁）",
     ),
+    review_edits: bool = typer.Option(
+        False, "--review-edits",
+        help="改动前人工确认：edit/write 每次都把 diff 显示出来等你批准",
+    ),
 ):
     """在 workspace 内执行一个任务（或从检查点续跑）。"""
     workspace_root = _default_workspace()
@@ -211,9 +258,22 @@ def run(
     #   默认 allow（正常行为不变）· 路径越界 deny · 危险命令 ask
     #   · 第三方工具 ask（须在 mcp.json 的 allow 里显式授权）
     #   （引擎不把 ask 转成 deny；是 loop 在「无确认交互」时按安全默认拒绝，理由回喂模型）
+    #
+    # M9-1 `--review-edits`：给上面这套补上**交互确认**，让 edit/write 的改动
+    # 在落盘前先给人看 diff。为什么做成开关而不是改成默认：
+    # TS 原版的 edit 是默认要批准的（`permissions.ts:ensureEdit`，无 TTY 时直接抛
+    # "Start minicode in TTY mode to review it"），但**我们的 CLI 没有确认回调**，
+    # 默认 ASK 会退化成"每一次改动都被拒绝"，整条 CLI 直接不可用 —— 那就把一个
+    # 安全机制变成了路障。开关让两件事同时成立：默认路径一字不变（eval/runner
+    # 也走的同一条），需要时又有一条真的能批准的路。
+    review_rules = (
+        {"tools": {"edit": "ask", "write": "ask"}} if review_edits else None
+    )
     permissions = PermissionsEngine(
         workspace_root,
         external_tools=[tool.name for tool in registry.external()],
+        confirm=_confirm_prompt if review_edits else None,
+        rules=review_rules,
     )
     permissions.allow_external(mcp_allowed)
     # M2 hooks：标准治理链（block-at-submit + 测试结果维护 marker）。

@@ -118,8 +118,8 @@ class SpyPermissions(PermissionsEngine):
         self.checks: list[tuple[str, dict, Decision]] = []
         SpyPermissions.last = self
 
-    def check(self, tool_name, arguments, ctx):  # noqa: ANN001 - 继承签名
-        decision = super().check(tool_name, arguments, ctx)
+    def check(self, tool_name, arguments, ctx, *, details=None):  # noqa: ANN001 - 继承签名
+        decision = super().check(tool_name, arguments, ctx, details=details)
         self.checks.append((tool_name, arguments, decision))
         return decision
 
@@ -622,3 +622,143 @@ def test_resume_events_reach_the_trajectory(tmp_path, monkeypatch):
     assert "plan_resumed" in kinds, f"计划恢复这件事没进轨迹：{kinds}"
     assert "resume_instruction" in kinds, f"续跑指示没进轨迹：{kinds}"
     assert "taint_cleared" in kinds, f"人工复位没进轨迹：{kinds}"
+
+
+# ---------- M9-1：--review-edits（改动前人工确认） ----------
+
+def test_review_edits_flag_gives_the_engine_a_confirm_callback(tmp_path, monkeypatch):
+    """`--review-edits` 必须真的把 confirm 回调与"抬成 ask"的规则**交给引擎**。
+
+    这是开关类功能最典型的失效方式：flag 解析了、help 里也写了、`if` 却写反或
+    漏传 —— 表现是「加不加这个参数，行为完全一样」，而没有任何东西会报错。
+    所以这里断的是**构造函数收到的实参**，不是最终行为。
+    """
+    seen: dict = {}
+
+    class Recording(PermissionsEngine):
+        def __init__(self, *args, **kwargs) -> None:
+            seen.update(kwargs)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    monkeypatch.setattr("app.cli._build_llm", lambda mock: MockLLM.script(LLMResult(content="ok")))
+    monkeypatch.setattr("app.cli.PermissionsEngine", Recording)
+
+    result = runner.invoke(app, ["随便一个任务", "--review-edits", "--mock"])
+
+    assert result.exit_code == 0, result.output
+    assert callable(seen.get("confirm")), "没装确认回调 → 人永远没机会批准"
+    assert seen["rules"] == {"tools": {"edit": "ask", "write": "ask"}}, seen.get("rules")
+
+
+def test_without_the_flag_nothing_changes(tmp_path, monkeypatch):
+    """不开开关时，构造参数与 M9-1 之前**一模一样**。
+
+    默认路径一字不变是这个开关存在的全部理由：eval/runner 与日常使用都走默认，
+    打开它会让每次改动都停下来问，而 CLI 里 ask 等于拒绝（无回调）。
+    """
+    seen: dict = {}
+
+    class Recording(PermissionsEngine):
+        def __init__(self, *args, **kwargs) -> None:
+            seen.update(kwargs)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    monkeypatch.setattr("app.cli._build_llm", lambda mock: MockLLM.script(LLMResult(content="ok")))
+    monkeypatch.setattr("app.cli.PermissionsEngine", Recording)
+
+    result = runner.invoke(app, ["随便一个任务", "--mock"])
+
+    assert result.exit_code == 0, result.output
+    assert seen.get("confirm") is None
+    assert seen.get("rules") is None
+
+
+def test_confirm_prompt_maps_numbers_to_granularity(monkeypatch):
+    """1-6 → 权限引擎的粒度串，且**直接回车是拒绝**。
+
+    默认值必须是更安全的那个方向：确认框的默认值就是用户不假思索按下的那个。
+    """
+    from app.cli import _CONFIRM_CHOICES, _confirm_prompt
+
+    monkeypatch.setattr("app.cli.typer.secho", lambda *a, **k: None)
+    monkeypatch.setattr("app.cli.typer.echo", lambda *a, **k: None)
+
+    for key, expected in _CONFIRM_CHOICES.items():
+        monkeypatch.setattr("app.cli.typer.prompt", lambda *a, **k: key)
+        assert _confirm_prompt("问题") == expected
+
+    # 默认值本身也要钉：确认框的默认值就是用户不假思索按下的那个，
+    # 它必须落在"拒绝"那一侧。只测映射表测不到这一点。
+    captured: dict = {}
+
+    def capture(*a, **k):
+        captured.update(k)
+        return ""
+
+    monkeypatch.setattr("app.cli.typer.prompt", capture)
+    assert _confirm_prompt("问题") is None, "空输入必须落到拒绝"
+    assert _CONFIRM_CHOICES[captured["default"]].startswith("deny_"), (
+        f"默认选项是 {captured['default']}，必须默认拒绝"
+    )
+
+    monkeypatch.setattr("app.cli.typer.prompt", lambda *a, **k: "9")
+    assert _confirm_prompt("问题") is None, "非法输入必须落到拒绝"
+
+
+def test_confirm_prompt_denies_when_there_is_no_input(monkeypatch):
+    """读不到输入（管道/EOF/Ctrl-C）→ 返回 None（引擎按拒绝处理）。
+
+    非交互环境下"卡住等输入"比"拒绝"糟得多：前者看起来像死机。
+    """
+    from app.cli import _confirm_prompt
+
+    monkeypatch.setattr("app.cli.typer.secho", lambda *a, **k: None)
+    monkeypatch.setattr("app.cli.typer.echo", lambda *a, **k: None)
+
+    def eof(*a, **k):
+        raise EOFError
+
+    monkeypatch.setattr("app.cli.typer.prompt", eof)
+    assert _confirm_prompt("问题") is None
+
+
+def test_review_edits_shows_the_diff_in_a_real_cli_run(tmp_path, monkeypatch):
+    """端到端：真跑 CLI + 真权限引擎，确认回调里必须拿到 diff，且此刻文件还没改。
+
+    这条是 M9-1 在 **CLI 入口**上的验收 —— 前面 `tests/test_loop.py` 那条钉的是
+    引擎内部时序，这条钉的是"从命令行敲下去，人真的能看见"。
+    """
+    workspace = tmp_path
+    (workspace / "calc.py").write_text(
+        "def add(a, b):\n    return a - b\n", encoding="utf-8"
+    )
+    seen: dict = {}
+
+    def fake_confirm(question: str) -> str:
+        seen["question"] = question
+        seen["content_at_confirm"] = (workspace / "calc.py").read_text(encoding="utf-8")
+        return "allow_once"
+
+    monkeypatch.setenv("WORKSPACE_ROOT", str(workspace))
+    monkeypatch.setattr(
+        "app.cli._build_llm",
+        lambda mock: MockLLM.script(
+            MockLLM.tool("edit", {
+                "path": "calc.py", "old_string": "a - b", "new_string": "a + b",
+            }).responses[0],
+            LLMResult(content="改好了"),
+        ),
+    )
+    monkeypatch.setattr("app.cli._confirm_prompt", fake_confirm)
+
+    result = runner.invoke(app, ["修掉减法 bug", "--review-edits", "--mock"])
+
+    assert result.exit_code == 0, result.output
+    assert "-    return a - b" in seen["question"], seen.get("question")
+    assert "+    return a + b" in seen["question"]
+    assert seen["content_at_confirm"] == "def add(a, b):\n    return a - b\n"
+    assert (workspace / "calc.py").read_text(encoding="utf-8") == (
+        "def add(a, b):\n    return a + b\n"
+    )

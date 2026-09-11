@@ -6,7 +6,7 @@ from pydantic import BaseModel
 
 from agent.llm import LLMResult, MockLLM
 from agent.loop import QueryEngine
-from agent.permissions import Decision, PermissionsEngine
+from agent.permissions import Decision, PermissionsEngine, _irreversible_kind
 from agent.tools.base import Tool, ToolContext, ToolRegistry, ToolResult
 
 
@@ -396,3 +396,152 @@ def test_loop_authorized_external_tool_runs(tmp_path):
     calls = [e for e in result.events if e["type"] == "tool_call"]
     assert calls[0]["success"] is True
 
+
+
+# ---------- M9-1：确认文案里的"将要改什么" ----------
+
+def test_details_reach_the_confirmation_prompt(tmp_path):
+    """预览文本要出现在**交给人看的那段字**里 —— 否则取了一遍预览等于白取。
+
+    这是 M9-1 的接线点：`preview` 算出 diff、权限引擎把它拼进 `describe`。
+    中间任何一处忘了传，失败模式都是**静默的**：功能"能跑"、测试"能过"、
+    只是确认框里永远看不到 diff。
+    """
+    seen: dict[str, str] = {}
+
+    def confirm(question: str) -> str:
+        seen["question"] = question
+        return "allow_once"
+
+    engine = PermissionsEngine(
+        tmp_path, confirm=confirm, rules={"tools": {"bash": "ask"}}
+    )
+    ctx = make_ctx(tmp_path)
+
+    engine.check("bash", {"command": "ls"}, ctx, details="- a\n+ b")
+
+    assert seen["question"] is not None
+    assert "- a" in seen["question"] and "+ b" in seen["question"]
+
+
+def test_details_do_not_change_the_decision(tmp_path):
+    """预览**不参与判定**：同一条调用，给不给 details 结果必须一样。
+
+    一旦 details 能影响判定，权限引擎就有了第二套"这次编辑合不合法"的判断，
+    与工具的"唯一匹配"语义分叉 —— 正是 `Tool.preview` 文档里要防的那个真相源。
+    """
+    ctx = make_ctx(tmp_path)
+
+    def decide(details):
+        return PermissionsEngine(tmp_path).check(
+            "write", {"path": "CLAUDE.md", "content": "x"}, ctx, details=details
+        )
+
+    assert decide(None) is decide("- 旧\n+ 新\n+ 又一行")
+
+
+def test_description_order_is_what_then_change_then_why(tmp_path):
+    """顺序是「问什么 → 改什么 → 为什么问」。
+
+    天花板说明排在最后，是因为它解释的是"为什么又问一遍"，属于补充；
+    而 diff 是**判断依据本身**，必须紧贴问句 —— 排在理由之后就会被折叠掉。
+    """
+    engine = PermissionsEngine(tmp_path)
+    engine.note_taint("high")
+
+    text = engine.describe(
+        "write", {"path": "CLAUDE.md", "content": "x"}, details="[新建文件] CLAUDE.md"
+    )
+
+    assert text.index("是否允许") < text.index("[新建文件]") < text.index("污染标记")
+
+
+# ---------- M9-2：web 工具接上污染天花板 ----------
+
+def test_web_tools_are_egress_by_definition():
+    """判据是「这个工具**做什么**」，不是「这次参数里有什么」。
+
+    `web_fetch` 无论抓哪个 URL 都会把请求发出去，所以它恒属于「网络外发」。
+    这条同时也是在钉：URL 里出现 `.env` 这类字样**不会**让它变成「读取凭据文件」
+    —— 取远端 URL 跟读本地凭据文件是两件事，归类错了就会给出错误的解除指引。
+    """
+    assert _irreversible_kind("web_fetch", {"url": "https://example.com/"}) == "网络外发"
+    assert _irreversible_kind("web_search", {"query": "python"}) == "网络外发"
+    assert _irreversible_kind(
+        "web_fetch", {"url": "https://example.com/?q=.env"}
+    ) == "网络外发"
+
+
+def test_web_tools_are_allowed_when_the_session_is_clean(tmp_path):
+    """常态下联网工具是放行的 —— 收紧只在 high 污染时发生，别把它变成路障。"""
+    engine = PermissionsEngine(tmp_path)
+    ctx = make_ctx(tmp_path)
+
+    assert engine.check("web_fetch", {"url": "https://example.com/"}, ctx) is Decision.ALLOW
+    assert engine.check("web_search", {"query": "x"}, ctx) is Decision.ALLOW
+
+
+def test_high_taint_tightens_web_tools(tmp_path):
+    """这是 M9-2 的**主要目的**：让天花板里「网络外发」那一类第一次有真实对象。
+
+    之前 `ToolRegistry.default()` 里没有任何联网工具，判据只能命中 bash 命令行里
+    的 `curl|wget` —— 模型换个方式外发就绕过去了，那一类等于形同虚设。
+    """
+    engine = PermissionsEngine(tmp_path)
+    engine.note_taint("high")
+    ctx = make_ctx(tmp_path)
+
+    assert engine.check("web_fetch", {"url": "https://example.com/"}, ctx) is Decision.ASK
+    assert engine.check("web_search", {"query": "x"}, ctx) is Decision.ASK
+
+
+def test_high_taint_still_leaves_local_reads_alone(tmp_path):
+    """收紧范围必须压在最小 —— 多收紧一类，就多一类"本该能做的事突然做不了"。
+
+    这条是反向闸门：别顺手把天花板扩到普通只读动作上。
+    """
+    engine = PermissionsEngine(tmp_path)
+    engine.note_taint("high")
+    ctx = make_ctx(tmp_path)
+
+    assert engine.check("read", {"path": "notes.txt"}, ctx) is Decision.ALLOW
+    assert engine.check("glob", {"pattern": "*.py"}, ctx) is Decision.ALLOW
+    assert engine.check("bash", {"command": "git status"}, ctx) is Decision.ALLOW
+
+
+def test_web_denial_hint_is_actionable(tmp_path):
+    """拒绝而不说怎么解 = 路障。指引要带**类别**和**可执行的**解除动作。"""
+    engine = PermissionsEngine(tmp_path)
+    engine.note_taint("high")
+
+    hint = engine.denial_hint("web_fetch", {"url": "https://example.com/"})
+
+    assert hint is not None
+    assert "网络外发" in hint
+    assert "--clear-taint" in hint
+
+
+def test_each_taint_category_has_a_trigger_inside_the_default_registry(tmp_path):
+    """**通用不变量**：三类不可逆动作，每一类都要在 `default()` 里有触发对象。
+
+    M9-2 之前这条是**不成立**的：「网络外发」的判据挂在那里，但默认工具集里
+    一个联网工具都没有 —— 机制在、测试绿、文档也写了，可它打的是一个不存在的
+    动作。这正是本项目最要防的那类缺陷（机制在、但没有任何东西会走到它）。
+
+    所以这里不写死"web_fetch 属于网络外发"，而是从**注册表**这一侧检查：
+    判据挂着的那个工具名，必须真的在模型的默认工具集里。以后谁再加一类动作、
+    或者把某个工具移出 `default()`，这条会红。
+    """
+    registry = ToolRegistry.default(tmp_path)
+    triggers = {
+        "网络外发": ("web_fetch", {"url": "https://example.com/"}),
+        "读取凭据文件": ("read", {"path": ".env"}),
+        "写入记忆文件": ("write", {"path": "CLAUDE.md", "content": "x"}),
+    }
+
+    for category, (tool_name, args) in triggers.items():
+        assert tool_name in registry.names(), (
+            f"「{category}」的判据挂在 {tool_name} 上，但它不在 default() 里 —— "
+            f"模型手上的默认工具集里没有能触发这一类的动作，天花板就是空的"
+        )
+        assert _irreversible_kind(tool_name, args) == category

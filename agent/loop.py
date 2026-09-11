@@ -23,7 +23,7 @@ from agent.permissions import Decision, PermissionsEngine
 from agent.security import TAINT_NONE
 from agent.state import AgentState, assistant_tool_calls, system, tool_result, user
 from agent.tool_result import ToolResultStore, compact_batch
-from agent.tools.base import ToolContext, ToolRegistry, ToolResult
+from agent.tools.base import Tool, ToolContext, ToolRegistry, ToolResult
 
 
 @dataclass
@@ -505,6 +505,27 @@ class QueryEngine:
         )
         return ToolResult.fail(message)
 
+    def _preview(
+        self, tool: Tool, call: ToolCall, ctx: ToolContext, state: AgentState
+    ) -> str | None:
+        """取这次调用"将要做什么"的预览（M9-1；目前只有 write/edit 实现）。
+
+        **失败一律吞掉、但留一条事件**：预览是给人看的信息，不是判定依据。
+        让它把整轮任务搞挂，比它想解决的问题更糟（同 `security.py` 的 fail-open
+        纪律）。但"吞掉"必须是**可见**的 —— 静默地把确认框退回原样，人只会以为
+        "这个工具本来就没有预览"，而不是"预览出错了"。所以记 `preview_failed`。
+        """
+        preview = getattr(tool, "preview", None)
+        if preview is None:
+            return None
+        try:
+            return preview(call.arguments, ctx)
+        except Exception as exc:
+            state.record_event(
+                "preview_failed", tool=call.name, error=f"{type(exc).__name__}: {exc}"
+            )
+            return None
+
     def _gate_and_run(
         self, call: ToolCall, state: AgentState, ctx: ToolContext
     ) -> ToolResult:
@@ -530,14 +551,20 @@ class QueryEngine:
             # 先同步污染标记，再判定：标记的权威在 state（只升不降），引擎只是
             # 照它设值。放在判定**之前**，才能保证「上一步抬的标记、这一步就生效」。
             self._sync_taint(state)
-            decision = self.permissions.check(call.name, call.arguments, ctx)
+            # M9-1：在 check() **之前**取"将要改什么"。位置就是这一项的全部意义 ——
+            # 人看到 diff 时文件还是旧的（`tests/test_loop.py` 有一条测试专门钉这个：
+            # 确认回调被调用的那一刻，磁盘上必须仍是原文）。
+            details = self._preview(tool, call, ctx, state)
+            decision = self.permissions.check(
+                call.name, call.arguments, ctx, details=details
+            )
             if decision is Decision.DENY:
                 return self._gate_block(
                     state,
                     call,
                     "permissions",
                     f"权限拒绝: 未获允许执行 {call.name}"
-                    f"（{self.permissions.describe(call.name, call.arguments)}）",
+                    f"（{self.permissions.describe(call.name, call.arguments, details=details)}）",
                 )
             if decision is Decision.ASK:
                 # 拒绝必须带**出处与解除方式**：只说"没权限"会让 agent 反复重试

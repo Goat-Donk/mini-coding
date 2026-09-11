@@ -98,6 +98,27 @@ class Tool(ABC):
         """工具自声明是否需要人工确认（M1：bash 危险命令返回 True）。"""
         return False
 
+    def preview(self, arguments: dict, ctx: ToolContext) -> str | None:
+        """声明这次调用**将要做什么**，供权限确认在动手之前查看（M9-1）。
+
+        与 `execute` 的分工：`execute` 是"做"，`preview` 是"把要做的事说清楚"。
+        默认返回 None（没有可预览的东西）—— 目前只有 `write` / `edit` 实现它，
+        因为**整份覆盖**和**精确替换**是两类误伤了就收不回来的动作，人要看的
+        正是"改完会变成什么样"。
+
+        **必须是纯函数：绝不写盘、不改状态。** 它的产物会进入人工确认文案，
+        调用方（`_gate_and_run`）不会、也没办法为它准备回滚。
+
+        为什么放在工具上，而不是让权限引擎拿 `arguments` 自己算：edit 的
+        "唯一匹配"语义属于工具（见 `files.EditTool`）。权限引擎要是重算一遍，
+        就有了**两个真相源**，迟早出现"预览说能改、执行说匹配不唯一"——
+        而那时人已经照着预览点过允许了。越界与匹配失败的口径也只能有一份。
+
+        参数是**原始 dict** 而非校验过的模型：门禁链跑在 `run()` 之前，
+        此时还没有 pydantic 校验，所以实现方要自己容忍缺字段（返回 None 即可）。
+        """
+        return None
+
     def schema(self) -> dict:
         """OpenAI function calling 格式 schema（由 pydantic 输入模型自动生成）。"""
         raw = self.input_model.model_json_schema()
@@ -180,7 +201,7 @@ class ToolRegistry:
 
     @classmethod
     def default(cls, workspace_root: Path) -> "ToolRegistry":
-        """默认工具集：bash + read/write/edit/glob/grep（M4 加 subagent，M8 加 plan）。
+        """默认工具集：bash + read/write/edit/glob/grep（M4 加 subagent，M8 加 plan，M9 加 web）。
 
         延迟导入避免循环依赖（base 是 tools 包的底座）。
 
@@ -189,14 +210,23 @@ class ToolRegistry:
         判据。副作用要说清楚：`eval/runner.py` 用 `default()`，所以评测里的 agent
         也会拿到它 —— 那是能力不是负担（eval 是单发任务，写不写计划都不失真），
         而且它**不需要**任何外部配合，不存在 `ask_user` 那种"没人在就挂住"的问题。
+
+        `web_fetch` / `web_search` 同样进这里，但理由不同，且**代价要说明**：
+        它们让 `permissions.py` 污染天花板里「网络外发」那一类第一次有了真实对象
+        （判据见 `_irreversible_kind`）—— 这是本项的主要目的。代价是评测也拿到了
+        联网能力，**因此 README 里的 token/耗时/缓存命中率数字与 M9-2 之前不可比**，
+        必须重跑 `python -m eval.runner` 后再引用（已记进 TASKS.md 的 M9-2 条目）。
         """
         from agent.tools.bash import BashTool
         from agent.tools.files import EditTool, GlobTool, GrepTool, ReadTool, WriteTool
         from agent.tools.plan import UpdatePlanTool
+        from agent.tools.web import build_web_tools
 
         registry = cls()
         for tool_cls in (
             BashTool, ReadTool, WriteTool, EditTool, GlobTool, GrepTool, UpdatePlanTool,
         ):
             registry.register(tool_cls())
+        for tool in build_web_tools():
+            registry.register(tool)
         return registry

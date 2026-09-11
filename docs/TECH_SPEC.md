@@ -190,6 +190,14 @@ class Tool(ABC):
     def needs_permission(self, arguments: dict) -> bool: return False
         # 工具自声明是否需要人工确认（M1：bash 危险命令 True；M2 起由权限引擎统一裁决）
 
+    def preview(self, arguments: dict, ctx: ToolContext) -> str | None: return None
+        # ★M9-1 声明这次调用**将要做什么**，供权限确认在动手之前查看。
+        # 收**原始 dict**（门禁链跑在 run() 之前，还没有 pydantic 校验）→ 实现方自己容忍缺字段，返回 None。
+        # **必须是纯函数：绝不写盘、不改状态** —— 调用方不为它准备回滚。
+        # 放在工具上而不是让权限引擎自己算：edit 的「唯一匹配」语义属于工具，
+        # 引擎重算一遍就有了两个真相源，迟早「预览说能改、执行说不唯一」，而那时人已经点过允许了。
+        # 目前只有 WriteTool / EditTool 实现（整份覆盖与精确替换是两类误伤收不回来的动作）。
+
     def schema(self) -> dict:
         # s = self.input_model.model_json_schema()
         # 清理：删 title、删 $defs（扁平参数不应有）；确保 {"type":"object","properties":...,"required":...}
@@ -229,6 +237,9 @@ class ToolRegistry:
 - pydantic v2 的 `model_json_schema()` 会给 `$defs`（嵌套模型时）。**约定：工具参数扁平化**，出现 `$defs` 即视为设计错误（测试里断言）。
 - `required` 列表：仅填没有默认值的字段。
 - 未知工具名：loop 返回 `ToolResult.fail(f"未知工具 {name}，可用: ...")` 回喂模型。
+- **`preview` 的调用时机是它唯一的失败模式，而且失败时是静默的**（M9-1）：必须在 `permissions.check()` **之前**取。挪到之后不会报任何错 —— 功能照样跑、确认框照样显示 diff，只是那份 diff 已经是**事后**的了。所以 `tests/test_loop.py::test_edit_diff_is_available_before_the_write` 断的是「确认回调被调用的那一刻，磁盘上必须仍是原文」。
+- **预览 fail-open、权限 fail-closed**：`_preview` 抛异常只记 `preview_failed` 事件并退回原确认框（预览是**信息**）；权限链算不出来必须大声失败（判定漏一次就是门禁漏一次）。
+- **没有权限引擎时根本不计算预览**：没有确认交互就没有人看得到它，而 edit 的预览要把整个文件读进来做 diff。headless（`eval/runner.py`）走的就是这条路，白算是实打实的每步开销。
 
 ### 2.6 测试
 
@@ -356,16 +367,38 @@ class EditInput(BaseModel):
 class EditTool(Tool):
     name="edit"
     description = "在文件中做精确字符串替换。old_string 必须唯一匹配（含完整上下文与缩进）；不匹配或匹配多次会报错并提示如何修正。"
+
+    # _plan(args, resolved) -> (原文, 新内容, 失败原因)   ★M9-1
+    #   **preview 与 execute 共用这一份匹配语义**，匹配/计数/替换只写在这里。
+    #   各写一份的后果不是代码重复，而是「预览说能改、执行说匹配不唯一」——
+    #   而那时人已经照着预览点过允许了。后两者恰有一个非 None。
+
+    # preview(arguments, ctx) -> str | None            ★M9-1
+    #   arguments 是原始 dict → EditInput(**arguments) 校验失败则 None（门禁链跑在 run() 之前）
+    #   越界/文件不存在 → None（execute 与权限链各自有更准的话说）
+    #   _plan 失败 → **返回 "[无法预览改动] {error}" 而不是 None**
+    #     （人看到的该是「这次编辑根本改不动，因为 old_string 匹配到 3 处」，
+    #      而不是一片空白；预览的全部意义就是让这个判断发生在写盘之前）
+    #   否则 → _unified_diff(path, old, new)，上限 DIFF_PREVIEW_CHARS = 4_000
+
     # execute:
-    #   1) content = read
-    #   2) count = content.count(old_string)
-    #      0 → fail(f"old_string 未在文件中找到。请先用 read 查看实际内容，注意缩进/换行/转义，再重试。当前文件共 {lines} 行。")
-    #      >1 且 not replace_all → fail(f"old_string 在文件中出现 {count} 次，不唯一。请包含更多上下文行使其唯一，或传 replace_all=true")
-    #   3) new = content.replace(old_string, new_string)（replace_all=True 时替换全部）
-    #   4) diff = difflib.unified_diff(old_lines, new_lines, fromfile=f"a/{path}", tofile=f"b/{path}", lineterm="")
-    #   5) 写回文件；output = "编辑完成，diff：\n" + diff（diff 展示给模型确认改动）
+    #   1) resolved = _resolve(...)；不存在 → fail
+    #   2) old_content, new_content, error = self._plan(args, resolved)；error → fail(error)
+    #   3) 写回文件
+    #   4) output = "编辑完成，diff：\n" + _unified_diff(path, old, new, limit=MAX_CHARS)
+    #      ★ 这个 limit=MAX_CHARS 是必需的：_unified_diff 的默认值是给人看的 4_000，
+    #        漏传就会把模型那份 diff 从 500K 悄悄砍成 4K —— 没有任何测试会自然变红，
+    #        所以 tests/test_tools.py::test_execute_diff_is_not_capped_at_the_preview_limit 钉着它
     #   data = {"path", "replacements": count if replace_all else 1}
 ```
+
+> **两处上限刻意不同**（M9-1）：`DIFF_PREVIEW_CHARS = 4_000` 给人看，`MAX_CHARS = 500_000` 给模型看。
+> 几万字符的 diff 出现在确认框里，会把人逼成"闭眼点允许"—— 而一个训练用户不看内容的确认框，等于没有确认框。
+> 两者共用 `_unified_diff`，所以那个 `limit=` 实参是这一项最容易被漏掉的接线。
+>
+> `WriteTool.preview` 同理，但它处理的是**整份覆盖**：工具结果里只有一句"已写入 N 字符到 X（覆盖）"，
+> 人根本看不出丢了什么（`edit` 至少还能从 `old_string` 猜到改动范围）。新文件 → `[新建文件] p（N 字符）`；
+> 内容相同 → `[内容无变化] p`；否则 unified diff。
 
 ### 4.4 GlobTool（只读）
 
@@ -415,6 +448,7 @@ class GrepTool(Tool):
 - test_glob_basic + 截断：>100 文件截断提示
 - test_grep_basic：命中 file:line；include 过滤；max_matches 截断
 - test_path_escape：read/write/edit/glob 的 path 指向沙箱外 → fail 越界
+- **M9-1 预览**：`test_edit_preview_shows_the_diff_without_touching_the_file`（两头断言：diff 对**且**磁盘仍是原文）· `test_edit_preview_reports_why_it_cannot_change_anything`（匹配不唯一 → 给原因不是空白）· `test_edit_preview_and_execute_agree_on_uniqueness`（唯一性口径一致）· `test_write_preview_diffs_the_file_it_would_overwrite` · `test_write_preview_reports_a_new_file` · `test_preview_defaults_to_none` · `test_edit_preview_is_capped_for_the_human` · `test_execute_diff_is_not_capped_at_the_preview_limit`
 
 ---
 
@@ -849,6 +883,35 @@ DEFAULT_SYSTEM_PROMPT = f"""\
 - 打印：每步事件（工具调用名+参数摘要+结果截断）+ 最终结论 + 总 token/步骤
 - **M2+**：加 `--resume`、权限 ask 交互、`--checkpoint-dir`（M3）
 
+### 8.1 `--review-edits`：改动前人工确认（★M9-1）
+
+**为什么是开关而不是默认**：TS 原版的 edit 是**默认要批准**的（`permissions.ts:427 ensureEdit`，无 TTY 时直接抛
+`Edit requires approval: … Start minicode in TTY mode to review it`）。但**我们的 CLI 没有确认回调**，
+把 `edit` 改成默认 ASK 会让每一次改动都退化成拒绝 —— 整条 CLI 不可用，等于把安全机制变成了路障。
+所以做成 opt-in：默认路径（含 `eval/runner.py`）一字不变，需要时再打开。
+
+```python
+_CONFIRM_CHOICES = {"1": "allow_once", "2": "allow_turn", "3": "allow_always",
+                    "4": "deny_once",  "5": "deny_turn",  "6": "deny_always"}
+
+def _confirm_prompt(question: str) -> str | None:
+    # 只负责「显示 + 读数」，**不重新解释 question** —— 里面已经带了将要做什么（Tool.preview 产出）
+    # 打印 question（含 diff）→ 编号菜单 → typer.prompt(default="4")
+    # 读不到输入（EOF / KeyboardInterrupt / Abort）→ None → 引擎按安全默认拒绝
+    #   （非交互环境下"卡住等输入"比"拒绝"糟得多：前者看起来像死机）
+    # 直接回车默认拒绝而不是允许：确认框的默认值就是用户不假思索按下的那个，
+    #   它必须选更安全的方向（有测试钉住 default 落在 deny_* 一侧）
+
+# run() 里：
+review_rules = {"tools": {"edit": "ask", "write": "ask"}} if review_edits else None
+permissions = PermissionsEngine(..., confirm=_confirm_prompt if review_edits else None,
+                                rules=review_rules)
+```
+
+**测试**（`tests/test_cli.py`）：开关真把 `confirm`+`rules` 交给了引擎（断构造实参，不断最终行为 ——
+开关类功能挂在"解析了但 `if` 写反/漏传"上，表现是加不加参数行为完全一样且不报错）·
+不开开关时构造参数与 M9-1 之前一模一样 · 编号映射与默认拒绝 · 无输入→拒绝 · **端到端真跑 CLI 拿到 diff**。
+
 ### 8.2 app/ui_streamlit.py（M2-3 控制台 v1）
 
 **文件**：`app/ui_streamlit.py`；运行 `streamlit run app/ui_streamlit.py`（无 key 自动 Mock 演示）。
@@ -879,7 +942,14 @@ DEFAULT_SYSTEM_PROMPT = f"""\
 - 规则文件 `permissions.json`：`{"tools": {"bash": {"dangerous": "ask"}}, "commands": {...}, "paths": {"allow": [...], "deny": [...]}}`
 - 三类请求：**path**（读/写/列/搜）、**command**、**edit**；每类 allowlist/denylist + 决策记忆（once/turn/always 落内存或文件）
 - 危险命令黑名单从 bash.py 提取共享；路径沙箱复用 files._resolve 语义
-- `PermissionsEngine.check(tool_name, arguments, ctx) -> 决策`；ask → 回调用户确认
+- `PermissionsEngine.check(tool_name, arguments, ctx, *, details=None) -> 决策`；ask → 回调用户确认
+
+#### `details`：确认文案里的"将要改什么"（★M9-1）
+
+- `check` / `ask` / `describe` / `_confirm_and_record` 都多一个 **keyword-only** 的 `details: str | None`，由调用方从 `tool.preview()` 取。
+- **它不参与判定** —— 只被带进确认文案给人看。一旦它能影响判定，权限引擎就有了第二套"这次编辑合不合法"的判断，与工具的「唯一匹配」语义成为**两个真相源**（见 §2.3 `Tool.preview`）。
+- `describe()` 的拼接顺序是**「问什么 → 改什么 → 为什么问」**：`details` 紧跟问句，污染天花板的说明排最后。diff 是**判断依据本身**，排在理由之后就会被折叠掉；而天花板说明解释的是"为什么又问一遍"，属于补充。
+- 引擎**刻意不自己去算 diff**：那正是上面那条真相源禁令。引擎判"要不要问"，工具说"改完什么样"。
 
 ### 9.2 agent/hooks.py（M2）
 - `HookContext`：event_name / tool_name / arguments / result / state
@@ -1194,9 +1264,11 @@ def memory_frame(text, source) -> str        # **项目约定**外框（措辞�
 
 | 类别 | 判据（`_irreversible_kind`） | 为什么算不可逆 |
 |---|---|---|
-| 网络外发 | `curl` / `wget` / `nc` / `scp` / `ssh` / `Invoke-WebRequest` …、`requests.` / `httpx.` / `urllib.request` / `socket.socket` | 数据出去了就出去了，事后撤销没有意义 |
+| 网络外发 | **`web_fetch` / `web_search`（工具名即判据，M9-2）**；bash 命令行里的 `curl` / `wget` / `nc` / `scp` / `ssh` / `Invoke-WebRequest` …、`requests.` / `httpx.` / `urllib.request` / `socket.socket` | 数据出去了就出去了，事后撤销没有意义 |
 | 读取凭据 | `.env` / `id_rsa` / `.aws` / `credentials.json` / `.npmrc` … | key 进了模型上下文，只能靠轮换补救 |
 | 写入记忆文件 | `CLAUDE.md` / `CODEAGENT.md` / `learned*.md` / `.codeagent/rules` | 会被**后续每个会话**自动注入，是跨会话持久化 |
+
+> **第一行在 M9-2 之前是空的**：`ToolRegistry.default()` 里一个联网工具都没有，所以「网络外发」这一类只能靠 bash 命令行命中 —— 一个天花板挂着一个打不到的动作。加工具的同时接线也必须跟上，而接线有个位置陷阱：`_irreversible_kind` 的 web 分支**必须写在取 `raw` 之前**（它只取 `command`/`path`/`pattern`，web 参数是 `url`/`query`），写在后面等于永远返回 None，**单测不会变红**。有专门的变异体钉这个位置。
 
 - **bash 的凭据判据是「提到即命中」，不是「读动词 + 路径」**（`CREDENTIAL_MENTION`，不锚定末尾）。这一条是**真跑真模型之后改的**，两版都不对：
   1. 第一版要求「读动词 + 凭据路径」同现，动词表是 `cat|type|head|tail|less|more|Get-Content|gc`。模型读 `.env` 用的却是 `findstr /r /c:"^[A-Za-z_]" .env`（Windows 上 `grep` 的自然替代）—— **不在表里，天花板没生效**：命令正常执行、变量名进了上下文，轨迹里连一条 `gate_block` 都没有。枚举读动词是打地鼠（`findstr` / `Select-String` / `grep` / `awk` / `sed` / `od` / `strings` / `python -c` …），漏一个就等于这类动作完全没有天花板。
@@ -1262,6 +1334,44 @@ M7 的机制不能只靠单测验收 —— 下面四条各跑了一遍真实 LL
 2. **`--resume` 丢掉续跑指示**：拒绝文案指引「复位后重试」，但复位后 CLI 无法把话送进会话（`run_from` 用 `state.task`）→ 「收紧 → 人解锁 → 重试」动线断在最后一步。
 
 两条的意义都在于：**它们是只有真跑真模型才会暴露的失败模式**，也正是「每条都要如实写明跑过/没跑过」这条纪律的价值所在。
+
+### 9.12 agent/tools/web.py（M9-2 已实现：联网工具 + SSRF 拦截）
+
+```python
+MAX_FETCH_BYTES = 2_000_000     # 单次抓取上限；压缩前与解压后各算一次
+COMPRESSION_HINT = "identity"   # 请求头里显式要求不压缩（服务端可以不听）
+DEFAULT_MAX_CHARS = 12_000      # 回给模型的正文上限（对齐 TS 原版）
+MAX_REDIRECTS = 5
+ALLOWED_SCHEMES = frozenset({"http", "https"})
+
+class WebFetchInput(BaseModel):
+    url: str
+    max_chars: int = Field(default=DEFAULT_MAX_CHARS, ge=500, le=200_000)
+
+class WebSearchInput(BaseModel):
+    query: str
+    max_results: int = Field(default=5, ge=1, le=20)
+
+def _blocked_reason(url: str) -> str | None          # None = 放行
+def _is_internal(ip) -> bool
+def _embedded_ipv4(ip: IPv6Address) -> IPv4Address | None
+def _decompress(body: bytes, content_encoding: str) -> tuple[bytes | None, str | None]
+def _html_to_text(raw: str) -> tuple[str, str]        # (标题, 正文)
+class _GuardedRedirectHandler(urllib.request.HTTPRedirectHandler)
+def build_web_tools() -> list[Tool]
+```
+
+- **分层边界**：本模块判「这个 URL **能不能碰**」（确定性，与权限无关）；权限层判「这次外发**要不要人点头**」（`high` 污染时收紧）。两者不重叠、也不互为备份。
+- **判据支点 = 先解析、再判结果 IP**。判 `hostname` 字面量是漏的（实测 `localtest.me` → `127.0.0.1`）。**解析失败 → 拒绝（fail-closed）**，理由写进返回值（「域名解析失败（host）」），不是一句"不允许"。
+- **地址分类的三处非显然判定**（判据表在 `tests/test_tools.py::test_is_internal_table`）：`::ffff:` 映射拆开递归判（`::ffff:100.64.0.1` 只有拆开才够得着 CGNAT，而 `::ffff:8.8.8.8` 必须放行）；CGNAT `100.64.0.0/10` 单列（`is_private`/`is_reserved` 都是 False）；NAT64/6to4 拆出内嵌 IPv4 再判（整段判会误拦合法映射，且诊断信息是错的）。
+- **三条拦截位置各自的失效形态**：① 判据必须在**发请求之前**；② `_opener()` 必须真装 `_GuardedRedirectHandler`；③ **每一跳重定向都要重查**（只数跳数不校验目标等于不设防，一次跳转就够 —— `max_redirections` 对 SSRF 毫无作用）。
+- **内容编码**：`Accept-Encoding: identity` **减少**服务端压缩的情况，但服务端可以不理会（实测 `python.org` 就是），所以必须真解压；`_decompress` 支持 gzip / deflate（zlib 包装与裸流两种都试），**解压后同样封顶 `MAX_FETCH_BYTES`**（原上限只管读进来的字节，压缩炸弹能解出几 GB）；**认不出的编码如实返回错误**，绝不退回原文。
+- **正文提取**：不做 DOM 解析（要引依赖），只丢明显不是内容的块。**`header` 刻意不在丢弃表里**（不少站把 `<h1>` 放在里面）；`_TITLE` 必须在 `_DROP_BLOCK` **之前**取（丢弃表含 `head`，否则标题永远为空）。
+- **搜索后端可切换**：`CODEAGENT_SEARCH_BACKEND`（`ddg` 默认，对齐 TS 原版 / `bing`），非法值回落默认。**查询词必须 `quote_plus`**（来自模型，是不可信输入）。解析不到结果时说「没有解析到结果」而不是「没找到相关内容」—— 后者会把"解析器失效"伪装成"这个词真的搜不到"。
+- **`is_read_only() -> True`**：不改本地文件 → 可进只读并发批。这不与「它有副作用」矛盾：并发与否是**调度**问题，要不要人点头是**判定**问题（权限层看到的是「网络外发」）。
+- **注册**：`build_web_tools()` 进 `ToolRegistry.default()`。**副作用**：`eval/runner` 也拿到这两个工具，token 从 62.8k 升到 82.5k（+31%），**判定结论不变** —— 见 README 的口径说明。
+- 测试：`tests/test_tools.py`（+73 例）+ `tests/test_permissions.py`（+6 例，含「三类不可逆动作各有一个触发工具真的在 `default()` 里」这条不变量）。变异测试 31/31（`m9verify/mutate_m9_2.py`）。
+- **如实标注**：默认后端 `ddg` 在本机连不通（直连超时 / 代理 SSL 中断），其解析正则**未经真实响应校准**；真跑走 `bing`。**只读并发批内，外发与产生污染的读同时执行**，该次外发按批前级别判定 —— 物理顺序，不是漏洞，见 `docs/architecture.md` §4。
 
 ---
 

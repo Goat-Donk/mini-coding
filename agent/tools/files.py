@@ -11,17 +11,44 @@ import os
 import re
 from pathlib import Path
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from agent.tools.base import Tool, ToolContext, ToolResult
 
 MAX_CHARS = 500_000  # 兜底安全上限；超大输出走 tool_result 落盘（M3-2）
+#: 给人看的 diff 预览上限（M9-1）。比 `MAX_CHARS` 小两个数量级是**故意的**：
+#: 它出现在人工确认框里，一段几万字符的 diff 会把人逼成"闭眼点允许"——
+#: 而一个训练用户不看内容的确认框，等于没有确认框。
+DIFF_PREVIEW_CHARS = 4_000
 TRUNCATED_MESSAGE = (
     "\n... [输出被截断，共 {total} 字符，仅显示前 {limit} 字符] ..."
 )
 GLOB_TRUNCATED_MESSAGE = (
     "\n... [文件过多，仅显示前 {limit} 个。请用更精确的 glob pattern 或 read 深入探索] ..."
 )
+
+
+def _unified_diff(
+    label: str, old: str, new: str, limit: int = DIFF_PREVIEW_CHARS
+) -> str:
+    """生成 `a/label` → `b/label` 的 unified diff（截断到 limit）。
+
+    **改前预览与"编辑完成"回执共用这一个函数。** 两处各写一份的后果不是
+    代码重复，而是口径分叉：给人看的 diff 和给模型看的 diff 迟早不一致，
+    而这类不一致没有任何测试会自然覆盖到。
+    """
+    diff_text = "\n".join(
+        difflib.unified_diff(
+            old.splitlines(), new.splitlines(),
+            fromfile=f"a/{label}", tofile=f"b/{label}", lineterm="",
+        )
+    )
+    if len(diff_text) > limit:
+        diff_text = diff_text[:limit] + TRUNCATED_MESSAGE.format(
+            total=len(diff_text), limit=limit
+        )
+    return diff_text
+
 
 
 def _resolve(ctx: ToolContext, raw: str, *, default_root: bool = False) -> Path | ToolResult:
@@ -128,6 +155,33 @@ class WriteTool(Tool):
             data={"path": str(resolved), "chars": len(args.content)},
         )
 
+    def preview(self, arguments: dict, ctx: ToolContext) -> str | None:
+        """覆盖写入前把 diff 交给人看（新文件则说明是新建）。
+
+        这一类最需要预览：**整份内容被替换**，而工具结果里只有一句
+        "已写入 N 字符到 X（覆盖）"—— 人根本看不出丢了什么。`edit` 至少
+        还能从 old_string 猜到改动范围，`write` 连这个都没有。
+
+        不抛异常、不写盘：拿不到就返回 None，确认框退回原来的样子。
+        """
+        try:
+            args = WriteInput(**arguments)
+        except ValidationError:
+            return None
+
+        resolved = _resolve(ctx, args.path)
+        if isinstance(resolved, ToolResult):
+            return None  # 越界由权限链的硬 deny 处理，这里不管
+        if not resolved.exists():
+            return f"[新建文件] {args.path}（{len(args.content)} 字符）"
+        if not resolved.is_file():
+            return None
+        old = _read_text(resolved)
+        if old == args.content:
+            return f"[内容无变化] {args.path}"
+        return _unified_diff(args.path, old, args.content)
+
+
 
 # ---------- edit（CC 唯一匹配 + diff） ----------
 
@@ -146,6 +200,53 @@ class EditTool(Tool):
     )
     input_model = EditInput
 
+    def _plan(
+        self, args: EditInput, resolved: Path
+    ) -> tuple[str, str | None, str | None]:
+        """算出编辑后的内容。返回 `(原文, 新内容, 失败原因)`（后两者恰有一个非 None）。
+
+        **`preview` 与 `execute` 共用这一份匹配语义** —— 这是本项最要紧的一处约束：
+        "唯一匹配"如果各判一遍，就会出现"预览说能改、执行说匹配不唯一"，
+        而那时人已经照着预览点过允许了。匹配、计数、替换只写在这里。
+        """
+        content = _read_text(resolved)
+        count = content.count(args.old_string)
+        if count == 0:
+            lines = content.count("\n") + 1
+            return content, None, (
+                f"old_string 未在文件中找到。当前文件共 {lines} 行。\n"
+                "请先用 read 查看实际内容，注意缩进/换行/转义，再重试。\n"
+                f"查找内容: {args.old_string[:200]!r}"
+            )
+        if count > 1 and not args.replace_all:
+            return content, None, (
+                f"old_string 在文件中出现 {count} 次，不唯一。\n"
+                "请包含更多上下文行使其唯一，或传 replace_all=true。\n"
+                f"查找内容: {args.old_string[:200]!r}"
+            )
+        if args.replace_all:
+            return content, content.replace(args.old_string, args.new_string), None
+        return content, content.replace(args.old_string, args.new_string, 1), None
+
+    def preview(self, arguments: dict, ctx: ToolContext) -> str | None:
+        """改**之前**把 diff 交给人看 —— 权限确认要看的正是这个。
+
+        匹配失败时**返回失败原因而不是 None**，这是刻意的：人看到的不该是
+        一片空白（"它没说要改什么"），而是"这次编辑根本改不动，因为
+        old_string 匹配到 3 处"。预览的全部意义就是让这个判断发生在写盘之前。
+        """
+        try:
+            args = EditInput(**arguments)
+        except ValidationError:
+            return None
+        resolved = _resolve(ctx, args.path)
+        if isinstance(resolved, ToolResult) or not resolved.exists():
+            return None  # 越界/不存在：execute 与权限链各自有更准的话说
+        old, new, error = self._plan(args, resolved)
+        if error is not None:
+            return f"[无法预览改动] {error}"
+        return _unified_diff(args.path, old, new or "")
+
     def execute(self, args: EditInput, ctx: ToolContext) -> ToolResult:
         resolved = _resolve(ctx, args.path)
         if isinstance(resolved, ToolResult):
@@ -153,38 +254,9 @@ class EditTool(Tool):
         if not resolved.exists():
             return ToolResult.fail(f"文件不存在: {args.path}（请先 write 或 read 确认）")
 
-        content = _read_text(resolved)
-        count = content.count(args.old_string)
-        if count == 0:
-            lines = content.count("\n") + 1
-            return ToolResult.fail(
-                f"old_string 未在文件中找到。当前文件共 {lines} 行。\n"
-                "请先用 read 查看实际内容，注意缩进/换行/转义，再重试。\n"
-                f"查找内容: {args.old_string[:200]!r}"
-            )
-        if count > 1 and not args.replace_all:
-            return ToolResult.fail(
-                f"old_string 在文件中出现 {count} 次，不唯一。\n"
-                "请包含更多上下文行使其唯一，或传 replace_all=true。\n"
-                f"查找内容: {args.old_string[:200]!r}"
-            )
-
-        if args.replace_all:
-            new_content = content.replace(args.old_string, args.new_string)
-        else:
-            new_content = content.replace(args.old_string, args.new_string, 1)
-
-        old_lines = content.splitlines()
-        new_lines = new_content.splitlines()
-        diff = difflib.unified_diff(
-            old_lines, new_lines,
-            fromfile=f"a/{args.path}", tofile=f"b/{args.path}", lineterm="",
-        )
-        diff_text = "\n".join(diff)
-        if len(diff_text) > MAX_CHARS:
-            diff_text = diff_text[:MAX_CHARS] + TRUNCATED_MESSAGE.format(
-                total=len(diff_text), limit=MAX_CHARS
-            )
+        old_content, new_content, error = self._plan(args, resolved)
+        if error is not None:
+            return ToolResult.fail(error)
 
         try:
             resolved.write_text(new_content, encoding="utf-8")
@@ -192,10 +264,13 @@ class EditTool(Tool):
             return ToolResult.fail(f"写入失败: {exc}")
 
         return ToolResult.ok(
-            "编辑完成，diff：\n" + diff_text,
+            "编辑完成，diff：\n"
+            + _unified_diff(args.path, old_content, new_content, limit=MAX_CHARS),
             data={
                 "path": str(resolved),
-                "replacements": count if args.replace_all else 1,
+                "replacements": (
+                    old_content.count(args.old_string) if args.replace_all else 1
+                ),
             },
         )
 

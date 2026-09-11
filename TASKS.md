@@ -237,11 +237,85 @@ step 5  完成
 
 ---
 
+## M9 向 TS 原版对齐（2026-09-11 用户决定）
+
+**背景**：把 TS 原版 `F:\MiniCode-main` 的 12 项「核心能力」清单（`README.zh-CN.md:125-137`）逐条在源码里核实，
+结论是 **TS 原版 12 项全部真实现** —— 那是一份成熟产品，清单一条不虚，差距真实存在。
+完整的**三方对照表**（TS 原版 / Python 移植 / 我们，含实现文件与行号）与核实方法见
+[`docs/reference/minicode-notes.md`](docs/reference/minicode-notes.md) §10。用户决定**往原版靠**。
+
+**排序原则**：先做「小改动 + 直接强化已有资产」的，再做「兑现已写进面试稿的承诺」的，
+最后做「会动核心循环契约」的。**不做的项也写下来并给理由** —— 「测过同类机制收益不达预期，所以不做」是一个可讲的工程判断，不是缺口。
+
+### 第一批 · 小改动，直接强化已有资产
+
+- [x] **M9-1 ⑪ 改前 diff review**：diff 生成从写入**之后**（`agent/tools/files.py:179-195`，`"编辑完成，diff："`）提到写入**之前**，并作为权限请求的 `details` 传下去。
+  - 现状：`permissions.py:47` 已有 `EDIT_TOOLS` / `edit` 类（`_classify` `:361`、`kind == "edit"` `:431`），但**没有 `ensure_edit`** —— 权限决策时**看不到 diff**，diff 只在改完之后作为工具结果回喂
+  - 收益：权限从「事后报告」变「事前审批」（CC 的做法）；Streamlit 的权限弹窗也能显示 diff 了
+  - 验收：`pytest tests/test_permissions.py tests/test_tools.py`；真实 CLI 跑一条 edit 任务，权限请求的 details 里带 diff
+
+  **✅ 2026-09-11 完成。实现**：`Tool.preview(arguments, ctx)`（`agent/tools/base.py`，纯函数，默认 None）→ `WriteTool.preview` / `EditTool.preview`（`files.py`）→ `_gate_and_run` 里 `details = self._preview(...)` **在 `check()` 之前**取 → `permissions.check/ask/describe/_confirm_and_record` 收 `details` 并拼进确认文案。
+  - **唯一真相源**：`EditTool._plan` 同时供 `preview` 与 `execute`（匹配、计数、替换只写一份）。各判一遍就会出现「预览说能改、执行说匹配不唯一」——而那时人已经照着预览点过允许了。
+  - **两处上限是分开的**：给人看的 `DIFF_PREVIEW_CHARS = 4_000`（几万字符的 diff 会把人逼成闭眼点允许），给模型的仍是 `MAX_CHARS`。两者共用 `_unified_diff`，所以 `execute` 的 `limit=` 实参是一条**漏了也没有测试会自然变红**的接线，单配一条测试钉着。
+  - **fail-open vs fail-closed 的分工**：预览是**信息** → 抛异常只记 `preview_failed` 事件并退回原确认框；权限是**判定** → 算不出来必须大声失败。**没有权限引擎时根本不计算预览**（headless 没确认交互，而 edit 的预览要把整个文件读进来做 diff，算了是白花）。
+  - **新开关 `--review-edits`（`app/cli.py`）**：给 CLI 装上 `confirm` 回调（编号菜单，**直接回车默认拒绝**）并把 `edit`/`write` 抬成 ask。为什么是开关而不是默认 —— TS 原版的 edit 是默认要批准的（`permissions.ts:427 ensureEdit`，无 TTY 时直接抛「Start minicode in TTY mode to review it」），但**我们的 CLI 没有确认回调**，改成默认 ASK 会让每次改动都退化成拒绝、整条 CLI 不可用（把安全机制变成路障）。默认路径与 eval 一字不变。
+  - **测试**：`test_tools.py` 8 例（含「预览后磁盘必须仍是原文」「预览与执行对唯一性判断一致」「execute 不受 4K 上限影响」）、`test_permissions.py` 3 例（details 到达确认文案 / 不参与判定 / 文案顺序问什么→改什么→为什么问）、`test_loop.py` 3 例（**确认回调被调用那一刻磁盘仍是原文** / 预览异常不打断本轮 / 无权限引擎时不计算预览）、`test_cli.py` 5 例（开关真的把 confirm+rules 交给了引擎 / 不开开关参数一模一样 / 编号映射与默认拒绝 / 无输入→拒绝 / **端到端真跑 CLI 拿到 diff**）。**359 全绿**。
+  - **变异测试 12/12 被抓住**（`m9verify/mutate_m9_1.py`）：预览挪到 check() 之后、preview 自判唯一匹配、details 不拼进文案、execute 误用 4K 上限、预览异常抛出、预览顺手写盘、无引擎也白算预览、write 预览不看原文件、开关没装回调、开关没抬 ask、默认值改成允许、没开的开关也生效。
+  - **真实 LLM 跑过两个方向**（DeepSeek 官方通路，轨迹 `m9verify/review/`）：答「1 允许一次」→ 按 diff 改对（4 步、10755 token、缓存命中 71%）；答「4 拒绝一次」→ **`calc2.py` 磁盘上仍是 `return a - b`**，模型收到拒绝后如实回「编辑被权限系统拒绝了…补丁已准备好」（4 步、11377 token、命中 74%）。
+  - **如实说明**：默认配置下这个 diff **到不了人眼前**（edit 默认 ALLOW、CLI 无确认交互），只有 `--review-edits`、或污染天花板收紧、或显式规则把工具抬成 ask 时才出现。看着像"做了个看不到的功能"，所以开关是这一项的必需部分，不是一个附加物。
+- [x] **M9-2 ⑨ web fetch / search**：两个新工具 + SSRF 拦截，**并接上污染天花板**。
+  - 现状：`ToolRegistry.default()`（`agent/tools/base.py:184-201`）里**没有任何联网工具** —— 于是 M7 的天花板收紧的三类不可逆动作中，「网络外发」那一类**打的是不存在的动作**
+  - 收益：补工具面的同时，让一条已有机制第一次有真实对象（比新增机制更值得讲）
+  - 验收：`pytest tests/test_tools.py`；真跑「查 X 并写进文件」
+
+  **✅ 2026-09-11 完成。实现**：`agent/tools/web.py`（`WebFetchTool` / `WebSearchTool` / SSRF 判据 / 重定向守卫 / HTML→文本 / 内容编码解压）→ `permissions._irreversible_kind` 顶部的 web 分支 → `ToolRegistry.default()` 里加 `build_web_tools()`。
+  - **判据的支点在「先解析、再判结果 IP」**：判 `hostname` 字面量是漏的。本机实测 `localtest.me` 解析到 `127.0.0.1`（字面量里一点内网字样都没有）；`2130706433` / `0x7f000001` / `127.1` 是 127.0.0.1 的十进制/十六进制/短写法，本机 Windows 的 `getaddrinfo` 恰好拒掉它们，但那是**操作系统的行为**，Linux 上会正常解析 —— 安全判据不能建在「目标平台恰好也拒绝」上面。解析失败 → **拒绝**（fail-closed）。
+  - **`_is_internal` 的三处非显然判定（都是本机实测出来的，不是照抄文档）**：① `::ffff:100.64.0.1` 自己是 `is_private=False`/`is_reserved=False`，**只有拆开 `ipv4_mapped` 递归判**才拦得住；但 `::ffff:8.8.8.8` 必须放行，所以不能把整段 `::ffff:` 拉黑（两行都在判据表里）。② `100.64.0.0/10`（CGNAT）`is_private` 与 `is_reserved` 都是 False，得单列。③ NAT64（`64:ff9b::/96`）与 6to4（`2002::/16`）**整段**被 `is_reserved`/`is_private` 覆盖 —— 直接判会把合法映射一起拦掉，后果是纯 IPv6 + DNS64 网络上这两个工具**完全不可用**、且报的是「目标是内网/本机地址」这条**错误的**诊断。所以把内嵌的 IPv4 拆出来判（NAT64 在低 32 位、6to4 在第 16~48 位，位偏移取错就等于开一个洞，两种情况各钉了测试）。
+  - **拦截的位置与拦截本身一样重要**：判据排在发请求**之前**（测试用一个「被调用就炸」的传输层钉着），`_opener()` 真的装了 `_GuardedRedirectHandler`，且**每一跳重定向都重跑一遍判据**。真实验证用的是**真实攻击形态**：`https://httpbin.org/redirect-to?url=http://169.254.169.254/latest/meta-data/` —— 首跳是货真价实的公网地址、能过首轮判据，在跳转处被拦住（`HTTP 302: 重定向目标被拦截`）。**只数跳数不校验目标是完全不设防的：一次跳转就够了**（Python 移植版把 `MAX_REDIRECTS` 注释成「限制重定向次数防止 SSRF」，那个上限对 SSRF 一点用没有）。
+  - **接线是这一项的一半**：`permissions._irreversible_kind` 的 web 分支必须写在**取 `raw` 之前** —— 下面只取 `command`/`path`/`pattern` 三个键，web 工具的参数是 `url`/`query`，取不到就 `if not raw: return None` 直接返回。写在后面 = 两支永远不生效，**而这正好就是 M9-2 之前的原状**。有一条专门的变异体（「web 分支挪到取 raw 之后」）钉着这个位置。
+  - **注册进 `default()` 的副作用已兑现**：`eval/runner` 也拿到了这两个工具，README 的评估数字因此**不可比**，已重跑（见下）。
+  - **测试**：`test_tools.py` +73 例（SSRF 拦截/放行两张参数表、判据表、转换前缀取位表、fail-closed、拦截位置、重定向重校验与跳数上限、HTML→文本、内容编码 9 例、fetch 6 例、search 7 例）、`test_permissions.py` +6 例（**含一条不变量：三类不可逆动作各有一个触发工具真的在 `default()` 里**）。**449 全绿**。
+  - **变异测试 31/31 被抓住**（`m9verify/mutate_m9_2.py`）。三类失效模式各覆盖：判据漏格（CGNAT / ipv4_mapped / 转换前缀 / 6to4 位偏移 / 解析失败放行 / 协议不查）、拦截位置（判据挪到发请求之后 / 不装重定向处理器 / 重定向不重查）、接线（web 工具不归类 / 归错类 / 分支位置错 / 不进 `default()`）。
+  - **真跑挖出一个真 bug（单测没挖出来）**：抓 `python.org/downloads/release/python-3130/` 回来**一片乱码**。实测确认服务端在**我们没有请求压缩**的情况下回了 `Content-Encoding: gzip`（响应体以 `\x1f\x8b` 开头），而 `Content-Type` 是 `text/html; charset=utf-8` —— 于是 2MB 压缩字节顺利通过文本检查、被当正文解码后喂给模型。**乱码静默到达消费者**，正是本项目最忌讳的失效形态。修复：请求头加 `Accept-Encoding: identity`（减少该情况）+ `_decompress()` 真解压 gzip/deflate + **解压后同样封顶 `MAX_FETCH_BYTES`**（`MAX_FETCH_BYTES` 限的是读进来的字节，管不到解压之后 —— 几十 KB 的压缩炸弹能解出几 GB，两道限额缺一不可）+ **认不出的编码（`br`/`zstd`）如实报错，不退回原文**（退回原文等于把压缩字节当正文交出去）。`deflate` 在野外 zlib 包装与裸流两种实现都有，逐个试而不是猜一个。修复后真实复验：`m9verify/web/run_encoding.log` 记录了同一 URL 的**修复前（5100 字符替换字符）与修复后（`TITLE: Python Release Python 3.13.0 | Python.org` + 可读正文）**；另有一条端到端真跑（3 步 / 13,726 token / 缓存命中 70%）正确读出 `Release date: Oct. 7, 2024` 并写入 `release.md`。
+  - **真实 LLM 端到端跑了四条**（DeepSeek 官方通路，工作区 `m9verify/web/`）：① 搜索→抓取→写入→读回（5 步 / 19,964 token / 命中 75%），产出的 `facts.md` 逐条对着来源核过；② 污染天花板：`hidden_text` 规则把 taint 抬到 high 后，`web_fetch` 与 `web_search` 被拒（0ms），模型转而用 `ask_user` 给出可执行的 `--clear-taint` 路径；③ `--resume --clear-taint` 解除天花板后完成（13 步 / 76,259 token / 命中 87%）；④ 上面的内容编码复验。
+  - **如实说明（一）：默认搜索后端 `ddg` 在本机没有真跑校准过**。`lite.duckduckgo.com` 直连超时（8.2s）、走本机代理 SSL EOF（7.6s），两条路都不通（实测 2026-09-11）。默认选 `ddg` 是**对齐 TS 原版**（`web-search.ts` 走 DDG Lite）的刻意选择，不是因为它在本机好用；DDG 的解析正则按已知页面结构写，**没有对着真实响应校准**，代码注释与这里都如实标注，而不是让它看起来像验证过。真跑验证走的是 `CODEAGENT_SEARCH_BACKEND=bing`（Bing 解析是照着 98KB 真实响应写的）。
+  - **如实说明（二）：一个只读并发批里，外发与污染读的判定有先后**。观察到的现象：第 2 步的 `web_search` 与那一步产生污染的 `read` 在**同一批**里并发执行，于是这次外发是按**批前**的污染级别判的。这是并发调度的物理顺序，不是漏洞（同一批里的调用本来就互为并发，没有"谁先"可依据），但它确实看起来像一个洞，所以写在这里、也写进 `docs/TECH_SPEC.md`。要严格堵住只能在批内串行判定并让整批重判，代价是只读并发这一条被废掉 —— 不值得。
+
+### 第二批 · 兑现承诺 / 天然搭配
+
+- [ ] **M9-3 ⑦ fork + rename**：fork 挂在**我们的 step 级检查点**上 —— 可以从**任意一步**分叉，而 TS 的 fork 是**会话级**的。这是个能讲出真实差异、成本又低的点
+- [ ] **M9-4 ⑩ MCP 远程 HTTP + resources/prompts**：面试稿 §10「下一步」第一条**已经承诺了** HTTP/SSE，做了就是兑现；且「协议层复用、只换传输」正是分层设计的证明
+
+### 第三批 · 需要前置
+
+- [ ] **M9-5 常驻交互模式（REPL）** —— ④⑤ 的**硬前置**
+  - 现状核实（2026-09-11）：`app/cli.py` 是**单发**的，没有 `while True` / `input()` / REPL，跑完即退
+  - 「跨回合自动推进」「每 N 分钟重复提示词」在一次性进程里**没有意义**，所以 ④⑤ 排在这里之后
+  - 顺带收益：面试稿 §12 的演示动线不再全是单发命令
+- [ ] **M9-6 ④ Goal**：进程内 Goal + 暂停/恢复 + **显式完成检查**（后者的判分思路与我们的评估层呼应）
+
+### 压轴 · 价值最高，但唯一会动核心循环契约
+
+- [ ] **M9-7 ② sub-agent 并发 3 + wait/close**
+  - 现状：工具协议是「同步 `execute` → `ToolResult`」（`agent/tools/base.py`），要引入「后台任务 + 句柄」就得**改这个契约**
+  - 还要与已有的「只读并发 / 写串行」语义协调，并防递归（我们现在的做法是 `_restricted_registry` 永不包含 subagent 自身，从结构上禁掉）
+  - 形状参照 `agents/manager.ts`：并发上限 + `wait` + `close` + 独立上下文 + 受限工具集 + 可取消
+  - **这是简历上最值钱的一条**（多智能体编排是 Agent 岗最热的考点），但它不该是起步项
+
+### 明确不做（理由留痕）
+
+- **⑥ 全屏 TUI**：纯终端渲染的体力活，面试加分有限；我们已有 Streamlit 控制台可演示（且已在真实浏览器里跑通过）
+- **⑤ Loop**：价值低（本质是个定时器）；REPL 做出来之后顺手做，**不单独排期**
+- **⑧ context collapse**：**测过同类机制收益不达预期，所以不做**。分级截断与本项同为「改动 `_PREFIX_LEN` 之后窗口」的机制，实测（P7-d）：单次省 5,128 token ↔ 多付 **45,304 miss token（8.8 倍）**，代价形状是后缀失效。这与我们**唯一的缓存亮点**直接冲突 —— 拿一个反例数据说明「不做」，比照着原版补上更值得讲
+
+---
+
 ## 进度快照
 
-- 当前里程碑：**M8 完成**（P1–P7 全部完成；四项真实验证已跑，见上节）
+- 当前里程碑：**M9 进行中**（第一批 M9-1、M9-2 已完成并真跑验证；下一项 M9-3 fork + rename）
+- 上一里程碑：**M8 完成**（P1–P7 全部完成；四项真实验证已跑，见上节）
 - 上一里程碑：**M7 完成**（M7-1~M7-6 + Part C 全部完成；四条真实 LLM 端到端验证 V1–V4 已全跑，工作区 `m7verify/`、`m7verify-nolock/` 已 gitignore）
-- 代码状态：**6,278 行源码 / 24 模块 / 340 测试全绿**（`python -m pytest tests/` → `340 passed`）
+- 代码状态：**7,175 行源码 / 25 模块 / 449 测试全绿**（`python -m pytest tests/` → `449 passed`）
   - 口径：源码 = `agent/` + `app/` + `eval/` 里被 git 跟踪的 `.py` 行数（不含 `eval/repos/` 克隆仓）；模块数 = 其中非空的 `.py` 文件数
 - **M8 期间发现并修复的真 bug（真跑挖出来的，不是单测挖的）**：
   1. **`update_plan` 的引导缺失（elicitation gap）**：工具实现了、测试全绿、计划也能落盘 —— 但 system prompt 里**一个字都没提它**，模型 6 步跑完一次都没调。修法：prompt 里写明"任务复杂时先调 `update_plan` 排一份 3~6 步的简短计划"。修前 0 次 / 修后 2 次（同 P7-c 表）

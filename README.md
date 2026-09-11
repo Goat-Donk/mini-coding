@@ -4,8 +4,7 @@
 **核心循环手写**（不套 LangGraph / Agent SDK），支撑层用成熟库（openai SDK / pydantic v2 / streamlit / typer / pytest）。
 
 > **一句话**：把 Claude Code 的架构用 Python 重写一遍——不是移植代码，是移植设计。
-> 6,278 行源码 / 24 个模块 / 340 个测试。真实跑分见[评估章节](#评估eval)。
-
+> 7,175 行源码 / 25 个模块 / 449 个测试。真实跑分见[评估章节](#评估eval)。
 📄 文档：[技术方案 `docs/TECH_SPEC.md`](docs/TECH_SPEC.md) · [架构详解 `docs/architecture.md`](docs/architecture.md) · [任务清单 `TASKS.md`](TASKS.md) · [参考笔记 `docs/reference/`](docs/reference/)
 
 ---
@@ -25,8 +24,10 @@
 | **MCP 客户端** | 手写 MCP stdio 客户端接入标准 MCP server；**第三方工具照样过权限与 hooks**，且**默认不放行**——必须列进 `mcp.json` 的 `allow` 才免确认 | MCP（工具接入标准） |
 | **第三方工具授权** | `Tool.is_external()` → 权限引擎单独归类，默认 `ask`（无交互确认 → 拒绝），拒绝文案带出处与解除方式；子进程环境按名清洗凭据类变量 | 权限与安全审查 |
 | **注入文本检测 + 会话污染标记** | `agent/security.py` 对已知文本模式做**概率性**检测（只出告警）；`high` 标记让**三类不可逆动作**（网络外发 / 读凭据 / 写记忆文件）在 `PermissionsEngine` 的**后置天花板**上从 allow 降为 ask —— 该位置在记忆之后，`allow_always` 短路不了它 | 权限与安全审查 |
+| **联网工具 + SSRF 拦截** | `web_fetch` / `web_search` 两个工具；**先解析域名再判结果 IP**（判 hostname 字面量是漏的），解析失败即拒绝；`::ffff:` 映射、CGNAT、NAT64/6to4 内嵌地址都拆开判；**每一跳重定向都重查**（只数跳数不校验目标等于不设防）。顺带让上面那条天花板的「网络外发」第一次有了真实对象 | WebFetch / WebSearch |
 | **提问暂停 / 续答** | 信息不足时 agent 调 `ask_user` **停下**并把问题打出来；`--resume "你的回答"` 把回复送进会话接着跑。「打断」是**数据标志**（`ToolResult.await_user`）而非阻塞控制流，所以 headless 评测只要不注册这个工具就完全不受影响 | `ask_user` 工具 / 澄清提问 |
 | **skills 渐进披露** | 工作区放 `SKILL.md`，**只有 name + 简介**进 system prompt，正文由 `load_skill` 按需取 —— 装 50 个 skill 也不额外占常驻 token | Skills（渐进披露） |
+| **改动前复核** | `Tool.preview()` 在**写盘之前**产出 diff 交给权限确认（`edit` / `write`），权限从「事后报告」变「事前审批」；`--review-edits` 打开交互确认。diff 与执行**共用同一份匹配语义**，不会出现「预览说能改、执行说不唯一」 | 权限确认带 diff（事前审批） |
 | **计划清单跨回合** | `update_plan` 写 `state.plan`，**随检查点落盘**：中途 kill 或换会话续跑都不丢；`--plan` 可无 key 直接查看。每次传**完整清单**（不是增量），状态只有一个写入者 | TodoWrite / 计划清单 |
 | **工具输出分级截断** | compact 流水线的**第 0 级**：按工具给不同预算先缩内容，缩不够才删消息；`grep`/`pytest` 的**结论在尾部**，所以是 head 70% + tail 30% 而不是只留头部；**失败结果给更大预算**（错误原文是模型自修复的依据）。**只在越过 warning 线时才跑**，低于阈值逐字节不碰（保住前缀缓存）| 上下文分级截断 |
 
@@ -105,6 +106,7 @@ flowchart TB
         BASE["base.py<br/>Tool 基类 + pydantic schema"]
         BASH["bash.py<br/>沙箱 + 危险命令拦截"]
         FILES["files.py<br/>read · write · edit · glob · grep"]
+        WEB["web.py<br/>web_fetch · web_search<br/>+ SSRF 拦截"]
         SUB["subagent.py<br/>research 子代理（只读）"]
         ASK["ask.py<br/>ask_user 提问暂停"]
         PLAN["plan.py<br/>update_plan 计划清单"]
@@ -127,6 +129,7 @@ flowchart TB
     LOOP --> BASE
     BASE --> BASH
     BASE --> FILES
+    BASE --> WEB
     BASE --> SUB
     BASE --> ASK
     BASE --> PLAN
@@ -204,6 +207,21 @@ python -m app.cli --plan                 # 只看最近会话的**任务计划�
 python -m app.cli --mcp .codeagent/mcp.json "任务"   # 加载 MCP server（第三方工具）
 ```
 
+**联网任务**：`web_fetch` / `web_search` 默认就在工具集里（`ToolRegistry.default()`）。
+
+```bash
+CODEAGENT_SEARCH_BACKEND=bing python -m app.cli "查一下 Python 3.13 的发布日期并写进 release.md"
+```
+
+> **默认搜索后端是 `ddg`（对齐 TS 参考实现），但它在境内网络下连不通**：`lite.duckduckgo.com`
+> 直连超时、走代理 SSL 中断（本机实测两种都试过）。所以真要用联网，先 `CODEAGENT_SEARCH_BACKEND=bing`。
+> 说清楚一件事：**DDG 那条解析路径没有对着真实响应校准过**（连不上就没法校准），Bing 的解析才是照着
+> 真实响应写的。这个事实写在代码注释和 `TASKS.md` 里，而不是让它看起来像验证过。
+>
+> `web_fetch` 会拦内网地址（本机/私网/云元数据端点/CGNAT/内网 IPv6，含 `::ffff:`、NAT64、6to4 的
+> 内嵌地址），**每一跳重定向都重查一遍**，域名解析失败一律拒绝。它拦的是「打内网」，不是「防注入」——
+> 数据外发那条线由权限层的污染天花板管（`high` 时这两个工具也要人工确认）。
+
 CLI 的事件日志是**实时流式**的：工具调用一发生就打一行（`[步 3] ✓ bash(command=python -m pytest -q) [1200ms]`），
 bash 退出码非 0 会额外标 `[exit code: N]`，不用等任务结束才看到进度。
 
@@ -212,6 +230,20 @@ CLI 的每一次工具调用都**统一过权限引擎与 hooks**（和 Streamli
 而 CLI 没有交互确认，于是按安全默认**拒绝**并把理由回喂模型；路径越界沙箱则直接 `deny`。
 hooks 侧是 block-at-submit：`git commit` 在 `data/tests_pass.marker` 不存在时被拦下，
 marker 由 `PostToolUse` 在**测试命令真跑成功**（退出码 0）时自动写入、失败时清除。
+
+**改动前复核（`--review-edits`）**：加上这个开关，`edit` / `write` 会把**将要写下去的 diff** 显示出来等你选
+（1 允许一次 / 2 本回合允许 / 3 一直允许 / 4-6 对应拒绝；直接回车 = 拒绝）。diff 取自 `Tool.preview()`
+——**在 `permissions.check()` 之前**取，所以人看到它时磁盘上还是旧内容；匹配不上时显示的是失败原因
+（"old_string 匹配到 3 处"）而不是空白。
+
+```bash
+python -m app.cli "修掉 calc.py 里的减法 bug" --review-edits
+```
+
+> **为什么是开关而不是默认**：TS 参考实现的 `edit` 是默认要批准的（靠 TTY 模式兜住），
+> 而**我们的 CLI 没有交互确认**——把 `edit` 改成默认 `ask` 会让每次改动都退化成拒绝、整条 CLI 不可用。
+> 所以默认值留在 `allow`，需要复核时再打开。同理，默认路径下这个 diff **到不了人眼前**，
+> 它只在 `--review-edits`、污染天花板收紧、或显式规则把工具抬成 `ask` 这三条路上出现。
 
 **接 MCP server**（复制 [`mcp.example.json`](mcp.example.json) 为 `.codeagent/mcp.json`）：
 
@@ -275,11 +307,11 @@ dcf0a013  fix: correctly handle falsy values in LRUCache
 
 ```
 $ python -m eval.runner --limit 2
-完成率 50%（1/2 个有效任务） · token 62,812 · 估算成本 ¥0.0625 · 平均缓存命中率 83%
+完成率 50%（1/2 个有效任务） · token 82,495 · 估算成本 ¥0.0769 · 平均缓存命中率 82%
 
-  ✗ 770486ff  fix: freeze unhashable args in Query.test…    8步 30935t ¥0.030  22.5s
-  ✓ e70f9b1d  fix: correct Table.update transform type hints 8步 31877t ¥0.033  15.5s
-报告已存: data/eval/report-20260910-192731.json
+  ✗ 770486ff  fix: freeze unhashable args in Query.test…    8步 45961t ¥0.041  21.2s
+  ✓ e70f9b1d  fix: correct Table.update transform type hints 8步 36534t ¥0.036  18.3s
+报告已存: data/eval/report-20260911-112304.json
 ```
 
 判定依据（judge 跑隐藏测试的真实输出，已落进报告）：
@@ -291,7 +323,8 @@ $ python -m eval.runner --limit 2
 
 > **口径说明（必读）**：
 > - 本组数字来自**项目选定通路**（DeepSeek 官方，代码默认值即此），缓存命中率是官方 `usage.prompt_cache_hit_tokens` / `(hit+miss)` 的**原生口径**。
-> - 早期曾用 DashScope（阿里百炼）的 OpenAI 兼容端点 + `deepseek-v4-flash` 做过一次临时验证（同一批任务：1/2 完成、269,767 token、命中率 89%）。那是**临时手段、已弃用**，两组的命中率口径不同、数值不可直接比。同样的任务在官方 `deepseek-chat` 上步数与 token 都显著更低（12/25 步 → 8/8 步，269.8k → 62.8k token），但**样本只有 2 个任务，不足以支撑"某模型更强"的结论**，仅作记录。
+> - **这组数字在 M9-2 之后重跑过，与之前的 62,812 / ¥0.0625 / 83% 不可直接比**：M9-2 把 `web_fetch` / `web_search` 注册进了 `ToolRegistry.default()`，而 eval 用的就是这个 `default()` —— 于是两个工具的 schema 进了每次请求的 tools 段，token 从 62.8k 升到 82.5k（+31%）。**判定结论一字未变**（两个任务的 judge 输出完全相同：`1 failed, 32 passed` / `109 passed`）。这是「给 agent 加能力」的诚实代价：能力不是免费的，多两个工具的 schema 就要多付 token。
+> - 早期曾用 DashScope（阿里百炼）的 OpenAI 兼容端点 + `deepseek-v4-flash` 做过一次临时验证（同一批任务：1/2 完成、269,767 token、命中率 89%）。那是**临时手段、已弃用**，两组的命中率口径不同、数值不可直接比。同样的任务在官方 `deepseek-chat` 上步数与 token 都显著更低（12/25 步 → 8/8 步，269.8k → 62.8k token，M9-2 后为 82.5k），但**样本只有 2 个任务，不足以支撑"某模型更强"的结论**，仅作记录。
 > - 本机 agentrouter 的 key 走不通（它只放行 Claude Code 客户端，自写程序一律 `401 unauthorized client detected`，实测 6 种认证头组合 × 2 个端点全部 401）。要接自己的程序，用官方 API key。
 > - **换自己的 key 重跑即可复现**：`python -m eval.runner --limit 2`。
 
@@ -307,15 +340,15 @@ $ python -m eval.runner --limit 2
 
 | 层 | 文件 | 行数 |
 |---|---|---|
-| 核心循环 | `agent/loop.py` `llm.py` `state.py` `context.py` `tool_result.py` `session.py` | 1,758 |
-| 治理 | `agent/permissions.py` `hooks.py` `memory.py` `security.py` | 1,434 |
+| 核心循环 | `agent/loop.py` `llm.py` `state.py` `context.py` `tool_result.py` `session.py` | 1,833 |
+| 治理 | `agent/permissions.py` `hooks.py` `memory.py` `security.py` | 1,499 |
 | 技能 | `agent/skills.py` | 271 |
-| 工具 | `agent/tools/base.py` `bash.py` `files.py` `subagent.py` `ask.py` `plan.py` `skills.py` | 1,097 |
+| 工具 | `agent/tools/base.py` `bash.py` `files.py` `web.py` `subagent.py` `ask.py` `plan.py` `skills.py` | 1,771 |
 | MCP | `agent/mcp.py` | 386 |
-| 入口 | `app/cli.py` `ui_streamlit.py` `replay.py` | 842 |
+| 入口 | `app/cli.py` `ui_streamlit.py` `replay.py` | 925 |
 | 评估 | `eval/golden_tasks.py` `runner.py` | 490 |
-| **源码合计** | **24 个模块** | **6,278** |
-| 测试 | `tests/` | 6,115（340 个用例） |
+| **源码合计** | **25 个模块** | **7,175** |
+| 测试 | `tests/` | 7,440（449 个用例） |
 
 > 口径：源码 = `agent/` + `app/` + `eval/` 里**被 git 跟踪**的 `.py` 行数（不含 `eval/repos/` 下的克隆仓，它被 gitignore）；模块数 = 其中**非空**的 `.py` 文件数（4 个空 `__init__.py` 不计）。
 
