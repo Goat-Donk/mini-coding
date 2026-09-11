@@ -4,7 +4,7 @@
 **核心循环手写**（不套 LangGraph / Agent SDK），支撑层用成熟库（openai SDK / pydantic v2 / streamlit / typer / pytest）。
 
 > **一句话**：把 Claude Code 的架构用 Python 重写一遍——不是移植代码，是移植设计。
-> 7,175 行源码 / 25 个模块 / 449 个测试。真实跑分见[评估章节](#评估eval)。
+> 7,728 行源码 / 25 个模块 / 482 个测试。真实跑分见[评估章节](#评估eval)。
 📄 文档：[技术方案 `docs/TECH_SPEC.md`](docs/TECH_SPEC.md) · [架构详解 `docs/architecture.md`](docs/architecture.md) · [任务清单 `TASKS.md`](TASKS.md) · [参考笔记 `docs/reference/`](docs/reference/)
 
 ---
@@ -17,6 +17,7 @@
 |---|---|---|
 | **cache-aware 上下文布局** | 稳定前缀（system+task 固定不动）+ 三级 compact，让 DeepSeek 磁盘缓存持续命中；控制台实时画命中率与省钱曲线 | TOKEN_BUDGET / CONTEXT_COLLAPSE |
 | **step 级检查点 / 崩溃恢复** | 每 N 步原子落盘 state，`--resume` 从最近检查点**接着 step 计数**续跑；任务中途 kill 进程不丢进度。**节拍随会话落盘**：`--resume` 不带 `--checkpoint-every` 时沿用会话当初的值，并把生效值打出来 | `/resume` |
+| **step 级分叉 / 会话命名** | `--fork --step K` 从**任意一步**另开一条路（TS 原版的 fork 是**会话级**的，只能从"现在"复制）；`--rename` 给人看得懂的名字，`--sessions` 列出名字 / 步数 / 分叉来源。会话 id **或名字**都能用来 `--resume`。**是对话分叉不是工作区分叉**：文件不回滚到第 K 步，CLI 会明确打出来 | `/fork` · `/rename` · `/resume` |
 | **block-at-submit hooks** | `PreToolUse` 包裹 `git commit`，`data/tests_pass.marker` 不存在就**阻断**——逼 agent 进入「测试并修复」循环；marker 只在**测试命令真跑成功**时由 `PostToolUse` 写入，失败即清除 | Hooks（block-at-submit） |
 | **真·轨迹驱动评估** | 从 tinydb 真实 git history 挖 bug 修复提交构造黄金任务，隐藏测试判分，出完成率/成本回归报告 | SWE-bench 思路 |
 | **分层记忆 + 自进化** | `CODEAGENT.md` / `CLAUDE.md` / `.codeagent/rules/*.md` 分层 + `@include` + hash 去重 + 预算；任务后提取约定写回，**下次会话自动生效** | CLAUDE.md 机制 |
@@ -204,6 +205,10 @@ python -m app.cli --resume               # 从最近检查点续跑（配合 Ctr
 python -m app.cli --resume --clear-taint # 复位污染标记（误报被收紧时用它解锁）
 python -m app.cli --resume "补充的信息"   # 回答 agent 的提问后续跑（agent 调 ask_user 停下来时）
 python -m app.cli --plan                 # 只看最近会话的**任务计划清单**后退出（不需要 API key）
+python -m app.cli --sessions             # 列出会话：名字 / 步数 / 分叉来源（不需要 API key）
+python -m app.cli --rename "基线方案"      # 给最近会话起名（只动元数据，不需要 API key）
+python -m app.cli --fork --step 3 "换个思路"   # 从第 3 步分叉出新会话并续跑（对话分叉，不动工作区文件）
+python -m app.cli --resume --session-id "基线方案" "接着改"   # 会话 id **或名字**都能指会话
 python -m app.cli --mcp .codeagent/mcp.json "任务"   # 加载 MCP server（第三方工具）
 ```
 
@@ -340,15 +345,15 @@ $ python -m eval.runner --limit 2
 
 | 层 | 文件 | 行数 |
 |---|---|---|
-| 核心循环 | `agent/loop.py` `llm.py` `state.py` `context.py` `tool_result.py` `session.py` | 1,833 |
+| 核心循环 | `agent/loop.py` `llm.py` `state.py` `context.py` `tool_result.py` `session.py` | 2,228 |
 | 治理 | `agent/permissions.py` `hooks.py` `memory.py` `security.py` | 1,499 |
 | 技能 | `agent/skills.py` | 271 |
 | 工具 | `agent/tools/base.py` `bash.py` `files.py` `web.py` `subagent.py` `ask.py` `plan.py` `skills.py` | 1,771 |
 | MCP | `agent/mcp.py` | 386 |
-| 入口 | `app/cli.py` `ui_streamlit.py` `replay.py` | 925 |
+| 入口 | `app/cli.py` `ui_streamlit.py` `replay.py` | 1,083 |
 | 评估 | `eval/golden_tasks.py` `runner.py` | 490 |
-| **源码合计** | **25 个模块** | **7,175** |
-| 测试 | `tests/` | 7,440（449 个用例） |
+| **源码合计** | **25 个模块** | **7,728** |
+| 测试 | `tests/` | 8,022（482 个用例） |
 
 > 口径：源码 = `agent/` + `app/` + `eval/` 里**被 git 跟踪**的 `.py` 行数（不含 `eval/repos/` 下的克隆仓，它被 gitignore）；模块数 = 其中**非空**的 `.py` 文件数（4 个空 `__init__.py` 不计）。
 
@@ -370,7 +375,7 @@ coding_agent/
 ├── eval/                  # 黄金任务集 + 回归 runner
 ├── tests/                 # pytest（每模块一个文件）
 ├── workspace/             # 演示工作区（.gitignore）
-└── data/                  # 轨迹 / 检查点 / 报告（.gitignore）
+└── data/                  # 轨迹 / 检查点 / 会话元数据 / 报告（.gitignore）
 ```
 
 ---

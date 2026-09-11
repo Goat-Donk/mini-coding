@@ -4,7 +4,7 @@
 
 ## 项目定位
 
-求职作品集：**CodeAgent** —— 参考 [pengchengneo/Claude-Code](https://github.com/pengchengneo/Claude-Code) 源码架构，用 Python 从零实现的小型 AI Coding Agent（7,175 行 / 25 模块 / 449 测试）。核心循环手写（不套 Agent SDK），支撑层用成熟库（openai / pydantic / streamlit / typer / pytest）。差异化：cache-aware 上下文 + 缓存省钱指标、step 级检查点恢复、block-at-submit hooks、轨迹驱动评估（真实 tinydb 提交 + 隐藏测试）、记忆自进化、MCP 工具接入、注入文本检测 + 会话污染天花板、联网工具 + SSRF 拦截、skills 渐进披露、计划清单跨回合、提问暂停/续答、改动前 diff 复核。
+求职作品集：**CodeAgent** —— 参考 [pengchengneo/Claude-Code](https://github.com/pengchengneo/Claude-Code) 源码架构，用 Python 从零实现的小型 AI Coding Agent（7,728 行 / 25 模块 / 482 测试）。核心循环手写（不套 Agent SDK），支撑层用成熟库（openai / pydantic / streamlit / typer / pytest）。差异化：cache-aware 上下文 + 缓存省钱指标、step 级检查点恢复 + **step 级分叉/会话命名**、block-at-submit hooks、轨迹驱动评估（真实 tinydb 提交 + 隐藏测试）、记忆自进化、MCP 工具接入、注入文本检测 + 会话污染天花板、联网工具 + SSRF 拦截、skills 渐进披露、计划清单跨回合、提问暂停/续答、改动前 diff 复核。
 
 > 数字口径（改数字时请沿用）：**源码 = `agent/` + `app/` + `eval/` 里被 git 跟踪的 `.py` 行数**（不含 `eval/repos/` 的克隆仓，它被 gitignore）；**模块数 = 其中非空的 `.py` 文件数**（4 个空 `__init__.py` 不计）；**测试 = `tests/` 行数 / pytest 用例数**。
 
@@ -27,6 +27,17 @@
 - **分级截断**：compact 流水线的**第 0 级**（分级截断 → 确定性 snip → LLM 摘要）。**只在 utilization ≥ 0.70 时才跑，这是不变量不是优化开关**：低于阈值必须逐字节不碰，否则每个大工具结果都会破坏一次前缀缓存。破坏它是**静默的**（没有报错，只有一条走平的缓存命中曲线和更贵的账单），所以有一条「utilization < 0.70 时消息逐字节不变」的测试钉着。**实测结论对设计不利，别只讲设计**：端到端命中率没降（A/B 差 ±0.02% 以内），但单次截断要付 **8.8 倍**的 miss token（后缀失效，截得越靠前越贵，差 3.8 倍），且**免不掉第 1/2 级**。**去留已拍板（2026-09-11）：保持现状**（代价被同一步的 LLM 摘要遮蔽，不值得为微观那 8.8 倍改取向；也不选"优先截最靠后的"——那会先丢最老的上下文）。数据在 `TASKS.md` P7-d。
 - **计划清单**：`update_plan` 写 `state.plan`（随检查点走）。**每次传完整清单**，状态只有一个写入者。**不要每轮把 plan 注入 messages** —— 计划一变就改一段消息、那段之后的缓存全失效；可见性靠工具结果本身，只在 `--resume` 时补投一次。
 - 这四项的变异测试结果（逐条打断机制、确认对应测试变红）：见 `TASKS.md`。
+
+**已做 M9-3 会话分叉 + 命名（`--fork` / `--rename` / `--sessions`）**，机制是：
+- **分叉挂在 step 级检查点上**（与 TS 原版的差别）：它的 `/fork` 是**会话级**的，我们可以 `--fork --step K` **回到任意一步**再开一条路 —— 检查点本来就逐步落，这能力是现成的。
+- **它是对话分叉，不是工作区分叉。** 工作区文件**不会**回滚到第 K 步，分叉后的 agent 看到的是**当前**工作区 —— 我们**没有**工作区快照机制（`grep rewind|snapshot` 在 `agent/ app/` 下零命中）。CLI 分叉后把这句打印出来、`--fork` 的 help 也写明。**别把这条说漏**，否则"回到第 3 步"几乎必然被读成文件也回去了。
+- fork 搬三样，都以 fork 点为界：检查点 `step-1..K`、**轨迹里 `step <= K` 的行**（整份复制会让分叉会话"继承"源会话在 K 之后才发生的 `security_finding`）、`forked_from`。**副本里唯一按新会话重写的是 `session_id`**（今天 `load_state` 会 pop 掉所以无害，但谁哪天直接读 `payload["session_id"]` 就会拿到源会话）。
+- **`--sessions` 是这一项的另一半，不是附赠**：没有它，`--rename` 写的名字与 `--fork` 记的血统**没有任何消费者** —— 正是本项目记录在案的头号缺陷类。清单的键集合取「检查点目录 ∪ `data/sessions/*.jsonl`」，所以**跑到一半被 kill、还没到第一个检查点的会话也在里面**。
+- **名字的两条判据合起来才成立**：写入侧 `validate_name` 拒绝「与任何已有 session_id 或会话名相同」，读取侧 `resolve_session` **先当 id、再当名字**。少了写入侧的拒绝，重名会让 `--resume --session-id <名字>` **安静地跑到另一个会话上**（带着另一个任务的上下文）；名字等于某个 id 时那个 id 就永远解析不到自己。所以不去读取侧加优先级"猜"。
+- **`update_meta` 是合并式**（read → update → 原子写）不是覆盖式：`--rename` 只该改名字，覆盖会静默抹掉 `forked_from`。**`read_meta` 与 `session_name` 对坏 meta 的反应刻意不同**：前者抛（名字是真丢了，静默返回 `{}` 会让人以为"我从没起过名字"从而重起一个），后者返回 `None`（调用方只是要个显示名），`--sessions` 逐行标 `meta_error`。
+- **`--rename` / `--sessions` / `--fork`（不带任务）都不构造 LLM、不需要 key**，dispatch 排在 `_build_llm` 之前；测试用"`_build_llm` 一被调用就炸"的替身钉住（靠"本机没配 key 也过了"来测会在有 `.env` 时假装通过）。**不带任务就退出**是刻意的：分叉零成本、续跑要花钱，且上面已打出可直接粘贴的续跑命令。
+- CLI 侧把"取会话 id"收成 `_resolve_sid` **一处**：原先 `_print_plan` 与 `--resume` 各写一遍，加名字解析时只改一处、另一处照旧忽略就是漂移。
+- 变异测试与真跑数字见 `TASKS.md` 的 M9-3 条目。
 
 **模块 docstring 要注明机制出处**（先例 `agent/tool_result.py`、`agent/tools/plan.py`），与本项目「参考与来源」的惯例一致。
 
@@ -67,7 +78,7 @@
 | 工具结果 | agent/tool_result.py | 超大工具结果落盘 + 预览替换 + 批预算（M3） |
 | 权限 | agent/permissions.py | once/turn/always 决策粒度 + 黑名单 + 沙箱 + 确认文案带 `details`（M2·M9） |
 | 钩子 | agent/hooks.py | Pre/PostToolUse + block-at-submit（marker 由测试成功自动写）（M2） |
-| 会话 | agent/session.py | JSONL 轨迹 + 检查点 + resume（M3） |
+| 会话 | agent/session.py | JSONL 轨迹 + 检查点 + resume + **step 级分叉 / 会话命名 / 清单**（M3·M9-3） |
 | 记忆 | agent/memory.py | 分层指令文件(@include+去重+预算) + 提取 + 简化 consolidation（M4） |
 | 技能 | agent/skills.py | SKILL.md 渐进披露：只把 name+简介进 system prompt，正文由 load_skill 按需取（M8） |
 | 安全 | agent/security.py | 注入文本检测（**概率性，只出告警**）+ 会话级污染标记 + 来源框架（M7） |
@@ -85,6 +96,10 @@ python -m app.cli "任务"                      # 真实 DeepSeek（需 .env 配
 python -m app.cli --resume                   # 从最近检查点续跑（配合 Ctrl+C 演示）
 python -m app.cli --plan                     # 只看最近会话的**任务计划清单**后退出（无 key 也能跑）
 python -m app.cli --resume "补充的信息"       # 回答 agent 的提问后续跑（配 --session-id 更稳）
+python -m app.cli --sessions                 # 列出会话：名字/步数/分叉来源（无 key）
+python -m app.cli --rename "基线方案"          # 给最近会话起名（只动元数据，无 key）
+python -m app.cli --fork --step 3 "换个思路"   # 从第 3 步分叉出新会话并续跑（对话分叉，见下）
+python -m app.cli --resume --session-id "基线方案" "接着改"   # 会话 id **或名字**都能用来指会话
 python -m app.cli "任务" --review-edits       # 改动前人工确认：edit/write 先显示 diff（M9-1）
 CODEAGENT_SEARCH_BACKEND=bing python -m app.cli "查 X 并写进文件"   # 联网任务（默认后端 ddg 本机连不上，见下）
 python -m app.cli --mcp .codeagent/mcp.json "任务"   # 加载 MCP server（见 mcp.example.json）
@@ -92,6 +107,9 @@ python -m eval.golden_tasks --clone --limit 10       # 拉 tinydb 并列出真�
 python -m eval.runner --limit 3              # 跑黄金任务出回归报告（--mock 无 key 冒烟）
 streamlit run app/ui_streamlit.py            # 控制台（指标 + 权限按钮 + 检查点回放）
 ```
+
+> ⚠️ **别再给 pytest 传第二个 `-q`**：`pyproject.toml` 的 `addopts` 里已经有一份，命令行再传一份就是 **`-qq`**，而 pytest 在这个详细度下**根本不打印最后那行 `NNN passed in …`** —— 进度点照打、退出码照对，只有那行给人看的结论没了。要看汇总：不传 `-q`，或写 `-o addopts="" -q`。
+> 2026-09-11 在这上面栽过：一份全量日志以 `[100%]` 结尾，我把它读成「汇总行被 streamlit 接管 stdout 吞了」，还照这个结论往 `tests/conftest.py` 加了个空转的 fixture（现已撤销）。**先怀疑自己的调用方式，再怀疑库。**
 
 > 本机跑真实任务前先 `export NO_PROXY="localhost,127.0.0.1,api.deepseek.com"` 并 unset `HTTPS_PROXY`（DeepSeek 官方是境内服务，走代理会绕远）。
 > CLI 已支持**事件实时流式打印**（工具调用一发生就打，不用等任务结束）。

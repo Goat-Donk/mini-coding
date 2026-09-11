@@ -144,7 +144,7 @@ flowchart LR
 `BaseLLM` 两个实现，**接口完全一致**，所以循环、子代理、评估层共用一套代码：
 
 - `DeepSeekClient`：走 openai SDK（DeepSeek 兼容 OpenAI 协议），`chat()` 返回 `LLMResult(content, tool_calls, usage)`，`complete()` 给 compact 摘要用。
-- `MockLLM`：`script(*responses)` 脚本化响应序列 / `text("...")` 固定响应 / `tool_then_text(...)`。**测试与无 key 演示都靠它**——340 个测试全部离线，不打网络。
+- `MockLLM`：`script(*responses)` 脚本化响应序列 / `text("...")` 固定响应 / `tool_then_text(...)`。**测试与无 key 演示都靠它**——482 个测试全部离线，不打网络。
 
 `Usage` 里单独保留 `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`——这是 DeepSeek 磁盘缓存的**实测**字段，整个缓存命中率指标和成本估算都建立在它之上（不是估算出来的）。
 
@@ -242,6 +242,31 @@ sequenceDiagram
 **续跑不重置 step 计数**——恢复的 `state.step` 继续推进，所以续跑产生的检查点不会覆盖恢复前的同名文件，轨迹里也没有歧义。
 
 **节拍也是会话的事实**：`checkpoint_every` 随检查点落盘，`--resume` 不带这个参数时**沿用该会话当初的值**，不是回落 CLI 的默认 5。优先序是「显式传参 > 会话里记的 > 默认」，CLI 会把实际生效的节拍打印出来。这一条是 M8 真跑挖出来的第二半：第一半（`--resume --checkpoint-every 1` 传了不生效）更显眼，而这一半的代价同样是**静默**的——5 凑巧也是个合法节拍，命令成功、退出码 0，唯一证据是检查点数不涨。老检查点没有这个字段 → 回落默认；字段被手改坏 → 同样回落，**不夹成 1**（那会让一个已损坏的检查点变成"每步都写"）。
+
+#### 分叉与命名（M9-3）
+
+检查点是**逐步**落的，所以「回到第 K 步另开一条路」是现成能力 —— TS 原版的 `/fork` 是**会话级**的（整段复制、从"现在"接着走），我们挂在 step 级检查点上，可以指定**任意一步**。
+
+```bash
+python -m app.cli --sessions                        # 列出会话：名字 / 步数 / 分叉来源
+python -m app.cli --rename "基线方案"                # 给最近会话起名（只动元数据，不需要 key）
+python -m app.cli --fork --step 3 --rename "换个思路"  # 从第 3 步分叉（对话分叉，不动工作区）
+python -m app.cli --resume --session-id "换个思路" "接着改"   # 名字和 id 都能用来指会话
+```
+
+**它是对话分叉，不是工作区分叉。** 工作区文件**不会**回滚到第 K 步的样子，分叉后的 agent 看到的是**当前**的工作区 —— 我们**没有**工作区快照机制（`grep rewind|snapshot` 在 `agent/ app/` 下零命中）。CLI 分叉后把这句打印出来，`--fork` 的 help 也写明。
+
+| 产物 | 路径 | 内容 |
+|---|---|---|
+| 会话元数据 | `data/sessions/{sid}.meta.json` | `name` + `forked_from`（合并式更新、原子写、自带 `session_id`）。**刻意不进检查点**：检查点放的是"任务跑到哪了"（要喂回引擎的状态），名字是人给的标签 |
+
+搬三样，都以 fork 点为界：**检查点 `step-1..K`**（于是新会话还能 `--resume --step` 回到其中任意一步）、**轨迹里 `step <= K` 的行**（整份复制会让分叉会话"继承"源会话在 K 之后才发生的 `security_finding`）、**`forked_from`**（`--sessions` 用它显示血统）。副本里唯一按新会话重写的是 `session_id`。
+
+检查点是**按节拍**落的，所以 `--fork --step K` 里的 K 可能压根没落盘（`--checkpoint-every 2` 的会话只有偶数步）。这时报的是 `第 K 步没有检查点（可用: [2, 4]）` 而不是一个裸文件路径 —— 分叉与续跑共用同一个读取入口，一条守卫管住两条路。
+
+**`--sessions` 不是附赠**：没有它，`--rename` 写的名字与 `--fork` 记的血统**没有任何消费者** —— 机制在、测试绿、文档写了，但没有任何东西把人引到它上面。清单的键集合取「检查点目录 ∪ `data/sessions/*.jsonl`」，所以跑到一半被 kill、还没到第一个检查点的会话也在里面。
+
+**名字的两条判据合起来才成立**：写入侧 `validate_name` 拒绝「与任何已有 session_id 或会话名相同」，读取侧 `resolve_session` **先当 id、再当名字**。少了写入侧的拒绝，重名会让 `--resume --session-id <名字>` 安静地跑到先遍历到的那个会话上（带着另一个任务的上下文）；名字等于某个 id 时那个 id 就永远解析不到自己。所以不去读取侧加优先级"猜"。
 
 ## 4. 治理层
 

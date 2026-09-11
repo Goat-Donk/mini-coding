@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from pathlib import Path
 
 import typer
@@ -30,8 +31,13 @@ from agent.permissions import PermissionsEngine
 from agent.session import (
     DEFAULT_CHECKPOINT_EVERY,
     Session,
+    SessionNotFound,
     latest_session,
+    list_sessions,
     new_session_id,
+    resolve_session,
+    session_name,
+    set_session_name,
 )
 from agent.state import user as user_message
 from agent.tools.ask import build_ask_tool
@@ -86,6 +92,119 @@ class EventPrinter:
 
 def _default_workspace() -> Path:
     return Path(os.environ.get("WORKSPACE_ROOT", "workspace")).resolve()
+
+
+def _resolve_sid(workspace_root: Path, ref: str | None) -> str:
+    """把 `--session-id` 的引用解析成 session_id：**先当 id、再当名字**；省略取最近会话。
+
+    单独一个函数是因为原先"取会话 id"这件事在 `_print_plan` 与 `--resume` 两处
+    各写了一遍（都是 `session_id or latest_session(...)` 加一句 None 检查）。
+    加名字解析时只改一处、另一处照旧忽略 —— 那就是本项目的头号缺陷类：
+    机制在某条路径生效、在另一条路径静默不生效。收成一处，两条路径一起拿到。
+    """
+    if ref:
+        try:
+            return resolve_session(workspace_root, ref)
+        except SessionNotFound as exc:
+            hint = "、".join(exc.available) if exc.available else "（没有任何会话）"
+            typer.secho(
+                f"找不到会话: {ref}\n可用的会话: {hint}\n"
+                f"（用 python -m app.cli --sessions 看完整清单）",
+                fg=typer.colors.YELLOW,
+            )
+            raise typer.Exit(1)
+    sid = latest_session(workspace_root)
+    if sid is None:
+        typer.secho(
+            "没有可恢复的会话检查点（data/checkpoints/ 为空）", fg=typer.colors.YELLOW
+        )
+        raise typer.Exit(1)
+    return sid
+
+
+def _session_label(workspace_root: Path, sid: str) -> str:
+    """`名字 (id)` 或只有 `id` —— 打印时统一用它，免得每处各拼一遍。"""
+    name = session_name(workspace_root, sid)
+    return f"{name} ({sid})" if name else sid
+
+
+def _print_sessions(workspace_root: Path) -> None:
+    """列出会话（`--sessions`）：名字、最新步、检查点数、分叉来源。
+
+    这条命令是 M9-3 的另一半。`--rename` 与 `--fork` 都往 `data/` 里写东西，
+    但没有这个出口的话，那些东西**没有任何消费者** —— 名字起完看不见、
+    分叉来源记了没人读，于是"机制在、测试绿、实际没人用得上"，正是要防的那类。
+    """
+    infos = list_sessions(workspace_root)
+    if not infos:
+        typer.secho("没有任何会话（data/ 下为空）", fg=typer.colors.YELLOW)
+        return
+    typer.secho(
+        f"会话 {len(infos)} 个（按最近活动倒序）:", fg=typer.colors.CYAN, bold=True
+    )
+    for info in infos:
+        # 名字放最前面：这是给人看的清单，id 是给命令用的
+        label = info.name or "(未命名)"
+        line = (
+            f"  {label}"
+            f"\n      {info.session_id} · step {info.latest_step}"
+            f"（{info.checkpoint_count} 个检查点）"
+            f" · {time.strftime('%m-%d %H:%M', time.localtime(info.mtime)) if info.mtime else '—'}"
+        )
+        if info.forked_from:
+            line += (
+                f"\n      ← 分叉自 {info.forked_from.get('session')}"
+                f"@{info.forked_from.get('step')}"
+            )
+        if info.meta_error:
+            # 名字丢了要**响**：静默显示"(未命名)"会让人以为从没起过名字
+            line += f"\n      [元数据损坏，名字读不出: {info.meta_error}]"
+        typer.echo(line)
+
+
+def _do_rename(workspace_root: Path, ref: str | None, name: str) -> None:
+    """给会话改名（`--rename`）。只动元数据，不建引擎、不需要 key。"""
+    sid = _resolve_sid(workspace_root, ref)
+    try:
+        set_session_name(workspace_root, sid, name)
+    except ValueError as exc:
+        typer.secho(f"改名失败: {exc}", fg=typer.colors.YELLOW)
+        raise typer.Exit(1)
+    typer.secho(f"会话改名: {sid} → {name}", fg=typer.colors.GREEN)
+
+
+def _do_fork(
+    workspace_root: Path, ref: str | None, step: int | None, name: str | None
+) -> str:
+    """从某一步分叉出新会话，返回新会话 id。"""
+    sid = _resolve_sid(workspace_root, ref)
+    try:
+        fork, restored = Session.fork(workspace_root, sid, step=step, name=name)
+    except (FileNotFoundError, ValueError) as exc:
+        typer.secho(f"分叉失败: {exc}", fg=typer.colors.YELLOW)
+        raise typer.Exit(1)
+    typer.secho(
+        f"已分叉: {_session_label(workspace_root, sid)} 的第 {restored.step} 步 "
+        f"→ {_session_label(workspace_root, fork.session_id)}",
+        fg=typer.colors.CYAN, bold=True,
+    )
+    typer.secho(
+        f"  搬了 {len(fork.list_checkpoints())} 个检查点 + "
+        f"{'该步之前的' if restored.step else ''}轨迹事件",
+        fg=typer.colors.BRIGHT_BLACK,
+    )
+    # 这句必须打：不说的话，"回到第 3 步"极容易被理解成工作区也回去了。
+    # 我们的分叉只复制**对话**，文件停在当前状态（没有工作区快照机制）。
+    typer.secho(
+        "  注意: 这是对话分叉 —— 工作区文件**不会**回滚到那一步，"
+        "分叉后的 agent 看到的是当前的文件",
+        fg=typer.colors.YELLOW,
+    )
+    typer.secho(
+        f'  继续: python -m app.cli --resume --session-id {fork.session_id} "你的指示"',
+        fg=typer.colors.CYAN,
+    )
+    return fork.session_id
 
 
 #: 确认菜单：编号 → 权限引擎的粒度串（见 agent/permissions.GRANULARITY）。
@@ -154,18 +273,16 @@ def _print_plan(workspace_root: Path, session_id: str | None, step: int | None) 
     计划是**检查点里的一个字段**，读它就够了 —— 所以这条路径不需要 API key、
     不建会话、不跑任务（也因此它在 `_build_llm` 之前处理）。
     """
-    sid = session_id or latest_session(workspace_root)
-    if sid is None:
-        typer.secho(
-            "没有可读的会话检查点（data/checkpoints/ 为空）", fg=typer.colors.YELLOW
-        )
-        raise typer.Exit(1)
+    sid = _resolve_sid(workspace_root, session_id)
     try:
         _, state = Session.from_checkpoint(workspace_root, sid, step=step)
     except FileNotFoundError as exc:
         typer.secho(f"读不到检查点: {exc}", fg=typer.colors.YELLOW)
         raise typer.Exit(1)
-    typer.secho(f"会话 {sid} 的计划:", fg=typer.colors.CYAN, bold=True)
+    typer.secho(
+        f"会话 {_session_label(workspace_root, sid)} 的计划:",
+        fg=typer.colors.CYAN, bold=True,
+    )
     # 空清单不要复用 render_plan 的"已清空"文案：那是 update_plan 清空动作的说法，
     # 而这里只是"这个会话没排过计划"。
     typer.echo(render_plan(state.plan) if state.plan else "（该会话没有计划清单）")
@@ -183,10 +300,21 @@ def run(
         help="只打印最近会话的**任务计划清单**后退出（agent 自己排的，不是 TASKS.md）",
     ),
     session_id: str | None = typer.Option(
-        None, "--session-id", help="会话 id（--resume 时指定；默认取最近 session）"
+        None, "--session-id",
+        help="会话 id **或名字**（--resume/--fork/--rename/--plan 时指定；默认取最近会话）",
     ),
     step: int | None = typer.Option(
-        None, "--step", help="--resume 时指定恢复步数（默认最近检查点）"
+        None, "--step", help="--resume/--fork 时指定步数（默认最近检查点）"
+    ),
+    sessions: bool = typer.Option(
+        False, "--sessions", help="列出所有会话（名字/步数/分叉来源）后退出",
+    ),
+    rename: str | None = typer.Option(
+        None, "--rename", help="给会话起个人看得懂的名字后退出（只动元数据，不需要 key）",
+    ),
+    fork: bool = typer.Option(
+        False, "--fork",
+        help="从 --step 那一步分叉出新会话（**对话**分叉，不回滚工作区文件）",
     ),
     checkpoint_every: int | None = typer.Option(
         None, "--checkpoint-every",
@@ -204,13 +332,34 @@ def run(
         help="改动前人工确认：edit/write 每次都把 diff 显示出来等你批准",
     ),
 ):
-    """在 workspace 内执行一个任务（或从检查点续跑）。"""
+    """在 workspace 内执行一个任务（或从检查点续跑、分叉、改名、列会话）。"""
     workspace_root = _default_workspace()
+
+    # ---- 不需要 API key 的只读/元数据路径，全部放在 `_build_llm` 之前。
+    # 顺序：先列（纯读）→ 再 plan（读检查点）→ 再改名（写元数据）→ 再分叉。
+    if sessions:
+        _print_sessions(workspace_root)
+        raise typer.Exit()
     if plan:
         # 放在"任务不能为空"检查之前：--plan 本来就不带任务
         _print_plan(workspace_root, session_id, step)
         raise typer.Exit()
-    if not resume and not task.strip():
+    if rename is not None and not fork:
+        # 只改名：不跑任务。`--fork` 一起给时改名的是**分叉出来的那个**，
+        # 所以那种情况留给下面的分叉路径处理。
+        _do_rename(workspace_root, session_id, rename)
+        raise typer.Exit()
+
+    forked_sid: str | None = None
+    if fork:
+        forked_sid = _do_fork(workspace_root, session_id, step, rename)
+        if not task.strip():
+            # 只分叉、不续跑：分叉本身是零成本的（不动模型），而续跑要花钱。
+            # 不带上任务就退出，把"要不要接着跑"留给用户显式说 —— 上面已经
+            # 打出了可执行的续跑命令。
+            raise typer.Exit()
+
+    if not resume and forked_sid is None and not task.strip():
         typer.secho(
             '请提供任务描述，例如：python -m app.cli "读 README 并总结项目结构"',
             fg=typer.colors.YELLOW,
@@ -303,11 +452,11 @@ def run(
     typer.secho("---", fg=typer.colors.BRIGHT_BLACK)
 
     try:
-        if resume:
-            sid = session_id or latest_session(workspace_root)
-            if sid is None:
-                typer.secho("没有可恢复的会话检查点（data/checkpoints/ 为空）", fg=typer.colors.YELLOW)
-                raise typer.Exit(1)
+        if resume or forked_sid is not None:
+            # 分叉出来的会话**直接接着跑**（--fork "指示"）：分叉已经把检查点铺好了，
+            # 之后的路径与 --resume 完全一样 —— 所以这里共用同一条路，而不是
+            # 复制一份"分叉后怎么跑"。两份写法迟早会有一份漏掉某个补投步骤。
+            sid = forked_sid or _resolve_sid(workspace_root, session_id)
             # `checkpoint_every` **必须转发**：`from_checkpoint` 的默认值是 5，而这条
             # 路径原先没传 —— 于是 `--resume --checkpoint-every 1` 会静默回落到
             # "每 5 步一次"。后果不是报错，而是**恢复出来的这一段一步都不落盘**：
@@ -321,9 +470,17 @@ def run(
             # 是"传了不生效 + 不传就用 CLI 的默认值"——后半句同样是错的：5 是 CLI 的
             # 默认值，不是这个会话的事实。用户没法看出恢复后节拍变了，所以下面把
             # **实际生效的节拍**打出来（这是这次改动里唯一的"可见性"出口）。
-            session, restored = Session.from_checkpoint(
-                workspace_root, sid, step=step, checkpoint_every=checkpoint_every
-            )
+            try:
+                session, restored = Session.from_checkpoint(
+                    workspace_root, sid, step=step, checkpoint_every=checkpoint_every
+                )
+            except FileNotFoundError as exc:
+                # `--step K` 里的 K 可能压根没落盘（检查点**按节拍**落，`--checkpoint-every 2`
+                # 的会话只有偶数步）。不接的话用户拿到的是**整个 traceback** —— 真实跑
+                # 撞到过（`--resume --step 9`）。`--fork` 与 `--plan` 两条路早就各有一句
+                # 人话，只有这条最常用的路漏了。文案与 `--plan` 保持一致。
+                typer.secho(f"读不到检查点: {exc}", fg=typer.colors.YELLOW)
+                raise typer.Exit(1)
             typer.secho(
                 f"检查点节拍: 每 {session.checkpoint_every} 步"
                 + ("" if checkpoint_every is not None else "（沿用该会话当初的设置）"),
@@ -343,7 +500,8 @@ def run(
                 permissions=permissions, hooks=hooks, skills=skills,
             )
             typer.secho(
-                f"恢复会话 {sid}（step {restored.step}）→ 续跑", fg=typer.colors.CYAN, bold=True
+                f"恢复会话 {_session_label(workspace_root, sid)}（step {restored.step}）→ 续跑",
+                fg=typer.colors.CYAN, bold=True,
             )
             if restored.taint != TAINT_NONE:
                 typer.secho(

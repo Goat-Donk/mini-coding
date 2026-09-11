@@ -12,7 +12,7 @@ __pycache__/
 # 注意：本文件里**不要写行尾注释** —— gitignore 只在行首把 `#` 当注释，写在模式
 # 后面的 `# ...` 会成为模式本身的一部分，那条规则就永远不匹配（且不报错）。
 # 下面 `.codeagent/` 和 m7verify/ 两处曾因此静默失效。
-.pytest_tmp/
+.pytest_tmp*/
 .coverage
 htmlcov/
 build/

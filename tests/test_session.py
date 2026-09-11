@@ -2,14 +2,25 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from agent.llm import MockLLM
 from agent.loop import QueryEngine
 from agent.state import AgentState
 from agent.session import (
     DEFAULT_CHECKPOINT_EVERY,
     Session,
+    SessionNotFound,
     latest_session,
+    list_sessions,
+    meta_path,
+    read_meta,
+    resolve_session,
+    session_name,
+    set_session_name,
     state_dict,
+    update_meta,
+    validate_name,
 )
 from agent.tools.base import ToolRegistry
 
@@ -403,3 +414,351 @@ def test_checkpoint_force_bypasses_interval(tmp_path):
     assert len(session.list_checkpoints()) == 1
     _, restored = Session.from_checkpoint(tmp_path, "s-force")
     assert restored.messages[-1]["content"] == "问题在这"
+
+
+# ---------- M9-3 分叉（fork）：从任意一步另开一条路 ----------
+
+def seed_steps(
+    tmp_path: Path,
+    sid: str,
+    steps: int,
+    *,
+    finding_at: int | None = None,
+    cadence: int = 1,
+) -> Session:
+    """手工落 `steps` 个检查点（每步一条消息 + 一个事件），可插一条 security_finding。
+
+    不用真引擎是因为本组测试要控制的是**检查点里的消息与事件流**，不是模型行为；
+    手写才能精确指定"污染发生在第几步"、以及"第 N 步的历史长什么样"。
+
+    `cadence` 是给"检查点不是逐步都有的"那类测试用的（`checkpoint_every` 按
+    **调用次数**节流，所以 cadence=2 走 3 步只留下第 2 步的检查点）。
+    """
+    session = Session(tmp_path, sid, checkpoint_every=cadence)
+    state = AgentState(session_id=sid, task="任务", system_prompt="sys")
+    state.emitter = session.emit
+    for step in range(1, steps + 1):
+        state.step = step
+        state.messages.append({"role": "assistant", "content": f"第 {step} 步"})
+        state.record_event("llm_call", n=step)
+        if finding_at == step:
+            state.record_event("security_finding", level="high")
+        session.checkpoint(state)
+    return session
+
+
+def _checkpoint_file(tmp_path: Path, sid: str, n: int) -> Path:
+    return tmp_path / "data" / "checkpoints" / sid / f"step-{n}.json"
+
+
+def test_fork_copies_only_checkpoints_up_to_the_fork_point(tmp_path):
+    """fork@3：新会话拿到 step 1..3，源会话 1..5 一个不动、内容也不变。"""
+    source = seed_steps(tmp_path, "src", 5)
+    before = {n: _checkpoint_file(tmp_path, "src", n).read_text(encoding="utf-8")
+              for n in source.list_checkpoints()}
+
+    fork, restored = Session.fork(tmp_path, "src", step=3, new_id="f1")
+
+    assert fork.list_checkpoints() == [1, 2, 3]
+    assert source.list_checkpoints() == [1, 2, 3, 4, 5]   # 源会话不受影响
+    assert restored.step == 3
+    assert fork.checkpoint_every == source.checkpoint_every   # 节拍沿用源会话
+    # 复制不是移动：源会话的检查点逐字节未变（含没被搬走的那两个）
+    after = {n: _checkpoint_file(tmp_path, "src", n).read_text(encoding="utf-8")
+             for n in source.list_checkpoints()}
+    assert after == before
+
+
+def test_a_step_without_a_checkpoint_lists_the_steps_that_exist(tmp_path):
+    """`--checkpoint-every 2` 的会话只有偶数步；`--fork --step 3` 要说清有哪几步。
+
+    为什么值得单独一条：step 级分叉是我们**对外宣传**的能力，而节拍是每个会话
+    自己的事实（还是跟着检查点落盘的）。撞上"这一步没落盘"时，裸的
+    `FileNotFoundError: .../step-3.json` 既不像步数写错了、也不像节拍问题，
+    用户只能去翻目录。这条钉的是**报错内容**而不是"会不会抛错"：去掉那句提示
+    照样抛 FileNotFoundError，但用户拿到的东西完全不同。分叉和续跑走的是同一个
+    `_load_payload`，所以两条都验。
+    """
+    import pytest
+
+    seed_steps(tmp_path, "src", 3, cadence=2)
+    assert Session(tmp_path, "src").list_checkpoints() == [2]   # 节拍 2 → 只落了第 2 步
+
+    with pytest.raises(FileNotFoundError, match=r"第 3 步.*可用: \[2\]"):
+        Session.fork(tmp_path, "src", step=3, new_id="f1")
+    with pytest.raises(FileNotFoundError, match=r"第 3 步.*可用: \[2\]"):
+        Session.from_checkpoint(tmp_path, "src", step=3)
+
+
+def test_fork_recovers_the_message_history_of_that_step(tmp_path):
+    """分叉点那一步的历史要和源会话整份一致 —— 不是空壳、也不是最新一步。"""
+    seed_steps(tmp_path, "src", 5)
+    _, restored = Session.fork(tmp_path, "src", step=3, new_id="f1")
+    _, source_state = Session.from_checkpoint(tmp_path, "src", step=3)
+    assert [m["content"] for m in restored.messages] == ["第 1 步", "第 2 步", "第 3 步"]
+    assert restored.messages == source_state.messages
+    assert restored.step == 3        # 特别钉住：不是源会话的最新一步 5
+
+
+def test_forked_checkpoints_do_not_claim_to_be_the_source(tmp_path):
+    """副本里的 `session_id` 必须是**新会话**的。
+
+    它是「从别处读来的 payload」唯一一处不能原样搬的字段：今天 `load_state`
+    会把它 pop 掉所以无害，但谁哪天直接读 `payload["session_id"]` 就会拿到源会话
+    —— 一个当前无人读、将来必有人读的错值，正是最该在写入时修掉的那种。
+    """
+    seed_steps(tmp_path, "src", 5)
+    Session.fork(tmp_path, "src", step=3, new_id="f1")
+    for n in (1, 2, 3):
+        payload = json.loads(
+            (tmp_path / "data" / "checkpoints" / "f1" / f"step-{n}.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert payload["session_id"] == "f1"
+
+
+def test_fork_trajectory_stops_at_the_fork_point(tmp_path):
+    """轨迹只搬 `step <= fork_step` 的行。
+
+    整份复制的话，源会话在第 4、5 步发生的事会跟着进新会话的轨迹 ——
+    那条分支上**根本没发生过**这些事。这是分叉最容易漏的一处：
+    检查点裁对了、轨迹忘了裁，看上去一切正常。
+    """
+    seed_steps(tmp_path, "src", 5)
+    Session.fork(tmp_path, "src", step=3, new_id="f1")
+    lines = [
+        json.loads(line)
+        for line in (tmp_path / "data" / "sessions" / "f1.jsonl")
+        .read_text(encoding="utf-8")
+        .strip()
+        .splitlines()
+    ]
+    assert lines, "分叉会话应该有轨迹"
+    assert {e["step"] for e in lines} == {1, 2, 3}   # 4、5 步的事件不在
+    # 血统记在轨迹里：光看 f1.jsonl 的前几行看不出它是分叉来的
+    forked = [e for e in lines if e["type"] == "session_forked"]
+    assert len(forked) == 1
+    assert forked[0]["from_session"] == "src"
+    assert forked[0]["from_step"] == 3
+
+
+def test_fork_inherits_taint_only_from_the_events_it_copied(tmp_path):
+    """污染标记按**搬过来的事件**重算，不是照抄源会话的当前值。
+
+    这条是"轨迹/检查点必须以 fork_step 为界"的判据面：源会话在第 4 步被标了 high，
+    从第 3 步分叉出去的那条路上，那件事还没发生。
+    """
+    seed_steps(tmp_path, "src", 5, finding_at=4)
+
+    _, early = Session.fork(tmp_path, "src", step=3, new_id="early")
+    assert early.taint == "none"        # 第 4 步的 finding 不在它的世界里
+
+    _, late = Session.fork(tmp_path, "src", step=5, new_id="late")
+    assert late.taint == "high"
+
+
+def test_fork_records_provenance_and_an_auto_name(tmp_path):
+    """meta 里记下来源 + 步数，并给一个能一眼看懂的名字（可被 --rename 覆盖）。"""
+    seed_steps(tmp_path, "src", 5)
+    Session.fork(tmp_path, "src", step=3, new_id="f1")
+    meta = read_meta(tmp_path, "f1")
+    assert meta["forked_from"] == {"session": "src", "step": 3}
+    assert meta["name"] == "src @3 分叉"
+
+
+def test_fork_auto_name_uses_the_source_name_when_it_has_one(tmp_path):
+    """源会话起过名 → 分叉的默认名沿用**名字**，不是 id。
+
+    一排 `s20260911-153012 @3 分叉` 之间看不出谁是谁；沿用名字才让人一眼看出
+    "这两条路是同一个任务分出来的"。**源会话没名字**时回落 id —— 那种情况
+    `test_fork_records_provenance_and_an_auto_name` 已经钉住，所以两条路都覆盖到了。
+    """
+    seed_steps(tmp_path, "src", 5)
+    set_session_name(tmp_path, "src", "基线方案")
+    Session.fork(tmp_path, "src", step=3, new_id="f1")
+    assert read_meta(tmp_path, "f1")["name"] == "基线方案 @3 分叉"
+
+
+def test_two_forks_in_the_same_second_get_distinct_ids_and_names(tmp_path):
+    """同一秒里分叉两次：id 要让开（否则两个会话共用一个检查点目录），名字也要。
+
+    `new_session_id()` 的粒度是秒，撞了不会有任何报错 —— 后一个会话的检查点
+    直接写进前一个的目录。名字撞了则更隐蔽：`resolve_session` 按名字只能返回
+    一个，`--resume --session-id <名字>` 会安静地跑到另一个会话上去。
+    """
+    seed_steps(tmp_path, "src", 5)
+    f1, _ = Session.fork(tmp_path, "src", step=3)
+    f2, _ = Session.fork(tmp_path, "src", step=3)
+    assert f1.session_id != f2.session_id
+    assert session_name(tmp_path, f1.session_id) != session_name(tmp_path, f2.session_id)
+
+
+# ---------- M9-3 改名（rename）+ 会话清单 ----------
+
+def test_rename_round_trip_and_resolution_by_name(tmp_path):
+    seed_steps(tmp_path, "src", 2)
+    set_session_name(tmp_path, "src", "基线方案")
+    assert session_name(tmp_path, "src") == "基线方案"
+    assert resolve_session(tmp_path, "基线方案") == "src"
+    assert resolve_session(tmp_path, "src") == "src"     # id 照常可用
+
+
+def test_rename_rejects_a_name_that_is_another_sessions_id(tmp_path):
+    """名字不许等于任何已有 session_id。
+
+    允许的话，`resolve_session` 先按 id 解析，那个 id 就永远解析不到自己的会话了
+    —— 失败方式是"静默跑到另一个会话上去"，所以要在**写入侧**拒绝，
+    而不是在解析侧加优先级去猜。
+    """
+    seed_steps(tmp_path, "src", 2)
+    seed_steps(tmp_path, "other", 2)
+    with pytest.raises(ValueError, match="已被 other 占用"):
+        set_session_name(tmp_path, "src", "other")
+
+
+def test_rename_rejects_a_duplicate_name(tmp_path):
+    seed_steps(tmp_path, "a", 2)
+    seed_steps(tmp_path, "b", 2)
+    set_session_name(tmp_path, "a", "同一个名字")
+    with pytest.raises(ValueError, match="已被 a 占用"):
+        set_session_name(tmp_path, "b", "同一个名字")
+    # 改成自己当前的名字是幂等的（否则"再设一次"会莫名失败）
+    set_session_name(tmp_path, "a", "同一个名字")
+
+
+def test_rename_rejects_empty_and_pathlike_names(tmp_path):
+    """每条判据都钉**拒绝理由**，不只钉"抛了 ValueError"。
+
+    为什么较这个真：`_name_taken` 里有一条 `_checkpoints_root / name` 的存在性检查，
+    而 `_checkpoints_root / ""` 正好解析回检查点根目录本身（它当然存在）。于是
+    "空名字"这条判据**去掉之后照样抛 ValueError** —— 只是理由从"不能为空"变成
+    "已被 占用"，用户看到的是句鬼话。只断言异常类型的测试抓不住这种退化。
+    """
+    seed_steps(tmp_path, "src", 2)
+    for bad in ("", "   "):
+        with pytest.raises(ValueError, match="不能为空"):
+            set_session_name(tmp_path, "src", bad)
+    for bad in ("a/b", "a\\b"):
+        with pytest.raises(ValueError, match="路径分隔符"):
+            set_session_name(tmp_path, "src", bad)
+    with pytest.raises(ValueError, match="最长"):
+        set_session_name(tmp_path, "src", "a" * 61)
+    assert session_name(tmp_path, "src") is None      # 一次都没写进去
+
+    # 前后空白是**去掉再存**，不是原样存。否则：（a）`--resume --session-id 基线方案`
+    # 找不到一个叫 "  基线方案  " 的会话；（b）查重那两条路都是按字面比的，
+    # "基线方案" 与 "  基线方案  " 会被当成两个不同的名字，同一个名字能存两份。
+    set_session_name(tmp_path, "src", "  基线方案  ")
+    assert session_name(tmp_path, "src") == "基线方案"
+    assert read_meta(tmp_path, "src")["name"] == "基线方案"
+
+
+def test_rename_refuses_a_session_that_does_not_exist(tmp_path):
+    """不给幽灵会话建 meta：`--sessions` 里看着像回事，`--resume` 却没有检查点。"""
+    with pytest.raises(ValueError, match="会话不存在"):
+        set_session_name(tmp_path, "nope", "名字")
+    assert not meta_path(tmp_path, "nope").exists()
+
+
+def test_rename_keeps_the_fork_provenance(tmp_path):
+    """改元数据是**合并**不是覆盖：改完名字，分叉来源不能消失。"""
+    seed_steps(tmp_path, "src", 5)
+    Session.fork(tmp_path, "src", step=3, new_id="f1")
+    set_session_name(tmp_path, "f1", "另一条路")
+    meta = read_meta(tmp_path, "f1")
+    assert meta["name"] == "另一条路"
+    assert meta["forked_from"] == {"session": "src", "step": 3}
+
+
+def test_sessions_lists_trajectory_only_sessions(tmp_path):
+    """只有轨迹、没有检查点的会话也要出现在清单里。
+
+    那是"跑到一半被 kill、还没到第一个检查点"的会话 —— 恰恰是最需要被看见的
+    一种（「我明明跑过」和「列表里没有」之间不该有落差）。
+    """
+    session = Session(tmp_path, "alive", checkpoint_every=5)
+    session.emit({"ts": 1.0, "type": "llm_call", "step": 0})
+    seed_steps(tmp_path, "full", 2)
+
+    by_id = {i.session_id: i for i in list_sessions(tmp_path)}
+    assert set(by_id) == {"alive", "full"}
+    assert by_id["alive"].latest_step == 0 and by_id["alive"].checkpoint_count == 0
+    assert by_id["full"].latest_step == 2
+
+
+def test_sessions_reports_a_corrupt_meta_without_hiding_others(tmp_path):
+    """一个坏 meta 不该让整张表挂掉，但也不能被静默当成"没有名字"。"""
+    seed_steps(tmp_path, "good", 2)
+    seed_steps(tmp_path, "bad", 2)
+    meta_path(tmp_path, "bad").write_text("{ 这不是 JSON", encoding="utf-8")
+
+    by_id = {i.session_id: i for i in list_sessions(tmp_path)}
+    assert by_id["bad"].meta_error is not None
+    assert by_id["good"].meta_error is None
+
+
+def test_session_name_is_quiet_about_a_corrupt_meta_but_the_listing_is_not(tmp_path):
+    """同一个坏 meta，两处刻意给出不同反应 —— 所以两处都要钉住。
+
+    `session_name` 的调用方是"要个显示名"（打印标签、拼分叉默认名），为一个坏
+    meta 让整条命令失败不成比例；`--sessions` 那边的调用方是"名字丢了要响"，
+    静默显示"(未命名)"会让人以为从没起过名字。
+    """
+    seed_steps(tmp_path, "bad", 2)
+    meta_path(tmp_path, "bad").write_text("{ 这不是 JSON", encoding="utf-8")
+    assert session_name(tmp_path, "bad") is None
+    assert list_sessions(tmp_path)[0].meta_error is not None
+
+
+def test_resolve_session_lists_candidates_when_unknown(tmp_path):
+    seed_steps(tmp_path, "src", 2)
+    with pytest.raises(SessionNotFound) as exc:
+        resolve_session(tmp_path, "没这个会话")
+    assert "src" in exc.value.available
+
+
+def test_update_meta_is_atomic_and_self_describing(tmp_path):
+    seed_steps(tmp_path, "src", 2)
+    update_meta(tmp_path, "src", name="x")
+    payload = json.loads(meta_path(tmp_path, "src").read_text(encoding="utf-8"))
+    assert payload["session_id"] == "src"
+    assert not meta_path(tmp_path, "src").with_suffix(".json.tmp").exists()
+
+
+def test_update_meta_writes_through_a_temp_file(tmp_path, monkeypatch):
+    """原子写：先写 `.json.tmp`、再 `replace` 到目标名，**绝不直接写目标文件**。
+
+    为什么不能靠比对结果来测：直接写与原子写在**成功路径上结果完全相同**
+    （文件都在、内容都对），差别只在进程被 kill 的那一瞬间。所以只能钉住
+    "走了哪条路径" —— 否则把 `tmp.replace(path)` 删成 `path.write_text(...)`
+    测试照样全绿，而那道原子性保证已经没了。
+    """
+    seed_steps(tmp_path, "src", 2)
+    writes: list[str] = []
+    replaces: list[str] = []
+    real_write, real_replace = Path.write_text, Path.replace
+
+    def spy_write(self, *args, **kwargs):
+        writes.append(self.name)
+        return real_write(self, *args, **kwargs)
+
+    def spy_replace(self, target):
+        replaces.append(self.name)
+        return real_replace(self, target)
+
+    monkeypatch.setattr(Path, "write_text", spy_write)
+    monkeypatch.setattr(Path, "replace", spy_replace)
+    update_meta(tmp_path, "src", name="x")
+
+    assert writes == ["src.meta.json.tmp"]      # 写的是临时文件
+    assert replaces == ["src.meta.json.tmp"]    # 由它原子替换过去
+    assert not meta_path(tmp_path, "src").with_suffix(".json.tmp").exists()
+    assert read_meta(tmp_path, "src")["name"] == "x"
+
+
+def test_validate_name_rejects_an_id_shape_that_exists(tmp_path):
+    seed_steps(tmp_path, "s20260911-000000", 1)
+    with pytest.raises(ValueError):
+        validate_name(tmp_path, "s20260911-000000")
+

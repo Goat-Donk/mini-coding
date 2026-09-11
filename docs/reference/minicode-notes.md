@@ -141,7 +141,7 @@ src/
 | ④ | 进程内 Goal（跨回合推进 + 暂停/恢复/完成检查） | ✅ `cli-commands.ts:25-30` 全套 `/goal` `/goal status` `/goal pause [reason]` `/goal resume` `/goal clear`；`goal/context.ts`、`tools/goal.ts`、`index.ts:317` `goal.manager.dispose()` | ❌ 无（`pause/resume/goal_manager/active_goal` 全 0 命中） | ❌ 未做 |
 | ⑤ | 进程内 Loop（固定间隔重复提示词，与 Goal 互斥） | ✅ `cli-commands.ts:22-24` `/loop [Nm\|Nh] <prompt>`（默认 10m、最小 1m）+ `/loop stop`；`loop/scheduler.ts:74` 有"已有 Loop 先 stop"的互斥校验 | ❌ 无 | ❌ 未做 |
 | ⑥ | 全屏 TUI（历史/滚动/slash 菜单/审批） | ✅ `tty-app.ts`（Ink/React） | ✅ 自研 ANSI，无第三方 TUI 库；`main.py:639 run_tty_app` | ❌ 我们用 Streamlit 控制台 |
-| ⑦ | 按项目持久化 + 恢复/重命名/分叉/压缩 | ✅ `cli-commands.ts:77/82/87/92/147` `/resume` `/rename` `/new` `/fork` `/compact`；`index.ts:11,53-137` `forkSession`；`session.ts:22` `rename` 事件 | ⚠️ resume 有；隔离是**读时过滤** `meta.workspace == workspace`（扁平 `~/.mini-code/sessions/<uuid>.json`，非 hash 路径）；**rename/fork 无** | ⚠️ resume 有且是 **step 级**检查点；rename/fork 无 |
+| ⑦ | 按项目持久化 + 恢复/重命名/分叉/压缩 | ✅ `cli-commands.ts:77/82/87/92/147` `/resume` `/rename` `/new` `/fork` `/compact`；`index.ts:11,53-137` `forkSession`；`session.ts:22` `rename` 事件 | ⚠️ resume 有；隔离是**读时过滤** `meta.workspace == workspace`（扁平 `~/.mini-code/sessions/<uuid>.json`，非 hash 路径）；**rename/fork 无** | ✅ **已补（M9-3）**：resume 本就是 **step 级**检查点，`--fork --step K` 因此能**回到任意一步**（TS 的 fork 是**会话级**的）；`--rename` + `--sessions`。**是对话分叉不是工作区分叉**（无工作区快照） |
 | ⑧ | provider usage 优先 + tail estimate + 自动压缩 + 折叠 + 裁剪 | ✅ 5/5。`utils/token-estimator.ts:6` `provider_usage_plus_estimate` / `:130` `tailMessages = messages.slice(i+1)`；`compact/` 下 auto-compact / context-collapse / microcompact / snipCompact 全在 | ⚠️ **只有 auto-compact 真接线**。`token_count_with_estimation()`（`context_manager.py:245`）无运行路径调用方，且自认"退化为 estimate_only"；tail estimate 无；collapse 无对应模块；snip 实际是整条丢弃 | ✅ **更强**：usage-first + 尾部估算 + snip + LLM 摘要**全部真接线**。**缺 context collapse** |
 | ⑨ | 内置工具含 Web fetch/search | ✅ `tools/web-fetch.ts` / `web-search.ts` / `ask-user.ts` | ✅ 真网络 IO（非桩）：`web_fetch.py:53` 真 `urllib` + SSRF 拦截；`web_search.py:26` 真打 DuckDuckGo | ✅ **已补（M9-2）**：`agent/tools/web.py` 的 `web_fetch` / `web_search` + SSRF 拦截（**重写，不照抄移植版**——它的 `_is_safe_url` 有四个真漏洞，见下） |
 | ⑩ | SKILL.md + MCP stdio 或远程 HTTP，tools/resources/prompts | ✅ `skills.ts` + `tools/load-skill.ts` + `/skills`；`mcp.ts:62` `'streamable-http'` → **远程 HTTP 有** | ⚠️ skills 真实现；MCP **tools/resources/prompts 三项都有**（`mcp.py:531/540/553`），但**传输只有 stdio**（http/sse 零命中） | ⚠️ 只有 stdio + **只有 tools** |
@@ -150,7 +150,7 @@ src/
 
 ### 三档结论
 
-- **TS → 我们**：②④⑤⑥ 四项完全没有，⑧⑩ 各差一块，①③⑦⑨⑪⑫ 已有（⑦⑫ 我们形态不同，⑨⑪ 已补齐）。
+- **TS → 我们**：②④⑤⑥ 四项完全没有，⑧⑩ 各差一块，①③⑦⑨⑪⑫ 已有（⑦⑫ 我们形态不同，⑨⑪ 已补齐；**⑦ 的 fork 已补（M9-3，且挂在 step 级检查点上，比 TS 的会话级 fork 更细）**）。
 - **Python 移植 → 我们**：③⑧⑫ **我们更强**（那边是死代码 / 半接线 / 只在高压才跑，我们是真接线）；①⑥ 它强。**⑨⑪ 已补齐** —— 而且⑨ 这一项我们是**照它的意图重写、不照抄**：它的 `_is_safe_url` 有四个真漏洞（见下面「移植版的四个 SSRF 漏洞」）。
 
 ### 移植版的四个 SSRF 漏洞（我们重写而不是照抄的理由）

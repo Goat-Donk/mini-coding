@@ -1027,6 +1027,99 @@ def _stored_cadence(payload: dict) -> int | None  # 读会话当初的节拍；�
   `session.checkpoint(state)`；`run_from(state)` 从恢复的 state 继续执行。
 - CLI：`--resume`（自动选最近会话）/ `--session-id` / `--step` / `--checkpoint-every`。
 
+### 9.3b 会话元数据 · 分叉 · 改名（★M9-3）
+
+```python
+# ---------- 元数据（data/sessions/{id}.meta.json，与轨迹同目录不同后缀） ----------
+NAME_MAX_CHARS = 60
+_NAME_FORBIDDEN = set('\\/:*?"<>|')
+
+def meta_path(workspace_root, session_id) -> Path
+def read_meta(workspace_root, session_id) -> dict          # 没有 → {}；损坏 → ValueError
+def update_meta(workspace_root, session_id, **fields) -> Path   # **合并**式 + 原子写
+def validate_name(workspace_root, name, *, allow_session=None) -> str
+def set_session_name(workspace_root, session_id, name) -> Path
+def session_name(workspace_root, session_id) -> str | None  # 没有/损坏 → None（不抛）
+
+# ---------- 分叉 ----------
+class Session:
+    @classmethod
+    def fork(cls, workspace_root, session_id, *, step=None, new_id=None, name=None
+             ) -> tuple[Session, AgentState]
+    def _copy_trajectory(self, source: Session, fork_step: int) -> int
+
+# ---------- 清单与查找 ----------
+@dataclass(frozen=True)
+class SessionInfo:  # session_id / name / latest_step / checkpoint_count / mtime
+                    # / forked_from / meta_error（meta 坏了：名字没了，会话还在）
+class SessionNotFound(LookupError):  # .ref / .available（候选清单，报错时列出来）
+def list_sessions(workspace_root) -> list[SessionInfo]     # 按 mtime 倒序
+def resolve_session(workspace_root, ref) -> str            # **先当 id、再当名字**
+def unique_session_id(workspace_root) -> str               # 同秒撞车时让开（-2/-3）
+def default_fork_name(workspace_root, source_id, fork_step) -> str  # "{源名} @{步} 分叉"
+```
+
+- **分叉挂在 step 级检查点上**（与 TS 原版的差别）：它的 `/fork` 是**会话级**的
+  （整段复制、从"现在"接着走）；我们逐 step 落检查点，于是 `--fork --step K`
+  可以**回到任意一步**再开一条路，这个能力是现成的。
+- **它是对话分叉，不是工作区分叉** —— 必须说清楚，否则极容易被读成"时光倒流"：
+  工作区（文件）**不会**回滚到第 K 步的样子，分叉后的 agent 看到的是**当前**工作区。
+  我们**没有**工作区快照机制（`grep rewind|snapshot` 在 `agent/ app/` 下零命中，2026-09-11
+  核实）。CLI 分叉后把这句**打印出来**，help 里也写明。
+- fork 搬三样，都以 `fork_step` 为界：
+  1. **检查点 `step-1..fork_step`** → 新会话因此能 `--resume --step K` 回到其中任意一步；
+  2. **轨迹里 `step <= fork_step` 的行**。**不能整份复制**：轨迹是追加的，源会话在
+     fork_step 之后的 `security_finding` 会被一起搬过去，分叉出来的会话于是"继承"了
+     它根本没发生过的事件。**解析不了的行原样保留** —— 那是 kill 在写一半时唯一留下的
+     现场，不会影响判定（污染重放读的是检查点里的 `state.events`，不是轨迹）；
+  3. **meta 里的 `forked_from`**（`{"session", "step"}`），供 `--sessions` 显示血统。
+- **`_load_payload(step)` 在"这一步没有检查点"时要说清有哪几步**（M9-3 补）：
+  检查点是**按节拍**落的，`--checkpoint-every 2` 的会话只有偶数步，而 `--fork --step K`
+  正是我们对外宣传的能力 —— 撞上没落盘的那一步时，裸的
+  `FileNotFoundError: .../step-K.json` 既不像步数写错了、也不像节拍问题，用户只能去翻目录。
+  现在改成 `第 K 步没有检查点（可用: [2, 4]）`，同 `SessionNotFound` 的「报错必须给出下一步」。
+  **分叉与续跑共用这一个入口**，所以一条守卫同时管住两条路（两处各写一遍必然漂移）。
+  但那只是**抛出**侧 —— 三条 CLI 入口（`--resume` / `--fork` / `--plan`）各自要**接住**它。
+  真实跑发现只有 `--resume` 没接：`--resume --step 9` 甩出一整个 traceback，而
+  `--fork` / `--plan` 早就各有一句人话。现在三条一致，都打 `读不到检查点: …` 并退 1。
+- **副本里唯一不能原样搬的字段是 `session_id`**，按新会话重写。`load_state` 会 pop 掉它
+  所以今天无害，但那是一颗定时炸弹：谁哪天直接读 `payload["session_id"]` 就会拿到源会话。
+  属"当前无人读、将来必有人读"的错值，在写入时修掉。
+- **`_write_payload(step, payload)` 把"怎么落盘"抽出来给 `_write` 与 `fork` 共用**：
+  分叉写的是从别处读来的 payload，内容不由本会话的 state 决定，但原子写/缩进/编码必须
+  是同一份知识。各写一遍的失败方式是静的 —— 分叉出来的会话少个字段，跑起来才发现。
+- **`update_meta` 是合并式（read → update → 原子写）而不是覆盖式**：`--rename` 只该改名字，
+  覆盖式会把 `forked_from` 一起抹掉，且没有任何提示。文件里自带 `session_id`（自描述）。
+- **`read_meta` 与 `session_name` 对坏 meta 的反应刻意不同**：前者抛
+  （"文件在但读不出"只可能是被手改坏或写了一半，**名字是真的丢了**，静默返回 `{}`
+  会让人以为"我从没起过名字"从而重起一个、旧的无声消失）；后者返回 `None`
+  （它的调用方只是要个显示名或拼默认名，为一个坏 meta 让整条命令失败不成比例）。
+  `--sessions` 逐行标出 `meta_error` —— 一个坏文件不该让另外九个正常会话也看不见。
+- **`validate_name` 的五条判据**：非空、≤60 字符、无路径分隔符/控制字符、
+  **不与任何已有 `session_id` 相同**、**不与任何已有会话名相同**。后两条都是必需的：
+  `resolve_session` 按名字只返回**一个**结果，重名时 `--resume --session-id <名字>`
+  会安静地跑到先被遍历到的那个上去（带着另一个任务的上下文继续）；名字等于某个 id 时
+  那个 id 就永远解析不到自己的会话了。**两处合起来才成立**：写入侧拒绝坏名字，
+  读取侧 id 优先 —— 所以不去读取侧加优先级"猜"，猜错的代价太大。
+  名字**从不参与路径拼接**（路径一律用 session_id），这条校验是防"看起来像地址"。
+- **`unique_session_id` 的让开也是必需的**：`new_session_id()` 粒度是**秒**，
+  同一秒里跑两条命令完全正常（测试里几乎是必然）。撞了 `Session.__init__` 不报错，
+  两个会话直接共用一个检查点目录，后者覆盖前者且全程静默。
+- **`--sessions` 是这一项的另一半，不是附赠**：没有它，`--rename` 写的名字和 `--fork`
+  记的血统**没有任何消费者** —— 正是本项目记录在案的头号缺陷类（机制在、测试绿、
+  文档写了，但没有任何东西把模型或人引到它上面）。清单的键集合取
+  **检查点目录 ∪ `data/sessions/*.jsonl`**：跑到一半被 kill、还没到第一个检查点就死掉的
+  会话只有轨迹，而那种会话恰恰最需要被看见。
+- **CLI 侧把"取会话 id"收成 `_resolve_sid` 一处**：原先 `_print_plan` 与 `--resume`
+  各写了一遍，加名字解析时只改一处、另一处照旧忽略就是漂移。收成一处，两条路径一起拿到。
+- **`--rename` / `--sessions` / `--fork`（不带任务）都不构造 LLM、不需要 API key**，
+  所以它们的 dispatch 放在 `_build_llm` **之前**。测试用"`_build_llm` 一被调用就炸"的
+  替身钉住这一点 —— 靠"本机没配 key 也过了"来测会在有 `.env` 时假装通过。
+- **不带任务就退出**是刻意的：分叉本身零成本（不动模型），续跑要花钱，
+  把"要不要接着跑"留给用户显式说；上面已经打出可执行的续跑命令
+  （`--resume --session-id <新 id> "你的指示"`）。M7 的教训是**一条走不通的解除指引
+  比没有指引更糟**，所以指引必须可直接粘贴执行。
+
 ### 9.4 agent/memory.py（M4-1 已实现：分层指令文件 + 提取 + consolidation）
 
 ```python
@@ -1385,5 +1478,8 @@ python -m eval.golden_tasks --clone --limit 10   # M5-1：拉 tinydb 并列出�
 python -m eval.runner --limit 3                  # M5-2：真实跑 3 个黄金任务出回归报告
 python -m eval.runner --limit 2 --mock           # M5-2 无 key 冒烟（judge 会如实失败）
 python -m app.cli --mcp .codeagent/mcp.json "任务"  # M6-3 加载 MCP server 后执行任务
+python -m app.cli --sessions                    # M9-3 会话清单：名字 / 步数 / 分叉来源（无 key）
+python -m app.cli --rename "基线方案"             # M9-3 起名（只动元数据，无 key）
+python -m app.cli --fork --step 3 "换个思路"      # M9-3 从第 3 步分叉并续跑（对话分叉）
 streamlit run app/ui_streamlit.py               # M2-3 控制台（含 M5-3 检查点回放）
 ```

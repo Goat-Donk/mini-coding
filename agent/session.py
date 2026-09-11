@@ -13,6 +13,13 @@
   `cli.py` 重算 `memory_blocks`，`restored.memory_blocks` 被静默忽略。手写白名单
   是那种「加了新东西看起来对、实际悄悄不生效」的坑，所以这里改成结构性修法：
   新增字段自动进检查点，只有**确实是运行时对象**的字段才需要显式排除。
+- **会话元数据（M9-3）**：`data/sessions/{session_id}.meta.json`——人给的名字、
+  分叉来源。**它不是 AgentState 的一部分**，所以刻意不塞进检查点：检查点里放的
+  是"任务跑到哪了"（可被 `--resume` 喂回引擎的状态），而名字是**人给的标签**、
+  分叉来源是**派生自检查点目录布局的事实**。放进去等于让 state 多两个既不影响
+  推理、又要跟着全字段往返一起走的字段。
+- **分叉（M9-3）**：`fork()` 从**任意一步**检查点开一个新会话。注意它是
+  **对话分叉，不是工作区分叉**（见 `fork()` 的说明）。
 """
 from __future__ import annotations
 
@@ -20,7 +27,7 @@ import dataclasses
 import json
 import threading
 import time
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 
 from agent.llm import Usage
@@ -55,6 +62,144 @@ _LEGACY_FLAT_KEYS: tuple[str, ...] = (
 def new_session_id() -> str:
     """生成会话 id（秒级时间戳，够区分一次演示/任务的连续运行）。"""
     return time.strftime("s%Y%m%d-%H%M%S")
+
+
+# ---------- 会话元数据（M9-3：名字 + 分叉来源） ----------
+
+#: 会话名的长度上限。**长度本身不是安全问题**（名字不参与任何路径拼接），
+#: 它只是给人看的；设上限是为了让 `--sessions` 的表格不被一个超长名字撑爆。
+NAME_MAX_CHARS = 60
+
+#: 名字里不允许出现的字符：路径分隔符（避免有人误以为名字能当地址用）与控制字符。
+#: 注意名字**从不参与路径拼接**——路径一律用 session_id（那是我们生成的、
+#: 字符集可控的）。这条校验是防"看起来像地址"，不是防穿越。
+_NAME_FORBIDDEN = set('\\/:*?"<>|')
+
+
+def _sessions_dir(workspace_root: Path) -> Path:
+    return Path(workspace_root).resolve() / "data" / "sessions"
+
+
+def _checkpoints_root(workspace_root: Path) -> Path:
+    return Path(workspace_root).resolve() / "data" / "checkpoints"
+
+
+def meta_path(workspace_root: Path, session_id: str) -> Path:
+    """会话元数据文件路径：`data/sessions/{session_id}.meta.json`。
+
+    与轨迹 `{session_id}.jsonl` 同目录、不同后缀，`*.json` 的 glob 不会误伤 `.jsonl`。
+    """
+    return _sessions_dir(workspace_root) / f"{session_id}.meta.json"
+
+
+def read_meta(workspace_root: Path, session_id: str) -> dict:
+    """读会话元数据；**没有这个文件返回空 dict**，文件坏了则抛错。
+
+    两者的区别是刻意的：没有 meta 是正常状态（M9-3 之前建的会话、或从没改过名的
+    会话都没有），而 meta 存在却解析不了只可能是被手改坏或写了一半 —— 那时**名字
+    是真的丢了**，静默返回 `{}` 会让人以为"我从没起过名字"，于是重新起一个、
+    旧的就此消失且没有任何痕迹。
+    """
+    path = meta_path(workspace_root, session_id)
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"会话元数据损坏: {path}（{exc}）") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"会话元数据格式不对（应为 JSON 对象）: {path}")
+    return data
+
+
+def update_meta(workspace_root: Path, session_id: str, **fields) -> Path:
+    """合并式更新会话元数据（原子写）。
+
+    **合并而不是覆盖**：`--rename` 只该改名字，不该把 `forked_from` 一起抹掉。
+    覆盖式写在这里是一个安静的 bug —— 改完名之后 `--sessions` 里的分叉来源
+    就没了，而且没有任何提示。
+    """
+    data = read_meta(workspace_root, session_id)
+    data.update(fields)
+    data["session_id"] = session_id   # 自描述：文件被挪走时还认得出自己是谁
+    path = meta_path(workspace_root, session_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)   # 同检查点：原子替换，kill 不留半个文件
+    return path
+
+
+def _name_taken(workspace_root: Path, name: str, *, allow_session: str | None = None) -> str | None:
+    """名字被占用则返回占用者的 session_id，否则 None。
+
+    `allow_session` 是"这个名字本来就属于它"的那一个 —— 把一个会话改成它当前
+    的名字不该报错（幂等）。除此之外任何重复都要拦。
+
+    **为什么重名也必须拦**：`resolve_session` 按名字查找只能返回**一个**结果。
+    两个会话同名时，`--resume --session-id <name>` 会安静地跑到其中先被遍历到的
+    那个上去 —— 带着另一个任务的上下文继续。这比"报错说我找不到"糟糕得多。
+    """
+    if (_checkpoints_root(workspace_root) / name).exists():
+        return name  # 撞上某个 session_id
+    for info in list_sessions(workspace_root):
+        if info.name == name and info.session_id != allow_session:
+            return info.session_id
+    return None
+
+
+def validate_name(
+    workspace_root: Path, name: str, *, allow_session: str | None = None
+) -> str:
+    """校验并返回规范化的会话名；不合法则抛 `ValueError`（带可读原因）。
+
+    判据里最要紧的是「不与任何已有 session_id / 会话名相同」。`resolve_session`
+    先按 id 再按名字解析，如果名字能等于某个 id，那个 id 就永远解析不到自己的
+    会话了 —— 而且失败方式是"静默跑到另一个会话上去"。所以在这头拒绝，
+    而不是在解析那头加优先级去猜（猜错的代价是带着另一个会话的上下文继续跑）。
+
+    `allow_session`：这个名字本来就属于的那个会话（改名幂等用），见 `_name_taken`。
+    """
+    cleaned = (name or "").strip()
+    if not cleaned:
+        raise ValueError("会话名不能为空")
+    if len(cleaned) > NAME_MAX_CHARS:
+        raise ValueError(f"会话名最长 {NAME_MAX_CHARS} 字符，当前 {len(cleaned)}")
+    bad = sorted(_NAME_FORBIDDEN & set(cleaned))
+    if bad or any(ord(c) < 32 for c in cleaned):
+        raise ValueError(f"会话名不能含路径分隔符/控制字符: {''.join(bad) or '控制字符'}")
+    taken = _name_taken(workspace_root, cleaned, allow_session=allow_session)
+    if taken is not None:
+        raise ValueError(f"会话名 {cleaned!r} 已被 {taken} 占用，换一个")
+    return cleaned
+
+
+def set_session_name(workspace_root: Path, session_id: str, name: str) -> Path:
+    """给人一个名字（`--rename`）。目标会话必须**已经存在**。
+
+    不存在的会话不接受改名：那会造出一个只有 meta 文件、没有任何检查点的幽灵，
+    `--sessions` 里看着像回事，`--resume` 却报"没有可恢复的检查点"。
+    """
+    if not (_checkpoints_root(workspace_root) / session_id).exists():
+        raise ValueError(f"会话不存在: {session_id}")
+    return update_meta(
+        workspace_root, session_id,
+        name=validate_name(workspace_root, name, allow_session=session_id),
+    )
+
+
+def session_name(workspace_root: Path, session_id: str) -> str | None:
+    """读会话名；没有/不是字符串 → None。meta 损坏同样返回 None。
+
+    这里**不抛错**：调用方是取名字来显示或拼默认名的，为一个坏 meta 让整条
+    命令失败不成比例。真正需要"名字丢了要响"的地方是 `--sessions`（那里
+    逐行标出 `meta_error`），不是这里。
+    """
+    try:
+        name = read_meta(workspace_root, session_id).get("name")
+    except ValueError:
+        return None
+    return name if isinstance(name, str) and name else None
 
 
 # ---------- state 序列化（全字段，不手写白名单） ----------
@@ -223,8 +368,18 @@ class Session:
             "checkpoint_every": self.checkpoint_every,
             "state": dump_state(state),   # 全字段快照（见模块 docstring）
         }
+        return self._write_payload(state.step, payload)
+
+    def _write_payload(self, step: int, payload: dict) -> Path:
+        """把一个**已经组装好的** payload 原子写到 `step-{step}.json`。
+
+        与 `_write` 分开是因为 `fork()` 要写的是从别处读来的 payload（内容不由
+        本会话的 state 决定）。两条路径共用同一份"怎么落盘"的知识 —— 原子写、
+        缩进、编码。各写一遍的话，将来改落盘格式就会漏掉分叉这条路径，
+        而它的失败方式是**静默的**：分叉出来的会话少了某个字段，跑起来才发现。
+        """
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        path = self.checkpoint_dir / f"step-{state.step}.json"
+        path = self.checkpoint_dir / f"step-{step}.json"
         tmp = path.with_suffix(".json.tmp")
         tmp.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -273,14 +428,121 @@ class Session:
         return session, load_state(payload, session_id)
 
     def _load_payload(self, step: int | None) -> dict:
-        path = (
-            self.checkpoint_dir / f"step-{step}.json"
-            if step is not None
-            else self.latest_checkpoint()
-        )
-        if path is None:
-            raise FileNotFoundError(f"没有可恢复的检查点: {self.checkpoint_dir}")
+        if step is None:
+            path = self.latest_checkpoint()
+            if path is None:
+                raise FileNotFoundError(f"没有可恢复的检查点: {self.checkpoint_dir}")
+        else:
+            path = self.checkpoint_dir / f"step-{step}.json"
+            if not path.exists():
+                # 检查点是**按节拍**落的：`--checkpoint-every 2` 的会话只有偶数步。
+                # 裸的 `FileNotFoundError: .../step-3.json` 既看不出是步数写错了、
+                # 也看不出是节拍问题，而 step 级分叉正是我们对外宣传的能力 ——
+                # 所以要把**实际有哪几步**说出来（同 `SessionNotFound` 的做法：
+                # 报错必须给出下一步，只说"找不到"等于把用户扔在原地）。
+                available = self.list_checkpoints()
+                hint = f"可用: {available}" if available else "这个会话还没有检查点"
+                raise FileNotFoundError(f"第 {step} 步没有检查点（{hint}）")
         return json.loads(path.read_text(encoding="utf-8"))
+
+    # ---------- 分叉 ----------
+
+    @classmethod
+    def fork(
+        cls,
+        workspace_root: Path,
+        session_id: str,
+        *,
+        step: int | None = None,
+        new_id: str | None = None,
+        name: str | None = None,
+    ) -> tuple["Session", AgentState]:
+        """从源会话的**某一步**检查点分叉出一个新会话，返回 (Session, AgentState)。
+
+        与 TS 原版的差别在这里：它的 `/fork` 是**会话级**的（把整段会话复制一份
+        从"现在"接着走），我们挂在 **step 级检查点**上，所以可以**回到任意一步**
+        再开一条路 —— 检查点本来就是逐步落的，这个能力是现成的。
+
+        **它是对话分叉，不是工作区分叉。** 这条必须说清楚，否则很容易被当成
+        "时光倒流"：工作区（文件）不会被回滚到第 N 步的样子，分叉后的 agent 看到
+        的是**当前**的工作区。想做"回到第 3 步且文件也回到第 3 步"，需要的是
+        工作区快照，我们**没有**这个机制。所以 CLI 在分叉后会把这句打出来。
+
+        搬什么（三样，都以 fork_step 为界）：
+        1. **检查点 `step-1..fork_step`** —— 于是新会话可以 `--resume --step K`
+           回到其中任意一步，而不只是分叉点。
+        2. **轨迹里 `step <= fork_step` 的行**。不能整份复制：轨迹是**追加**的，
+           源会话在 fork_step 之后的 `security_finding` 也会被一起搬过去，
+           分叉出来的会话于是"继承"了它根本没发生过的事件。
+        3. **meta 里的 `forked_from`**（来源 + 步数），供 `--sessions` 显示血统。
+        """
+        source = cls(Path(workspace_root), session_id)
+        payload = source._load_payload(step)
+        fork_step = int(payload["step"])
+        sid = new_id or unique_session_id(workspace_root)
+
+        cadence = _stored_cadence(payload)
+        fork = cls(
+            Path(workspace_root), sid,
+            checkpoint_every=DEFAULT_CHECKPOINT_EVERY if cadence is None else cadence,
+        )
+
+        for n in source.list_checkpoints():
+            if n > fork_step:
+                continue
+            src = source.checkpoint_dir / f"step-{n}.json"
+            copied = json.loads(src.read_text(encoding="utf-8"))
+            # 副本里那个 `session_id` 是**源会话的**。`load_state` 会 pop 掉它，
+            # 所以今天无害 —— 但它是一颗定时炸弹：谁哪天直接读 `payload["session_id"]`
+            # 就会拿到源会话。宁可现在重写，也不留一个"当前无人读、将来必有人读"的错值。
+            copied["session_id"] = sid
+            fork._write_payload(n, copied)
+
+        fork._copy_trajectory(source, fork_step)
+        update_meta(
+            Path(workspace_root), sid,
+            name=(validate_name(workspace_root, name) if name else default_fork_name(
+                workspace_root, session_id, fork_step
+            )),
+            forked_from={"session": session_id, "step": fork_step},
+        )
+        return fork, load_state(fork._load_payload(fork_step), sid)
+
+    def _copy_trajectory(self, source: "Session", fork_step: int) -> int:
+        """把源轨迹里 `step <= fork_step` 的行搬过来，返回搬了多少行。
+
+        解析不了的行**原样保留**：轨迹是 kill 在写一半时唯一留下的证据，
+        因为"这一步我读不懂"就把它删掉，等于把唯一的现场扔了。它也不会影响
+        任何判定 —— 污染标记重放读的是**检查点里的 `state.events`**，不是轨迹。
+        """
+        if not source.trajectory_path.exists():
+            return 0
+        kept: list[str] = []
+        for line in source.trajectory_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                event = json.loads(line)
+                if int(event.get("step", 0)) > fork_step:
+                    continue
+            except (json.JSONDecodeError, TypeError, ValueError):
+                pass  # 读不懂 → 留着（见 docstring）
+            kept.append(line)
+        if kept:
+            self.trajectory_path.parent.mkdir(parents=True, exist_ok=True)
+            self.trajectory_path.write_text(
+                "\n".join(kept) + "\n", encoding="utf-8"
+            )
+        # 分叉这件事本身也记一笔：新会话的轨迹第一眼看不出自己是分叉来的，
+        # 而 `--sessions` 只有最近状态、没有历史。事件补上这段血统。
+        self.emit({
+            "ts": time.time(),
+            "type": "session_forked",
+            "step": fork_step,
+            "from_session": source.session_id,
+            "from_step": fork_step,
+        })
+        return len(kept)
 
     # ---------- 查询 ----------
 
@@ -321,3 +583,136 @@ def latest_session(workspace_root: Path) -> str | None:
     if not candidates:
         return None
     return max(candidates, key=lambda pair: pair[0])[1]
+
+
+# ---------- 会话清单与查找（M9-3） ----------
+
+@dataclass(frozen=True)
+class SessionInfo:
+    """`--sessions` 一行所需的全部信息（只读快照，不载入检查点正文）。"""
+
+    session_id: str
+    name: str | None
+    latest_step: int
+    checkpoint_count: int
+    mtime: float
+    forked_from: dict | None = None
+    meta_error: str | None = None   # meta 文件坏了：名字没了，但会话本身还在
+
+
+class SessionNotFound(LookupError):
+    """按 id/名字都找不到会话。`available` 是候选清单（供报错时列出来）。"""
+
+    def __init__(self, ref: str, available: list[str]) -> None:
+        self.ref = ref
+        self.available = available
+        super().__init__(f"找不到会话: {ref}")
+
+
+def list_sessions(workspace_root: Path) -> list[SessionInfo]:
+    """列出工作区里所有会话（按最近活动倒序）。
+
+        **键集合取自"轨迹 ∪ 检查点目录"**，而不是只看检查点目录：跑到一半被 kill、
+        还没到第一个检查点就死掉的会话，只有轨迹。那种会话恰恰是最需要被看见的
+        ——「我明明跑过」和「列表里没有」之间不该有落差。
+
+    读不出名字（meta 损坏）不会让整张表挂掉，只在那一行标出来：一个坏文件
+    不该让另外九个正常会话也看不见。
+    """
+    root = Path(workspace_root).resolve()
+    ids: set[str] = set()
+    checkpoints_root = root / "data" / "checkpoints"
+    if checkpoints_root.exists():
+        ids |= {d.name for d in checkpoints_root.iterdir() if d.is_dir()}
+    sessions_dir = root / "data" / "sessions"
+    if sessions_dir.exists():
+        ids |= {p.stem for p in sessions_dir.glob("*.jsonl")}
+
+    infos: list[SessionInfo] = []
+    for sid in ids:
+        cp_dir = checkpoints_root / sid
+        steps = sorted(
+            int(p.stem.split("-")[1])
+            for p in cp_dir.glob("step-*.json")
+            if not p.name.endswith(".tmp")
+        ) if cp_dir.exists() else []
+        stamps = [p.stat().st_mtime for p in cp_dir.glob("step-*.json")] if cp_dir.exists() else []
+        traj = sessions_dir / f"{sid}.jsonl"
+        if traj.exists():
+            stamps.append(traj.stat().st_mtime)
+        name: str | None = None
+        forked_from: dict | None = None
+        meta_error: str | None = None
+        try:
+            meta = read_meta(root, sid)
+            raw_name = meta.get("name")
+            name = raw_name if isinstance(raw_name, str) and raw_name else None
+            raw_from = meta.get("forked_from")
+            forked_from = raw_from if isinstance(raw_from, dict) else None
+        except ValueError as exc:
+            meta_error = str(exc)
+        infos.append(SessionInfo(
+            session_id=sid,
+            name=name,
+            latest_step=steps[-1] if steps else 0,
+            checkpoint_count=len(steps),
+            mtime=max(stamps) if stamps else 0.0,
+            forked_from=forked_from,
+            meta_error=meta_error,
+        ))
+    return sorted(infos, key=lambda i: i.mtime, reverse=True)
+
+
+def resolve_session(workspace_root: Path, ref: str) -> str:
+    """把用户给的引用解析成 session_id：**先当 id，再当名字**。
+
+    id 优先是没有商量余地的：id 是权威标识，名字只是标签。而"名字与 id 撞车"
+    这种情况在 `validate_name` 那头就被拒绝了，所以这里不需要靠优先级去消歧 ——
+    两处合起来才成立：**拒绝坏名字（写入侧）+ id 优先（读取侧）**。
+    """
+    root = Path(workspace_root).resolve()
+    if (root / "data" / "checkpoints" / ref).exists():
+        return ref
+    infos = list_sessions(root)
+    for info in infos:
+        if info.name == ref:
+            return info.session_id
+    raise SessionNotFound(ref, [i.session_id for i in infos])
+
+
+def unique_session_id(workspace_root: Path) -> str:
+    """分配一个没被占用的 session_id。
+
+    `new_session_id()` 的粒度是**秒**，而两条命令在同一秒里跑完完全正常
+    （测试里几乎是必然）。撞了的话 `Session.__init__` 不报错，两个会话直接
+    共用一个检查点目录 —— 后者的检查点覆盖前者，且全程静默。所以这里显式让开。
+    """
+    base = new_session_id()
+    sid, n = base, 2
+    while (
+        (_checkpoints_root(workspace_root) / sid).exists()
+        or (_sessions_dir(workspace_root) / f"{sid}.jsonl").exists()
+    ):
+        sid = f"{base}-{n}"
+        n += 1
+    return sid
+
+
+def default_fork_name(workspace_root: Path, source_id: str, fork_step: int) -> str:
+    """分叉会话的默认名字：`{源名或 id} @{步} 分叉`（重名时补 `-2` / `-3`）。
+
+    默认给名字而不是留空，是为了让 `--sessions` 里一眼能看出血统和分叉点
+    —— 一排 `s20260911-153012` 之间看不出哪两个是同一个任务的两条路。
+    用户可以 `--rename` 覆盖它。
+
+    重名只能**自动让开**、不能报错：同一秒里从同一步分叉两次是很正常的操作，
+    为此让第二条命令失败，是把我们自己造的命名细节变成了用户的路障。
+    """
+    label = session_name(workspace_root, source_id) or source_id
+    base = label[: NAME_MAX_CHARS - len(" @999 分叉")] + f" @{fork_step} 分叉"
+    candidate, n = base, 2
+    while _name_taken(workspace_root, candidate) is not None:
+        tail = f"-{n}"
+        candidate = base[: NAME_MAX_CHARS - len(tail)] + tail
+        n += 1
+    return candidate

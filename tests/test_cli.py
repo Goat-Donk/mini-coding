@@ -542,6 +542,30 @@ def test_resume_honors_checkpoint_every(tmp_path, monkeypatch):
     assert Session(tmp_path, sid).list_checkpoints() == [2, 3, 4, 5]
 
 
+def test_resume_says_which_steps_exist_instead_of_dumping_a_traceback(
+    tmp_path, monkeypatch
+):
+    """`--resume --step K` 撞上没落盘的步数：给人话 + 退出码 1，不是一整个 traceback。
+
+    这是**真跑**挖出来的（不是单测）：`--fork` 与 `--plan` 两条路早就各接了一句
+    人话，只有最常用的 `--resume` 漏了 —— 用户拿到的是 `FileNotFoundError` 加
+    一整段调用栈。而"这一步没落盘"是**正常情形**（检查点按节拍落，
+    `--checkpoint-every 2` 的会话只有偶数步），不是什么意外崩溃。
+    """
+    _seed_via_cli(tmp_path, monkeypatch)          # 检查点 [1, 2, 3]
+
+    result = _invoke(
+        tmp_path, monkeypatch,
+        MockLLM.script(LLMResult(content="不该跑到这里")),
+        extra_args=("--resume", "--step", "9"),
+    )
+
+    assert result.exit_code == 1
+    assert "读不到检查点" in result.output          # 旧的失败形态：这句一个字都没有
+    assert "可用: [1, 2, 3]" in result.output
+    assert "不该跑到这里" not in result.output      # 没恢复出会话，任务不该被跑起来
+
+
 def test_resume_without_the_flag_inherits_the_session_cadence(tmp_path, monkeypatch):
     """`--resume` **不带** `--checkpoint-every` 时，沿用该会话当初的节拍，而不是 CLI 的默认 5。
 
@@ -762,3 +786,202 @@ def test_review_edits_shows_the_diff_in_a_real_cli_run(tmp_path, monkeypatch):
     assert (workspace / "calc.py").read_text(encoding="utf-8") == (
         "def add(a, b):\n    return a + b\n"
     )
+
+
+# ---------- M9-3 fork / rename / --sessions ----------
+
+def _no_llm(mock):  # noqa: ANN001 - 替身签名
+    """`_build_llm` 的替身：**一旦被调用就炸**。
+
+    「这条路径不需要 key」不能靠"我没配 key 它也过了"来测 —— 那种测法在
+    本机有 `.env` 时会因为 `load_dotenv()` 恰好读到 key 而假装通过。
+    直接钉住"根本没走到构造 LLM 那一步"才是可证伪的。
+    """
+    raise AssertionError("这条 CLI 路径不该构造 LLM（它是只读/元数据操作）")
+
+
+def _meta_invoke(tmp_path, monkeypatch, args: list[str]):
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    monkeypatch.setattr("app.cli._build_llm", _no_llm)
+    return runner.invoke(app, args)
+
+
+def _seed_via_cli(tmp_path, monkeypatch, *, cadence: int = 1, task: str = "占位任务"):
+    """真跑一次 CLI 落几个检查点（后面 fork/rename 才有东西可分）。"""
+    for letter in "abcdefgh":
+        (tmp_path / f"{letter}.txt").write_text(f"{letter}\n", encoding="utf-8")
+    return _invoke(
+        tmp_path, monkeypatch,
+        MockLLM.script(*_distinct_reads(0, 3), LLMResult(content="跑完")),
+        extra_args=("--checkpoint-every", str(cadence)), task=task,
+    )
+
+
+def test_sessions_flag_needs_no_key_and_lists_what_is_there(tmp_path, monkeypatch):
+    first = _seed_via_cli(tmp_path, monkeypatch)
+    assert first.exit_code == 0, first.output
+
+    result = _meta_invoke(tmp_path, monkeypatch, ["--sessions"])
+
+    assert result.exit_code == 0, result.output
+    assert "s2026" in result.output or "step 3" in result.output
+    assert "3 个检查点" in result.output
+
+
+def test_rename_flag_writes_a_name_that_resume_then_accepts(tmp_path, monkeypatch):
+    """`--rename` 之后 `--resume --session-id <名字>` 要能跑起来。
+
+    这是"改名有没有用"的唯一判据：光写进 meta 不算数，得有一条真能用名字
+    指到它的路 —— 否则名字就是个没人读的字段。
+    """
+    _seed_via_cli(tmp_path, monkeypatch)
+    renamed = _meta_invoke(tmp_path, monkeypatch, ["--rename", "基线方案"])
+
+    assert renamed.exit_code == 0, renamed.output
+    assert "基线方案" in renamed.output
+
+    resumed = _invoke(
+        tmp_path, monkeypatch,
+        MockLLM.script(LLMResult(content="用名字恢复成功")),
+        extra_args=("--resume", "--session-id", "基线方案"),
+    )
+    assert resumed.exit_code == 0, resumed.output
+    assert "用名字恢复成功" in resumed.output
+    assert "基线方案" in resumed.output          # 横幅里带上名字
+
+
+def test_rename_refuses_a_session_that_does_not_exist(tmp_path, monkeypatch):
+    result = _meta_invoke(tmp_path, monkeypatch, ["--rename", "名字", "--session-id", "没这个会话"])
+    assert result.exit_code == 1
+    assert "找不到会话" in result.output
+    assert "可用的会话" in result.output        # 报错要给出下一步，不能只说"找不到"
+
+
+def test_fork_without_a_task_creates_and_stops(tmp_path, monkeypatch):
+    """只分叉不续跑：分叉不动模型，所以（a）不需要 key（b）打印可执行的续跑命令。"""
+    _seed_via_cli(tmp_path, monkeypatch)
+
+    result = _meta_invoke(tmp_path, monkeypatch, ["--fork", "--step", "2"])
+
+    assert result.exit_code == 0, result.output
+    assert "已分叉" in result.output
+    assert "→ 续跑" not in result.output        # 没有续跑过（没构造 LLM，见 _no_llm）
+    # 指引必须可执行：把新会话 id 原样带上
+    from agent.session import list_sessions
+
+    fork_id = [i for i in list_sessions(tmp_path) if i.forked_from][0].session_id
+    assert f"--session-id {fork_id}" in result.output
+
+
+def test_fork_warns_that_the_workspace_is_not_rolled_back(tmp_path, monkeypatch):
+    """必须明说这是**对话**分叉。
+
+    不说的话，"回到第 3 步"几乎必然被理解成工作区也回去了 —— 而我们的
+    分叉只复制对话，文件停在当前状态。一句会让人误以为文件回滚了的提示，
+    比没有提示更糟。
+    """
+    _seed_via_cli(tmp_path, monkeypatch)
+    result = _meta_invoke(tmp_path, monkeypatch, ["--fork", "--step", "2"])
+    assert "对话分叉" in result.output
+    assert "不会" in result.output and "工作区" in result.output
+
+
+def test_fork_with_a_task_continues_from_the_fork_point(tmp_path, monkeypatch):
+    """`--fork --step 2 "指示"`：接着那一步跑，新检查点写进**新会话**目录。"""
+    _seed_via_cli(tmp_path, monkeypatch)
+
+    result = _invoke(
+        tmp_path, monkeypatch,
+        # 先调一次工具：检查点只在**工具执行后**落盘，最后一步纯文本回答不写
+        # （`loop.py` 的 `session.checkpoint(state)` 在 `_execute_tool_calls` 之后）
+        MockLLM.script(
+            MockLLM.tool("read", {"path": "a.txt"}).responses[0],
+            LLMResult(content="分叉后的结论"),
+        ),
+        extra_args=("--fork", "--step", "2"), task="换个思路",
+    )
+    assert result.exit_code == 0, result.output
+    assert "分叉后的结论" in result.output
+    assert "换个思路" in result.output          # 续跑指示确实送进去了
+
+    from agent.session import Session, list_sessions
+
+    fork = [i for i in list_sessions(tmp_path) if i.forked_from][0]
+    assert fork.latest_step == 3                # 从 2 续到 3（工具那一步落的盘）
+    assert Session(tmp_path, fork.session_id).list_checkpoints() == [1, 2, 3]
+
+
+def test_fork_point_alone_decides_where_resume_continues(tmp_path, monkeypatch):
+    """只分叉、再单独 resume：**分叉点**是决定恢复起点的唯一因素。
+
+    为什么要跟上一个测试分开写：`--fork --step 2 "指示"` 那条命令里，
+    `--step 2` 会**同时**喂给分叉点（`Session.fork(step=...)`）和恢复点
+    （`from_checkpoint(step=...)`）。两条路都正确时结果一样 —— 所以把分叉点
+    改成"用最新一步"也照样通过（这就是它最初漏掉一个变异体的原因）。
+    这里先只分叉、再不带 `--step` 地续跑，分叉点就成了唯一的决定者。
+    """
+    _seed_via_cli(tmp_path, monkeypatch)
+    _meta_invoke(tmp_path, monkeypatch, ["--fork", "--step", "2"])
+    from agent.session import Session, list_sessions
+
+    fork_id = [i for i in list_sessions(tmp_path) if i.forked_from][0].session_id
+
+    result = _invoke(
+        tmp_path, monkeypatch,
+        MockLLM.script(
+            MockLLM.tool("read", {"path": "a.txt"}).responses[0],
+            LLMResult(content="从第 2 步续上"),
+        ),
+        extra_args=("--resume", "--session-id", fork_id),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "从第 2 步续上" in result.output
+    # 分叉点若是"最新一步"，这里会是 [1, 2, 3, 4]
+    assert Session(tmp_path, fork_id).list_checkpoints() == [1, 2, 3]
+
+
+def test_rename_combined_with_fork_renames_the_fork_not_the_source(tmp_path, monkeypatch):
+    """`--fork ... --rename X`：改名的是**分叉出来的那个**。
+
+    这个组合很容易写成"先改名再分叉"，那样名字落在源会话上，而新会话顶着
+    自动生成的名字 —— 用户以为自己给新会话起了名，实际改的是老的。
+    """
+    _seed_via_cli(tmp_path, monkeypatch)
+    from agent.session import list_sessions, latest_session, session_name
+
+    source = latest_session(tmp_path)          # 先记下来：分叉完最新的是分叉那个
+    result = _meta_invoke(
+        tmp_path, monkeypatch, ["--fork", "--step", "2", "--rename", "另一条路"]
+    )
+
+    assert result.exit_code == 0, result.output
+    fork = [i for i in list_sessions(tmp_path) if i.forked_from][0]
+    assert fork.name == "另一条路"
+    assert session_name(tmp_path, source) is None     # 源会话没被改名
+
+
+def test_fork_does_not_touch_the_source_session(tmp_path, monkeypatch):
+    _seed_via_cli(tmp_path, monkeypatch)
+    from agent.session import Session, latest_session
+
+    source = latest_session(tmp_path)
+    before = (tmp_path / "data" / "checkpoints" / source / "step-2.json").read_text(
+        encoding="utf-8"
+    )
+    _meta_invoke(tmp_path, monkeypatch, ["--fork", "--step", "2"])
+
+    assert Session(tmp_path, source).list_checkpoints() == [1, 2, 3]
+    assert (tmp_path / "data" / "checkpoints" / source / "step-2.json").read_text(
+        encoding="utf-8"
+    ) == before
+
+
+def test_session_name_appears_in_the_plan_banner(tmp_path, monkeypatch):
+    """`--plan` 也走同一个"取会话 id"的解析（含名字）—— 两处曾各写一遍。"""
+    _seed_via_cli(tmp_path, monkeypatch)
+    _meta_invoke(tmp_path, monkeypatch, ["--rename", "计划会话"])
+    result = _meta_invoke(tmp_path, monkeypatch, ["--plan", "--session-id", "计划会话"])
+    assert result.exit_code == 0, result.output
+    assert "计划会话" in result.output
+
