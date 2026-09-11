@@ -4,7 +4,7 @@
 **核心循环手写**（不套 LangGraph / Agent SDK），支撑层用成熟库（openai SDK / pydantic v2 / streamlit / typer / pytest）。
 
 > **一句话**：把 Claude Code 的架构用 Python 重写一遍——不是移植代码，是移植设计。
-> 6,241 行源码 / 24 个模块 / 330 个测试。真实跑分见[评估章节](#评估eval)。
+> 6,278 行源码 / 24 个模块 / 340 个测试。真实跑分见[评估章节](#评估eval)。
 
 📄 文档：[技术方案 `docs/TECH_SPEC.md`](docs/TECH_SPEC.md) · [架构详解 `docs/architecture.md`](docs/architecture.md) · [任务清单 `TASKS.md`](TASKS.md) · [参考笔记 `docs/reference/`](docs/reference/)
 
@@ -17,7 +17,7 @@
 | 能力 | 说明 | 对应 Claude Code 机制 |
 |---|---|---|
 | **cache-aware 上下文布局** | 稳定前缀（system+task 固定不动）+ 三级 compact，让 DeepSeek 磁盘缓存持续命中；控制台实时画命中率与省钱曲线 | TOKEN_BUDGET / CONTEXT_COLLAPSE |
-| **step 级检查点 / 崩溃恢复** | 每 5 步原子落盘 state，`--resume` 从最近检查点**接着 step 计数**续跑；任务中途 kill 进程不丢进度 | `/resume` |
+| **step 级检查点 / 崩溃恢复** | 每 N 步原子落盘 state，`--resume` 从最近检查点**接着 step 计数**续跑；任务中途 kill 进程不丢进度。**节拍随会话落盘**：`--resume` 不带 `--checkpoint-every` 时沿用会话当初的值，并把生效值打出来 | `/resume` |
 | **block-at-submit hooks** | `PreToolUse` 包裹 `git commit`，`data/tests_pass.marker` 不存在就**阻断**——逼 agent 进入「测试并修复」循环；marker 只在**测试命令真跑成功**时由 `PostToolUse` 写入，失败即清除 | Hooks（block-at-submit） |
 | **真·轨迹驱动评估** | 从 tinydb 真实 git history 挖 bug 修复提交构造黄金任务，隐藏测试判分，出完成率/成本回归报告 | SWE-bench 思路 |
 | **分层记忆 + 自进化** | `CODEAGENT.md` / `CLAUDE.md` / `.codeagent/rules/*.md` 分层 + `@include` + hash 去重 + 预算；任务后提取约定写回，**下次会话自动生效** | CLAUDE.md 机制 |
@@ -28,28 +28,45 @@
 | **提问暂停 / 续答** | 信息不足时 agent 调 `ask_user` **停下**并把问题打出来；`--resume "你的回答"` 把回复送进会话接着跑。「打断」是**数据标志**（`ToolResult.await_user`）而非阻塞控制流，所以 headless 评测只要不注册这个工具就完全不受影响 | `ask_user` 工具 / 澄清提问 |
 | **skills 渐进披露** | 工作区放 `SKILL.md`，**只有 name + 简介**进 system prompt，正文由 `load_skill` 按需取 —— 装 50 个 skill 也不额外占常驻 token | Skills（渐进披露） |
 | **计划清单跨回合** | `update_plan` 写 `state.plan`，**随检查点落盘**：中途 kill 或换会话续跑都不丢；`--plan` 可无 key 直接查看。每次传**完整清单**（不是增量），状态只有一个写入者 | TodoWrite / 计划清单 |
-| **工具输出分级截断** | compact 流水线的**第 0 级**：按工具给不同预算先缩内容，缩不够才删消息；`grep`/`pytest` 的**结论在尾部**，所以是 head 70% + tail 30% 而不是只留头部；**失败结果给更大预算**（错误原文是模型自修复的依据）。**只在越过 warning 线时才跑**，低于阈值逐字节不碰（保住前缀缓存） | 上下文分级截断 |
+| **工具输出分级截断** | compact 流水线的**第 0 级**：按工具给不同预算先缩内容，缩不够才删消息；`grep`/`pytest` 的**结论在尾部**，所以是 head 70% + tail 30% 而不是只留头部；**失败结果给更大预算**（错误原文是模型自修复的依据）。**只在越过 warning 线时才跑**，低于阈值逐字节不碰（保住前缀缓存）| 上下文分级截断 |
+
+> ⚠️ 最后一行（分级截断）**实测收益比设计预期小**：端到端命中率没降，但单次截断要付 8.8 倍的 miss token，且免不掉下一级。**去留已拍板：保持现状**（理由与完整数据见 [分级截断的真实代价](#分级截断的真实代价端到端看不见微观对照看得见) 与 `TASKS.md` 的 P7-d）。
 
 > 上表最后四项是 M8 按参考实现的**设计**重写的（未复制任何代码），出处与「哪些明确不吸收」见 [MiniCode 笔记 §8](docs/reference/minicode-notes.md)。
 
 ### 实测：缓存命中率曲线（真·冷启动）
 
-cache-aware 布局不是设计推理，是**测出来的**。下面是 DeepSeek 官方通路（`deepseek-chat`）一次**真·冷启动**的逐步缓存命中——所谓冷启动是真的没命中：换个新的 workspace 目录，`{workspace_root}` 变了 → system prompt 前缀不同 → provider 侧缓存必然为空，所以 step 1 的命中率是 **0%**。
+cache-aware 布局不是设计推理，是**测出来的**。下面是 DeepSeek 官方通路（`deepseek-chat`）一次**真·冷启动**的逐步缓存命中——所谓冷启动是真的没命中：换一个没跑过的新 workspace 目录，`{workspace_root}` 变了 → system prompt 前缀不同 → provider 侧缓存必然为空，所以 step 1 的命中率是 **0%**。
 
 ```
 step  prompt   hit   miss   命中率
-   1    1376      0   1376    0%     ← 冷启动：整段前缀首次出现
-   2    1502   1280    222   85%
-   3    1939   1536    403   79%
-   4    2120   1920    200   91%
-   5    2294   2048    246   89%
-   6    2365   2176    189   92%
-                                 累计 77%（6 步修完 bug，12,064 token）
+   1    2411      0   2411    0%     ← 冷启动：整段前缀首次出现
+   2    2534   2304    230   91%
+   3    2797   2560    237   92%
+   4    3147   2816    331   89%
+   5    3345   3200    145   96%
+   6    3433   3200    233   93%
+                                 累计 80%（6 步修完 bug，prompt 共 17,667 token）
 ```
 
-这张表说明的就是 cache-aware 布局在做的事：**稳定前缀（system + 任务 + 工具 schema）一旦被缓存，后续每一步的 prompt 增量（新工具结果）只需付 miss 的钱**。命中量随步数单调增长（1280 → 1536 → 1920 → 2048 → 2176），因为每一步都在给已缓存的前缀续上新的一段。
+这张表说明的就是 cache-aware 布局在做的事：**稳定前缀（system + 任务 + 工具 schema）一旦被缓存，后续每一步的 prompt 增量（新工具结果）只需付 miss 的钱**。命中量随步数单调增长（2304 → 2560 → 2816 → 3200），因为每一步都在给已缓存的前缀续上新的一段。
 
 > 一个容易自欺的坑：同一条命令连着跑第二遍，step 1 就不再是 0% 了（前缀还在 provider 的磁盘缓存里，实测能到 85% 起步）。**那不是冷启动曲线**——要测冷启动必须换一个没跑过的工作目录。
+
+> 表里这一版是 **2026-09-11 用当时的 system prompt 复测的**（M8 给 prompt 加了 `update_plan` 引导语与 `ask_user` 槽位，旧版那条 1,376 起步的曲线属于更早的 prompt，已作废）。复测的意义不只是换数字：**这份曲线和「三级 compact」是同一份代码跑出来的**，所以它是下面那条截断结论的基线。
+
+### 分级截断的真实代价：端到端看不见，微观对照看得见
+
+「只在越过 warning 线时才动」这条设计不变量是对的，但**实测出来的收益比设计预期小得多，而且代价的形状和当初想的不一样**。两句话说完：
+
+- **端到端命中率没有下降**：两臂只差 `_truncate_oversized` 开/关，两个压力区间跑下来 B−A 都在 **±0.02%** 以内（区间①两臂的累计 hit token 甚至逐 token 相同：319,616）。
+- **但这不等于代价为零**。截断触发的那一步，下一级的 LLM 摘要**也在同一步触发**，缓存本来就整段失效——代价被淹在里面了。把一次截断单独拎出来做对照：它省下 5,128 token，代价是 **45,304 个 miss token（8.8 倍）**，该步命中率从 100% 掉到 28%。
+
+代价的形状是**后缀失效**：`_head_tail` 保留头部 70%，前缀缓存一路匹配到那 70% 处才分叉，**被改的那条之后全部算未命中**。所以代价不取决于截掉多少字符，取决于**它后面还压着多少** —— 同样截 4,000 字符，截第 7 条（后面 12 条）少命中 50,432 token，截第 17 条（后面 2 条）只少 13,312，差 **3.8 倍**。好在它是**一次性**的：同一份截断后的 messages 重发一次，miss 从 45,442 回到 134。
+
+它同样**没能免掉下一级**：中段窗口要到 20 条消息才非空，而那时 utilization 已经到 1.06 / 1.23，远在 0.85 之上；一次释放的 token 只值预算的 5.9~7.4 个百分点，每步增量却是 11~13 个百分点——追不上。真实小仓库的工具输出（本仓库真跑时最大 430 字符）更是连 4,000 字符的 `read` 预算都够不着，第 0 级被调用 8~13 次、**一次可截的都没有**。
+
+唯一稳定为正的收益是**尾部结论行 8/8 次保住**（`grep`/`pytest` 的结论在尾部，只留头等于把最该看的部分丢掉）——这条设计约束是对的，且实测每次都守住。**去留已拍板：保持现状** —— 不选"优先截最靠后的合格消息"（缓存代价能降到 1/3.8）是因为它会**先丢掉最老的上下文**，而"最近的最相关"是比缓存算术更硬的约束。完整数据见 [TASKS.md 的 P7-d 一节](TASKS.md)。
 
 另外吸收了 [MiniCode](https://github.com/LiuMengxuan04/MiniCode) 的长会话治理经验：provider-usage-first token 记账、超大工具结果落盘+预览、确定性 snip 裁剪、空响应重试、细粒度权限决策。
 
@@ -74,6 +91,10 @@ flowchart TB
         SESS["session.py<br/>JSONL 轨迹 + 检查点 + resume"]
     end
 
+    subgraph SKILL["渐进披露 agent/skills.py"]
+        SK["skills.py<br/>SKILL.md 发现 + 索引渲染<br/>正文按需加载"]
+    end
+
     subgraph GOV["治理层 agent/"]
         PERM["permissions.py<br/>once/turn/always + 黑名单 + 沙箱"]
         HOOK["hooks.py<br/>Pre/PostToolUse + block-at-submit"]
@@ -85,6 +106,9 @@ flowchart TB
         BASH["bash.py<br/>沙箱 + 危险命令拦截"]
         FILES["files.py<br/>read · write · edit · glob · grep"]
         SUB["subagent.py<br/>research 子代理（只读）"]
+        ASK["ask.py<br/>ask_user 提问暂停"]
+        PLAN["plan.py<br/>update_plan 计划清单"]
+        SKT["skills.py<br/>load_skill 取正文"]
     end
 
     subgraph EVAL["评估层 eval/"]
@@ -104,11 +128,16 @@ flowchart TB
     BASE --> BASH
     BASE --> FILES
     BASE --> SUB
+    BASE --> ASK
+    BASE --> PLAN
+    BASE --> SKT
     CTX --> TR
     MEM --> STATE
     RUN --> GT
     RUN --> LOOP
     RP --> SESS
+    SK --> SKT
+    SK -. 索引进 system prompt .-> STATE
     SUB -. 复用自己的 QueryEngine .-> LOOP
 ```
 
@@ -128,7 +157,7 @@ sequenceDiagram
     loop 每步
         Q->>L: chat(messages, tools)
         L-->>Q: content / tool_calls + usage
-        Q->>Q: token 记账 → utilization 判定 → snip / LLM compact
+        Q->>Q: token 记账 → utilization 判定 → 三级 compact（分级截断 / snip / LLM 摘要）
         alt 全部只读
             Q->>T: 并发执行
         else 含写工具
@@ -212,7 +241,7 @@ python -m eval.runner --limit 2 --mock           # 无 key 冒烟：只验证管
 **测试**：
 
 ```bash
-python -m pytest tests/                  # 330 passed
+python -m pytest tests/                  # 340 passed
 ```
 
 ---
@@ -278,15 +307,15 @@ $ python -m eval.runner --limit 2
 
 | 层 | 文件 | 行数 |
 |---|---|---|
-| 核心循环 | `agent/loop.py` `llm.py` `state.py` `context.py` `tool_result.py` `session.py` | 1,738 |
+| 核心循环 | `agent/loop.py` `llm.py` `state.py` `context.py` `tool_result.py` `session.py` | 1,758 |
 | 治理 | `agent/permissions.py` `hooks.py` `memory.py` `security.py` | 1,434 |
 | 技能 | `agent/skills.py` | 271 |
 | 工具 | `agent/tools/base.py` `bash.py` `files.py` `subagent.py` `ask.py` `plan.py` `skills.py` | 1,097 |
 | MCP | `agent/mcp.py` | 386 |
-| 入口 | `app/cli.py` `ui_streamlit.py` `replay.py` | 825 |
+| 入口 | `app/cli.py` `ui_streamlit.py` `replay.py` | 842 |
 | 评估 | `eval/golden_tasks.py` `runner.py` | 490 |
-| **源码合计** | **24 个模块** | **6,241** |
-| 测试 | `tests/` | 5,957（330 个用例） |
+| **源码合计** | **24 个模块** | **6,278** |
+| 测试 | `tests/` | 6,115（340 个用例） |
 
 > 口径：源码 = `agent/` + `app/` + `eval/` 里**被 git 跟踪**的 `.py` 行数（不含 `eval/repos/` 下的克隆仓，它被 gitignore）；模块数 = 其中**非空**的 `.py` 文件数（4 个空 `__init__.py` 不计）。
 

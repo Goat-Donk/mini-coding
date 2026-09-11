@@ -665,6 +665,23 @@ return state.messages
 **测试必须包含这条不变量**：`utilization < 0.70` 时消息**逐字节不变** —— 它是唯一能挡住
 "顺手把分级截断改成每步都跑"的测试，因为那个改动不会让任何别的东西变红。
 
+**实测（2026-09-11，DeepSeek 官方通路，脚本与原始输出在 `m8verify/`，已 gitignore）**：
+
+| 测法 | 结果 |
+|---|---|
+| 端到端 A/B（两臂只差本开关；budget 64,000/13×10KB 与 34,000/18×6KB 两个区间） | 累计命中率 B−A = **+0.003% / −0.014%**；区间①两臂累计 hit token **逐 token 相同**（319,616）。**命中率没有下降** |
+| 单次截断微观对照（真实检查点做 base，每个变体只发一次） | 省 5,128 token ↔ 多付 **45,304 miss token（8.8 倍）**，该步命中率 100% → 28%；**一次性**（重发同一份 messages，miss 从 45,442 回到 134） |
+| 代价的形状 | **后缀失效**：前缀缓存匹配到 `_head_tail` 保留的头部 70% 处才分叉，被改的那条之后全算未命中。同样截 4,000 字符，第 7 条（后面 12 条）少命中 50,432，第 17 条（后面 2 条）只少 13,312，**差 3.8 倍** |
+| 能否免掉第 2 级 | **不能**。中段窗口要到 20 条消息才非空，那时 utilization 已 1.06~1.23；一次释放值预算的 5.9~7.4 个百分点，每步增量 11~13 个百分点 |
+| 真实小仓库输出规模下 | 第 0 级被调用 8~13 次、**一次可截的都没有**（工具输出 160~430 字符 vs `read` 预算 4,000 字符）。三级时代的两级触发记录**原样复现** |
+| 唯一稳定为正的收益 | **尾部结论行 8/8 次保住** |
+
+> 结论：**上面那条不变量该守，但这条机制的收益比设计预期小得多，代价只是被同一步触发的
+> LLM 摘要遮蔽了**。**去留已拍板（2026-09-11）：保持现状** —— 不选"优先截最靠后的合格
+> 消息"（缓存代价降到 1/3.8）是因为它会先丢掉最老的上下文，而"最近的最相关"是比缓存
+> 算术更硬的约束；不选去掉是因为"尾部结论行 8/8 保住"这条收益实测为正。完整数据在
+> `TASKS.md` 的 P7-d 一节。
+
 ### 6.4 cache-aware 消息布局（我们的独家，叠加在其上）
 
 - **目标**：最大化 DeepSeek 磁盘缓存命中 → 稳定前缀（system + 全部工具 schema + 记忆块）永远在最前且不变。
@@ -879,16 +896,18 @@ def new_session_id() -> str: ...                      # "s%Y%m%d-%H%M%S"
 
 class Session:
     def __init__(self, workspace_root: Path, session_id: str, *,
-                 checkpoint_every: int = 5, on_event=None): ...
+                 checkpoint_every: int = DEFAULT_CHECKPOINT_EVERY, on_event=None): ...
     def emit(self, event: dict) -> None               # on_event 转发 + append JSONL
     def checkpoint(self, state: AgentState) -> None   # 每 N 步写一次（_ticks 计数，恢复后重新数）
     def _write(self, state: AgentState) -> Path       # 原子写：.json.tmp → replace
     @classmethod
     def from_checkpoint(cls, workspace_root, session_id, *, step=None,
-                        checkpoint_every=5) -> tuple[Session, AgentState]  # step=None → 最近
+                        checkpoint_every: int | None = None
+                        ) -> tuple[Session, AgentState]  # step=None → 最近；None → 沿用会话里记的
     def list_checkpoints(self) -> list[int]
     def latest_checkpoint(self) -> Path | None
 
+DEFAULT_CHECKPOINT_EVERY = 5                 # 新会话的默认节拍；老检查点的回落实也在用它
 _SKIP_FIELDS = frozenset({"emitter"})        # 运行时对象，不落盘
 _FIELD_DECODERS = {"usage": ..., "last_usage": ...}   # JSON dict → Usage
 _LEGACY_FLAT_KEYS: tuple[str, ...]           # M7 之前的平铺格式（冻结，只读老文件）
@@ -897,11 +916,30 @@ def dump_state(state: AgentState) -> dict    # 全字段快照；不可序列化
 def load_state(payload: dict, session_id: str) -> AgentState   # 新旧格式都吃
 def state_dict(payload: dict) -> dict        # 读者入口：兼容两种格式取 state
 def latest_session(workspace_root: Path) -> str | None  # 按检查点 mtime 选最近会话
+def _stored_cadence(payload: dict) -> int | None  # 读会话当初的节拍；缺失/非法 → None
 ```
 
 - 轨迹文件 `data/sessions/{id}.jsonl`（append-only；M3-3 compact 裁掉的中段消息仍完整保留，
   snip/摘要标记都指向这里）；检查点 `data/checkpoints/{id}/step-{N}.json` 形如
-  `{"session_id", "step", "ts", "state": {...}}`，`state` 是 **AgentState 全字段快照**。
+  `{"session_id", "step", "ts", "checkpoint_every", "state": {...}}`，`state` 是
+  **AgentState 全字段快照**。
+- **检查点节拍是会话的事实，跟着检查点落盘（M8）**。`checkpoint_every` 放在 payload
+  **顶层**而不是 `state` 里 —— 它是会话配置，不是 `AgentState` 的字段（`state` 会被
+  整个喂给 `AgentState(**raw)`）。恢复时的优先级：
+
+  | 优先级 | 来源 | 说明 |
+  |---|---|---|
+  | 1 | `from_checkpoint(checkpoint_every=N)` 显式传参 | 用户当场指定，**压过**会话里记的 |
+  | 2 | `payload["checkpoint_every"]` | `checkpoint_every=None` 时的来源 |
+  | 3 | `DEFAULT_CHECKPOINT_EVERY` | 只对**本次改动之前**写下的检查点生效（它们没这个字段） |
+
+  为什么要有第 2 档：节拍是**这个会话事实的一部分**。用 `--checkpoint-every 1` 起的
+  会话崩在半路，恢复时按 5 走，代价是丢一整段工作（真跑现场：kill 在 step 5，续跑到
+  step 9，检查点数还是 5）。而且它是**哑的** —— 命令成功、输出正常、退出码 0，唯一
+  证据是检查点数不涨。CLI 因此把**实际生效的节拍打印出来**（唯一的可见性出口）。
+  `_stored_cadence` 对缺失/非法值（0 / 负数 / 非整数，比如检查点被手改过）一律返回
+  `None` 走回落，**不夹成 1**：对一个已损坏的检查点做出"每步都写"这种比默认更激进的
+  行为，是错的方向。
 - **全字段往返（M7）**：state 的落盘/恢复按 `dataclasses.fields()` 自动推导，
   **不手写字段白名单**。原先 `_write` 与 `from_checkpoint` 各有一份手写字段表，
   给 AgentState 加字段**不会落盘且没有任何提示**（已有先例：`cli.py` 重算

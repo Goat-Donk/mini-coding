@@ -4,7 +4,7 @@
 
 ## 项目定位
 
-求职作品集：**CodeAgent** —— 参考 [pengchengneo/Claude-Code](https://github.com/pengchengneo/Claude-Code) 源码架构，用 Python 从零实现的小型 AI Coding Agent（6,241 行 / 24 模块 / 330 测试）。核心循环手写（不套 Agent SDK），支撑层用成熟库（openai / pydantic / streamlit / typer / pytest）。差异化：cache-aware 上下文 + 缓存省钱指标、step 级检查点恢复、block-at-submit hooks、轨迹驱动评估（真实 tinydb 提交 + 隐藏测试）、记忆自进化、MCP 工具接入、注入文本检测 + 会话污染天花板、skills 渐进披露、计划清单跨回合、提问暂停/续答。
+求职作品集：**CodeAgent** —— 参考 [pengchengneo/Claude-Code](https://github.com/pengchengneo/Claude-Code) 源码架构，用 Python 从零实现的小型 AI Coding Agent（6,278 行 / 24 模块 / 340 测试）。核心循环手写（不套 Agent SDK），支撑层用成熟库（openai / pydantic / streamlit / typer / pytest）。差异化：cache-aware 上下文 + 缓存省钱指标、step 级检查点恢复、block-at-submit hooks、轨迹驱动评估（真实 tinydb 提交 + 隐藏测试）、记忆自进化、MCP 工具接入、注入文本检测 + 会话污染天花板、skills 渐进披露、计划清单跨回合、提问暂停/续答。
 
 > 数字口径（改数字时请沿用）：**源码 = `agent/` + `app/` + `eval/` 里被 git 跟踪的 `.py` 行数**（不含 `eval/repos/` 的克隆仓，它被 gitignore）；**模块数 = 其中非空的 `.py` 文件数**（4 个空 `__init__.py` 不计）；**测试 = `tests/` 行数 / pytest 用例数**。
 
@@ -22,7 +22,7 @@
 **M8 移植的四项机制（照设计自己重写，未复制任何代码）**：
 - **提问暂停/续答**：`ask_user` 工具返回 `ToolResult(await_user=True)` —— 打断被建模成**数据标志**，不是阻塞式控制流，turn 语义由 loop 决定。所以 headless 只要**不注册**这个工具就完全不受影响（`eval/runner.py` 用 `default()`，故意不含它）。`--resume "回答"` 把人的回复作为一条 user 消息追加进会话。
 - **skills 渐进披露**：system prompt 只放 name+简介，正文由 `load_skill` 按需取。**`render_skills_block` 的输出绝不能含正文** —— 那是"省 token"的全部依据。
-- **分级截断**：compact 流水线的**第 0 级**（分级截断 → 确定性 snip → LLM 摘要）。**只在 utilization ≥ 0.70 时才跑，这是不变量不是优化开关**：低于阈值必须逐字节不碰，否则每个大工具结果都会破坏一次前缀缓存。破坏它是**静默的**（没有报错，只有一条走平的缓存命中曲线和更贵的账单），所以有一条「utilization < 0.70 时消息逐字节不变」的测试钉着。
+- **分级截断**：compact 流水线的**第 0 级**（分级截断 → 确定性 snip → LLM 摘要）。**只在 utilization ≥ 0.70 时才跑，这是不变量不是优化开关**：低于阈值必须逐字节不碰，否则每个大工具结果都会破坏一次前缀缓存。破坏它是**静默的**（没有报错，只有一条走平的缓存命中曲线和更贵的账单），所以有一条「utilization < 0.70 时消息逐字节不变」的测试钉着。**实测结论对设计不利，别只讲设计**：端到端命中率没降（A/B 差 ±0.02% 以内），但单次截断要付 **8.8 倍**的 miss token（后缀失效，截得越靠前越贵，差 3.8 倍），且**免不掉第 1/2 级**。**去留已拍板（2026-09-11）：保持现状**（代价被同一步的 LLM 摘要遮蔽，不值得为微观那 8.8 倍改取向；也不选"优先截最靠后的"——那会先丢最老的上下文）。数据在 `TASKS.md` P7-d。
 - **计划清单**：`update_plan` 写 `state.plan`（随检查点走）。**每次传完整清单**，状态只有一个写入者。**不要每轮把 plan 注入 messages** —— 计划一变就改一段消息、那段之后的缓存全失效；可见性靠工具结果本身，只在 `--resume` 时补投一次。
 - 这四项的变异测试结果（逐条打断机制、确认对应测试变红）：见 `TASKS.md`。
 
