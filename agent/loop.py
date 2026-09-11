@@ -21,7 +21,14 @@ from agent.hooks import HookEngine
 from agent.llm import BaseLLM, ToolCall, Usage
 from agent.permissions import Decision, PermissionsEngine
 from agent.security import TAINT_NONE
-from agent.state import AgentState, assistant_tool_calls, system, tool_result, user
+from agent.state import (
+    AgentState,
+    assistant_tool_calls,
+    ensure_tool_pairing,
+    system,
+    tool_result,
+    user,
+)
 from agent.tool_result import ToolResultStore, compact_batch
 from agent.tools.base import Tool, ToolContext, ToolRegistry, ToolResult
 
@@ -148,6 +155,21 @@ class QueryEngine:
 
     def run(self, task: str, *, cwd: Path | None = None) -> RunResult:
         """新建会话状态并跑任务。有 session 时用其 session_id（轨迹/检查点归属）。"""
+        return self.run_turn(self.new_state(task), task, cwd=cwd)
+
+    def new_state(self, task: str) -> AgentState:
+        """构造一个全新的会话状态：渲染 system prompt + 拼记忆块 + 认领 session_id。
+
+        **抽出来的理由（M9-5）**：常驻 REPL 必须**自己持有** `AgentState` 才能跨回合
+        （`run()` 把它建在局部变量里就丢了，`RunResult` 也不带它）。而"怎么建 state"
+        这件事只能有一处 —— 否则 system prompt 的槽位渲染、记忆块拼装、session_id
+        归属这三件事会在 REPL 里再写一遍，任何一处漏了都是静默的（模型收到的
+        prompt 少一块，不报错、只是变笨）。
+
+        `messages` 里**只有 system 一条**：第一条 user 消息由 `run_turn` 追加
+        （它是"一个回合"的唯一入口）。这样 `run()` 也不必自己拼 —— 它现在就是
+        `new_state` + `run_turn` 两行。
+        """
         if self.memory_blocks:
             memory_block = "\n".join(f"- {block}" for block in self.memory_blocks)
         else:
@@ -157,29 +179,94 @@ class QueryEngine:
         # 有 session 时用其 session_id（轨迹/检查点归属）；_EmitProxy 之类
         # 只实现 emit 的轻量替身没有 session_id，兜底 "m1"
         session_id = getattr(self.session, "session_id", "m1")
-        state = AgentState(
+        return AgentState(
             session_id=session_id,
             task=task,
             system_prompt=sys_prompt,
-            messages=[system(sys_prompt), user(task)],
+            messages=[system(sys_prompt)],
         )
-        return self._run_loop(state, task, cwd)
+
+    def run_turn(
+        self, state: AgentState, text: str, *, cwd: Path | None = None
+    ) -> RunResult:
+        """**一个用户回合**的唯一入口（M9-5）：接上一条 user 消息 → 跑一轮。
+
+        顺序是固定的，不能调换：
+
+        1. `ensure_tool_pairing` —— 上一回合被 Ctrl+C 打断的话，`messages` 可能停在
+           「assistant(tool_calls=[3 个]) + 只有 1 条 tool 结果」。**必须先修再跑**：
+           下一轮请求带着孤儿 id 会直接被端点 400，而报错发生在**这一回合**，
+           看起来和上次那一下 Ctrl+C 毫无关系。
+        2. 追加 `user(text)` —— **由本方法追加，不由调用方追加**。`--resume` 那条路
+           是 CLI 自己 append 的（还带一条 `resume_instruction` 事件）；REPL 若也
+           各写一遍，漏掉的那次就是"模型收到一个没有提问方的回合"。
+        3. `state.task = text` —— `run_from` 用的是 `state.task`，而轨迹里
+           `RunResult.task` 也是它；不更新就会让第二回合的结论挂上第一回合的任务名。
+        4. 跑一轮，**本轮一份步数预算**（`budget_start`）。
+        """
+        repaired = ensure_tool_pairing(state.messages)
+        if repaired:
+            # 不静默修：轨迹里要留下"这一回合是缝过的"，否则事后看一份对话
+            # 想不通模型为什么会说"重新调用一次"。
+            state.record_event("pairing_repaired", count=repaired)
+        state.task = text
+        state.messages.append(user(text))
+        return self._run_loop(state, text, cwd, budget_start=state.step)
 
     def run_from(self, state: AgentState, *, cwd: Path | None = None) -> RunResult:
         """从检查点恢复的 state 继续执行（Session.resume 配合用）。
 
         step 计数不重置：续跑继续推进步数，新检查点不会覆盖恢复前的同名文件。
+
+        步数**预算**却是新的一份（`budget_start` = 恢复时的 step）：`max_steps`
+        的意思是"这次运行最多走几步"，不是"这个会话累计几步"。旧语义下有个
+        真陷阱 —— 会话跑满 25 步后 `--resume` 会**一次模型调用都不发**，直接又
+        打印「已达到最大步数（请拆分子任务）」，而错误信息指的方向还是错的。
         """
         return self._run_loop(state, state.task, cwd)
 
-    def _run_loop(self, state: AgentState, task: str, cwd: Path | None) -> RunResult:
-        """共享主循环：think → 调工具 → 看结果 → ... → 完成。"""
+    def _run_loop(
+        self,
+        state: AgentState,
+        task: str,
+        cwd: Path | None,
+        *,
+        budget_start: int | None = None,
+    ) -> RunResult:
+        """共享主循环：think → 调工具 → 看结果 → ... → 完成。
+
+        `budget_start`：本次运行的步数预算从哪一步算起。省略 = 进入循环时
+        `state.step` 的值（`run()` 是 0、`run_from` 是恢复出来的步数）。
+        `state.step` 本身**照样累计、不重置** —— 检查点文件名 `step-N.json`、
+        `--fork --step K`、轨迹里的 `step` 字段都依赖它单调递增。
+        """
+        if budget_start is None:
+            budget_start = state.step
+
         state.emitter = self._make_emitter()
+
+        # 新回合：清掉上一回合的终止状态与"本回合"权限记忆（M9-5）。
+        #
+        # 放在这里而不是各入口，是因为**这是唯一一处**能让四个入口（CLI 单发 /
+        # CLI REPL / 控制台 / eval）一起拿到它的地方；在单发路径上两者都是
+        # no-op（一次运行只有一回合，terminated_reason 本来就由本次运行的
+        # 5 个返回点重写），所以不改变任何既有行为。
+        #
+        # `terminated_reason` 不复位的话：REPL 第二回合**全程**带着上一回合的值，
+        # 而中途落的检查点会把它写进 payload —— 于是"从检查点读出来的终止原因"
+        # 与"这个会话真的怎么结束的"是两件事（`app/ui_streamlit.py` 就在读它）。
+        # `permissions.new_turn()` 同理：不清 `_turn` 的话，确认框上的
+        # 「2) 本回合允许」在常驻进程里会变成"一直允许"。
+        state.terminated_reason = None
+        if self.permissions is not None and hasattr(self.permissions, "new_turn"):
+            self.permissions.new_turn()
+
         if self.skills is not None:
             # 记「本次运行带着哪些 skill」进轨迹。放在这里而不是入口，是因为
             # 入口有 3 处（CLI 新建 / CLI resume / 控制台），一处漏了就不一致；
             # 且 `record_discovery` 自己会判断索引是否真在这份 system prompt 里
-            # （resume 用的是会话当初那份，可能没有）—— 不给真空的会话记假事件。
+            # （resume 用的是会话当初那份，可能没有），也会跳过**已经记过**的
+            # 会话 —— 不给真空的会话记假事件，也不给第二回合重复记一份（M9-5）。
             from agent.skills import record_discovery, render_skills_block
 
             record_discovery(
@@ -201,7 +288,7 @@ class QueryEngine:
         empty_retry_count = 0
 
         try:
-            while state.step < self.max_steps:
+            while state.step - budget_start < self.max_steps:
                 messages = self._prepare_messages(state)
                 result = self.llm.chat(messages, self.registry.schemas())
                 state.usage += result.usage

@@ -4,7 +4,7 @@
 **核心循环手写**（不套 LangGraph / Agent SDK），支撑层用成熟库（openai SDK / pydantic v2 / streamlit / typer / pytest）。
 
 > **一句话**：把 Claude Code 的架构用 Python 重写一遍——不是移植代码，是移植设计。
-> 8,310 行源码 / 25 个模块 / 515 个测试。真实跑分见[评估章节](#评估eval)。
+> 9,139 行源码 / 26 个模块 / 559 个测试。真实跑分见[评估章节](#评估eval)。
 📄 文档：[技术方案 `docs/TECH_SPEC.md`](docs/TECH_SPEC.md) · [架构详解 `docs/architecture.md`](docs/architecture.md) · [任务清单 `TASKS.md`](TASKS.md) · [参考笔记 `docs/reference/`](docs/reference/)
 
 ---
@@ -18,6 +18,7 @@
 | **cache-aware 上下文布局** | 稳定前缀（system+task 固定不动）+ 三级 compact，让 DeepSeek 磁盘缓存持续命中；控制台实时画命中率与省钱曲线 | TOKEN_BUDGET / CONTEXT_COLLAPSE |
 | **step 级检查点 / 崩溃恢复** | 每 N 步原子落盘 state，`--resume` 从最近检查点**接着 step 计数**续跑；任务中途 kill 进程不丢进度。**节拍随会话落盘**：`--resume` 不带 `--checkpoint-every` 时沿用会话当初的值，并把生效值打出来 | `/resume` |
 | **step 级分叉 / 会话命名** | `--fork --step K` 从**任意一步**另开一条路（TS 原版的 fork 是**会话级**的，只能从"现在"复制）；`--rename` 给人看得懂的名字，`--sessions` 列出名字 / 步数 / 分叉来源。会话 id **或名字**都能用来 `--resume`。**是对话分叉不是工作区分叉**：文件不回滚到第 K 步，CLI 会明确打出来 | `/fork` · `/rename` · `/resume` |
+| **常驻交互模式（REPL）** | `--repl` 进提示符：**一行输入 = 一个回合**，整个进程共用一份 `messages`，上下文真的接得上（第二回合不重读源码就能接着改）。9 个斜杠命令（`/new` `/resume` `/fork` `/plan` `/sessions` `/rename` `/clear-taint` `/help` `/exit`）全部复用已有函数、零新机制。**多回合把四处「单发时看不见」的失效逼了出来**：`terminated_reason` 不复位、`allow_turn` 永不过期、skill 发现每回合重放、中断后 tool 结果配对残缺（详见下表） | `/resume` 后的连续会话 |
 | **block-at-submit hooks** | `PreToolUse` 包裹 `git commit`，`data/tests_pass.marker` 不存在就**阻断**——逼 agent 进入「测试并修复」循环；marker 只在**测试命令真跑成功**时由 `PostToolUse` 写入，失败即清除 | Hooks（block-at-submit） |
 | **真·轨迹驱动评估** | 从 tinydb 真实 git history 挖 bug 修复提交构造黄金任务，隐藏测试判分，出完成率/成本回归报告 | SWE-bench 思路 |
 | **分层记忆 + 自进化** | `CODEAGENT.md` / `CLAUDE.md` / `.codeagent/rules/*.md` 分层 + `@include` + hash 去重 + 预算；任务后提取约定写回，**下次会话自动生效** | CLAUDE.md 机制 |
@@ -79,7 +80,8 @@ step  prompt   hit   miss   命中率
 ```mermaid
 flowchart TB
     subgraph ENTRY["入口层 app/"]
-        CLI["app/cli.py<br/>typer CLI · --resume"]
+        CLI["app/cli.py<br/>typer CLI · --resume · --repl"]
+        REPL["app/repl.py<br/>常驻交互：一行 = 一个回合"]
         UI["app/ui_streamlit.py<br/>实时事件 · 权限按钮 · 指标曲线"]
         RP["app/replay.py<br/>检查点回放"]
     end
@@ -120,6 +122,7 @@ flowchart TB
     end
 
     CLI --> LOOP
+    REPL --> LOOP
     UI --> LOOP
     LOOP --> LLM
     LOOP --> STATE
@@ -211,6 +214,34 @@ python -m app.cli --fork --step 3 "换个思路"   # 从第 3 步分叉出新会
 python -m app.cli --resume --session-id "基线方案" "接着改"   # 会话 id **或名字**都能指会话
 python -m app.cli --mcp .codeagent/mcp.json "任务"   # 加载 MCP server（第三方工具）
 ```
+
+**常驻交互模式**（`--repl`）：一行输入 = 一个回合，同一个会话连着聊，上下文不丢。
+
+```bash
+python -m app.cli --repl                    # 进提示符
+python -m app.cli --repl "先跑一下测试"      # 带任务：它作为**第一个回合**跑掉再进提示符
+python -m app.cli --repl --resume --session-id <sid>   # 恢复后接着聊
+```
+
+提示符是 `codeagent [会话名或 id · step 12 · high] › `（污染级别只在非 none 时显示）。
+行首的 `/` 一律当命令，**要把它当任务发出去就在行首加一个空格**；打错的命令只打印提示、
+**不会**发给模型（打错一个字母 = 一次真实的模型调用，而回答看起来还挺像回事）。
+
+```
+/help          显示这份帮助
+/exit          退出（等价于 Ctrl+D，或空行处 Ctrl+C）
+/new           开一个新会话（当前会话留在检查点里，可 /resume 回来）
+/resume        切到某个会话：id 或名字；省略 = 最近一个
+/fork          从当前会话的第 N 步分叉出去并切过去（省略 = 最近检查点）
+/plan          打印 agent 自己排的任务计划清单
+/sessions      列出所有会话（名字/步数/检查点数/分叉来源）
+/rename        给当前会话起个人看得懂的名字
+/clear-taint   复位本会话的污染标记（**人的动作**）
+```
+
+每回合结束打一行**本回合**增量（不是会话累计）：`[completed] 本回合 step 6→9 · token 13,323
+（prompt 12,899 + completion 424），缓存命中 95%，上下文 normal (7%)，检查点 7 个`。
+退出时强制落一次检查点，并给出**真能跑起来**的续跑命令。
 
 **联网任务**：`web_fetch` / `web_search` 默认就在工具集里（`ToolRegistry.default()`）。
 
@@ -362,17 +393,18 @@ $ python -m eval.runner --limit 2
 
 | 层 | 文件 | 行数 |
 |---|---|---|
-| 核心循环 | `agent/loop.py` `llm.py` `state.py` `context.py` `tool_result.py` `session.py` | 2,228 |
-| 治理 | `agent/permissions.py` `hooks.py` `memory.py` `security.py` | 1,499 |
-| 技能 | `agent/skills.py` | 271 |
+| 核心循环 | `agent/loop.py` `llm.py` `state.py` `context.py` `tool_result.py` `session.py` | 2,383 |
+| 治理 | `agent/permissions.py` `hooks.py` `memory.py` `security.py` | 1,519 |
+| 技能 | `agent/skills.py` | 281 |
 | 工具 | `agent/tools/base.py` `bash.py` `files.py` `web.py` `subagent.py` `ask.py` `plan.py` `skills.py` | 1,771 |
 | MCP | `agent/mcp.py` | 961 |
-| 入口 | `app/cli.py` `ui_streamlit.py` `replay.py` | 1,090 |
+| 入口 | `app/cli.py` `repl.py` `ui_streamlit.py` `replay.py` | 1,734 |
 | 评估 | `eval/golden_tasks.py` `runner.py` | 490 |
-| **源码合计** | **25 个模块** | **8,310** |
-| 测试 | `tests/` | 9,064（515 个用例） |
+| **源码合计** | **26 个模块** | **9,139** |
+| 测试 | `tests/` | 10,019（559 个用例） |
 
-> 口径：源码 = `agent/` + `app/` + `eval/` 里**被 git 跟踪**的 `.py` 行数（不含 `eval/repos/` 下的克隆仓，它被 gitignore）；模块数 = 其中**非空**的 `.py` 文件数（4 个空 `__init__.py` 不计）。
+> 口径：源码 = `agent/` + `app/` + `eval/` 下的非空 `.py` 行数（不含 `eval/repos/` 下的克隆仓，它被 gitignore）；模块数 = 其中**非空**的 `.py` 文件数（4 个空 `__init__.py` 不计）。
+> **按文件系统数，不按 git 跟踪数** —— 新文件在提交前也该算进去（M9-5 的 `app/repl.py`(503) 与 `tests/test_repl.py`(785) 当时尚未提交）。
 
 ---
 

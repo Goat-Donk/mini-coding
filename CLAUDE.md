@@ -4,13 +4,13 @@
 
 ## 项目定位
 
-求职作品集：**CodeAgent** —— 参考 [pengchengneo/Claude-Code](https://github.com/pengchengneo/Claude-Code) 源码架构，用 Python 从零实现的小型 AI Coding Agent（8,310 行 / 25 模块 / 515 测试）。核心循环手写（不套 Agent SDK），支撑层用成熟库（openai / pydantic / streamlit / typer / pytest）。差异化：cache-aware 上下文 + 缓存省钱指标、step 级检查点恢复 + **step 级分叉/会话命名**、block-at-submit hooks、轨迹驱动评估（真实 tinydb 提交 + 隐藏测试）、记忆自进化、MCP 工具接入（**stdio + Streamable HTTP 两种传输**）、注入文本检测 + 会话污染天花板、联网工具 + SSRF 拦截、skills 渐进披露、计划清单跨回合、提问暂停/续答、改动前 diff 复核。
+求职作品集：**CodeAgent** —— 参考 [pengchengneo/Claude-Code](https://github.com/pengchengneo/Claude-Code) 源码架构，用 Python 从零实现的小型 AI Coding Agent（9,139 行 / 26 模块 / 559 测试）。核心循环手写（不套 Agent SDK），支撑层用成熟库（openai / pydantic / streamlit / typer / pytest）。差异化：cache-aware 上下文 + 缓存省钱指标、step 级检查点恢复 + **step 级分叉/会话命名**、**常驻交互模式（REPL，一行一个回合）**、block-at-submit hooks、轨迹驱动评估（真实 tinydb 提交 + 隐藏测试）、记忆自进化、MCP 工具接入（**stdio + Streamable HTTP 两种传输**）、注入文本检测 + 会话污染天花板、联网工具 + SSRF 拦截、skills 渐进披露、计划清单跨回合、提问暂停/续答、改动前 diff 复核。
 
-> 数字口径（改数字时请沿用）：**源码 = `agent/` + `app/` + `eval/` 里被 git 跟踪的 `.py` 行数**（不含 `eval/repos/` 的克隆仓，它被 gitignore）；**模块数 = 其中非空的 `.py` 文件数**（4 个空 `__init__.py` 不计）；**测试 = `tests/` 行数 / pytest 用例数**。
+> 数字口径（改数字时请沿用）：**源码 = `agent/` + `app/` + `eval/` 下的非空 `.py` 行数**（不含 `eval/repos/` 的克隆仓，它被 gitignore）；**模块数 = 其中非空的 `.py` 文件数**（4 个空 `__init__.py` 不计）；**测试 = `tests/` 行数 / pytest 用例数**。**按文件系统数，不按 git 跟踪数** —— 新文件在提交前也该算进去（M9-5 的 `app/repl.py`(503) 与 `tests/test_repl.py`(785) 当时尚未提交）。
 
-**已验证状态**：真实 LLM 端到端跑通（修 bug 全流程、kill+`--resume` 续跑、eval 出真实报告 50% 1/2）。README「评估」章节有真实数字与口径说明。**M6 收尾后又补齐三项此前只是单测覆盖的验证**：compact 在真实 token 压力下真实触发（当时是两级；M8 加了分级截断，现为三级 compact）、MCP 接真实第三方 server（官方 `mcp-server-time`，stdio）并确认仍走权限/hook 门禁链、Streamlit 控制台用真实 Chrome 打开并操作控件跑通 mock 任务。**M9-4 又补了一项**：MCP 接**真实远程 HTTP** server（DeepWiki 的 Streamable HTTP 端点，走公网）并端到端跑通工具调用。
+**已验证状态**：真实 LLM 端到端跑通（修 bug 全流程、kill+`--resume` 续跑、eval 出真实报告 50% 1/2）。README「评估」章节有真实数字与口径说明。**M6 收尾后又补齐三项此前只是单测覆盖的验证**：compact 在真实 token 压力下真实触发（当时是两级；M8 加了分级截断，现为三级 compact）、MCP 接真实第三方 server（官方 `mcp-server-time`，stdio）并确认仍走权限/hook 门禁链、Streamlit 控制台用真实 Chrome 打开并操作控件跑通 mock 任务。**M9-4 又补了一项**：MCP 接**真实远程 HTTP** server（DeepWiki 的 Streamable HTTP 端点，走公网）并端到端跑通工具调用。**M9-5 又补了三轮**：常驻 REPL 的多回合上下文接续（第二回合不重读源码就改对）、`/rename`+重进+`/fork 2` 新分支接着跑、`--review-edits` 下答「本回合允许」后下一回合同一命令**重新被问**（`m9verify/repl_a|b|c.log`）。
 
-**CLI 治理链路**：`app/cli.py` 两处 `QueryEngine` 都已接 `PermissionsEngine`（默认 allow、危险命令 ask→无确认交互→拒绝、路径越界 deny、**第三方/MCP 工具须在 `mcp.json` 的 `allow` 里显式授权否则 ask**）与 hooks（`default_engine()`：block-at-submit + marker 自动维护 + **注入检测**）。两个入口共用 `hooks.default_engine()`，避免接线漂移（CLI 曾整体漏接 hooks）。`tests/test_cli.py` 有 26 例锁住这个接线。
+**CLI 治理链路**：`app/cli.py` 的 `_Runtime.engine()` 是**唯一** `QueryEngine(...)` 构造点（M9-5 收的，原先两处各写一遍），单发与常驻 REPL 都从它拿引擎 —— 两处都已接 `PermissionsEngine`（默认 allow、危险命令 ask→无确认交互→拒绝、路径越界 deny、**第三方/MCP 工具须在 `mcp.json` 的 `allow` 里显式授权否则 ask**）与 hooks（`default_engine()`：block-at-submit + marker 自动维护 + **注入检测**）。入口层共用 `hooks.default_engine()`，避免接线漂移（CLI 曾整体漏接 hooks）。`tests/test_cli.py` 共 38 例（接线相关的多条在里面）。
 **唯一例外是 `--review-edits`（M9-1）**：它给 CLI 装上 `confirm` 回调并把 `edit`/`write` 抬成 ask，于是改动落盘前人能看到 diff。**默认关闭是刻意的** —— 我们的 CLI 本来没有确认回调，把 edit 改成默认 ask 会让每次改动都退化成拒绝、整条 CLI 不可用（那就把安全机制变成了路障；TS 原版靠 TTY 模式兜住，我们没有）。所以它是 opt-in，默认路径与 eval 一字不变。
 
 **M7 安全机制（措辞红线，别写错）**：本项目**没有**做「防止 prompt 注入」。分三层：① `permissions.py` 执行（确定性）② `hooks.py` PreToolUse 阻断（确定性）③ `security.py` 检测（**概率性，只出告警，从不直接决定放行/拒绝**）。检测出 `high` 后收紧能力的是**后置天花板**（`_apply_taint_ceiling`，只把三类不可逆动作 网络外发/读凭据/写记忆文件 从 ALLOW 降为 ASK），位置**必须在 `_always`/`_turn` 之后、`confirm` 之前**。禁用措辞：不说「防御/防止注入」，不说「污点追踪/taint 传播」（实为**会话级粗粒度标记**），不说「纵深防御/零信任」，不说「子代理沙箱」（实为**受限只读工具集**），不给「误报率低」这类无数字形容词。局限逐条写在 README「已知未修复的绕过路径」（S1–S16，其中 S6–S10 配了探针实测），改任何一条都要同步改那张表。**bash 的凭据判据是「提到即命中」**（`CREDENTIAL_MENTION`，不锚定末尾，见 permissions.py 的注释）——别「顺手修回去」，那会让天花板重新空转。
@@ -73,6 +73,23 @@
 - 变异测试 **41/41** 被抓住（`m9verify/mutate_m9_4.py`）。**一处已验证的等价变异体**（已从列表删掉，理由写在脚本头部）：`_parse_sse` 里 `if line.startswith(":")` 那条注释行判断**算术上不可观测** —— 以 `:` 开头的行 `partition(":")` 出来的 field 恒为空串，永远不等于 `"data"`。
 - **真实远程 HTTP 端到端跑过**（DeepWiki `https://mcp.deepwiki.com/mcp`，真网络真 server）：握手拿到 `protocolVersion 2025-06-18` / `serverInfo DeepWiki 2.14.3`；DeepSeek 驱动实际调用 `read_wiki_structure(repoName=pallets/flask)` 成功（1 步、2425ms、缓存命中 45% → 终局 86%）。**该 server 不回 `Mcp-Session-Id`（无状态模式），我们的客户端照常工作**。
 
+**已做 M9-5 常驻交互模式（REPL，`--repl` + `app/repl.py`）**，机制是：
+- **它不是新功能，是「换个用法」**：同一个 `AgentState` 连跑两次。这个用法第一次让四条**单发进程里结构上不可观测**的契约成为真实路径 —— 这四条才是这一项的产出，界面只是把它们变成必经之路：
+  1. `run_turn` 每回合**复位 `terminated_reason`**（单发时"一个回合"和"一个进程"是同一件事，所以从没有过清空动作；`app/ui_streamlit.py` 会从检查点 payload 里读出它）。
+  2. `run_turn` 每回合调 **`permissions.new_turn()`**（清 `_turn`、**保留 `_always`**）。此前 `_turn` 全仓零 clear/reset，单发路径上它随进程一起消失，所以 `tests/test_permissions.py` 把"回合结束"定义成**新建实例**。常驻进程里 `allow_turn` 就变成**永久放行**，与确认框写的「2) 本回合允许」直接矛盾。**调用点在 `_run_loop` 入口**（唯一能让四个入口都拿到它的地方），单发路径上是 no-op。
+  3. **`record_discovery` 去重认 `state.events`**，不是认"block 在不在 prompt 里"（第二回合 block 还在 → 每回合往轨迹里再写一份 `skill_discovery`）。
+  4. `run_turn` 入口调 **`state.ensure_tool_pairing(messages)`** 补被中断打断的 tool 结果配对，**补了几条就记一条 `pairing_repaired` 事件**（不静默修）。不补的话下一轮请求是 400 形状，而**报错发生在下一回合**、与那次 Ctrl+C 看起来毫无关系。
+- **`max_steps` 语义变更（行为变更，要主动说）**：从「整个 state 的累计步数上限」改成**「每轮一份预算」**（`_run_loop` 记 `budget_start = state.step`，条件 `state.step - budget_start < max_steps`）。`state.step` **照样累计不重置**（检查点文件名、`--fork --step K`、轨迹 `step` 字段都依赖它单调递增），只改预算的**度量起点**。顺带修掉一个陷阱：会话跑满 25 步后 `--resume` 旧语义下**一次模型调用都不发**、直接又打印「已达到最大步数」。
+- **装配不复制（这一项防漂移的关键）**：`QueryEngine(...)` 原先在 `app/cli.py` 被构造**两遍**（`--resume` 一条路、全新会话一条路，参数逐字相同）。收成 `_Runtime.engine(session)` 一处，单发与常驻从同一处拿。**REPL 若自己装配一遍，迟早漏掉一样** —— CLI 历史上**漏接过 hooks 与 permissions 各一次，两次都是静默的**。
+- **两条硬不变量**：① 不认识的斜杠命令**绝不发给模型**（打错一个字母 = 一次真实调用，而回答看起来还挺像回事 → 这个错误不会被发现）；② 会话切换失败**不能半切换**（`_activate` 三样一起换，**engine 必须跟着换** —— `QueryEngine.session` 构造期绑定；"session 换了、engine/state 没换"是**零报错**的错配：轨迹写进 A、你在看 B）。命令判据用 **`raw.startswith("/")`**（strip **之前**的行），所以行首加空格仍当任务发。
+- **9 个命令的正文由 `_COMMANDS` 表生成**（`/help` 与命令表写两处迟早对不上），有测试断言 `/help` 列出的名字**恰好等于**表的键集合。
+- **退出语必须可执行**：`_farewell` 打印「继续: … `--repl --resume --session-id <sid>`」，而检查点是**按节拍**落的、且**只在有工具调用的步上 tick** —— 纯聊天或只走两步就退出会一个检查点都不落，那条命令直接报"读不到检查点"。所以 `_wrap_up` **退出时强制落一次**（理由同 `_awaiting_user` 的 `force=True`：流程即将因非步数原因退出，节流的下一次 tick 永远等不来）。**这条是写测试时逼出来的，不是真跑**，如实记着。
+- **每回合报增量**（`RunResult.steps`/`usage` 是**会话累计**的，五个返回点给的都是 `state.step`）。`Usage` 是**可变 dataclass**、`state.usage += …` 是**原地**累加 → 快照必须 `dataclasses.replace()` 复制，**不复制则相减恒为 0 且不报错**。
+- **`await_user` 在 REPL 里不需要任何特殊代码**（模型提问 → 本轮结束 → 打印问题 → 下一行输入就是回答）。这是 M8「打断是数据标志而不是阻塞控制流」的回报 —— 反过来若 REPL 自己 `input()` 一个"回答"，就是把数据标志退化成阻塞控制流。
+- 变异测试 **19/19** 被抓住（`m9verify/mutate_m9_5.py`）。**三类要说明的**：一个**证明过的等价变异体**（`_run_loop(..., budget_start=state.step)` 省略该实参恒等，因为兜底就是同一个表达式、两次读之间没有东西改 step）；一个**依赖时序的**（`/new` 用 `unique_session_id` 而非秒级 `new_session_id`，跨秒会 MISS —— 但它防的是真缺陷：两个"不同"会话**静默共用**一个检查点目录）；一个**刻意不设的**（`_dispatch` 的 `except typer.Exit: pass`，去掉后 `CliRunner` 会接住异常、退出码照样 0，从输出上分辨不出来）。
+- **一处被变异测试逼出来的测试修正**：空行变异最初 **MISS** —— 空行变成第 3 个回合吃掉脚本响应，最后一条真实输入才报错，而 loop 的 `except Exception` 把它变成 `terminated_reason="error"` 的 `RunResult`、**退出码仍是 0**，原断言照样成立。修法是补 `assert "[error]" not in result.output` 与 `assert users == [...]`（直接钉"模型收到的 user 消息序列"）。
+- **真实端到端跑了三轮**（`m9verify/repl_a|b|c.log`，工作区 `m9verify/ws_m95/`）：A 两回合修 bug + 补测试（第二回合**不重读源码**就改对了）；B `/rename` → 重进 → `/fork 2` → 新分支接着跑；C `--review-edits` 下答「2) 本回合允许」→ **下一回合同一个 edit、同一个文件重新被问**（权限记忆键是 `_classify` 给的 `arguments["path"]`，两回合都是字面量 `textstat.py`，**键相同**，所以"重新问一次"只可能来自回合边界上的清空）。
+
 ## 硬约束（不可违反）
 
 - LLM 只用 DeepSeek（国内 API）；生产 `deepseek-chat`，测试用 MockLLM
@@ -97,7 +114,7 @@
 | 技能 | agent/skills.py | SKILL.md 渐进披露：只把 name+简介进 system prompt，正文由 load_skill 按需取（M8） |
 | 安全 | agent/security.py | 注入文本检测（**概率性，只出告警**）+ 会话级污染标记 + 来源框架（M7） |
 | MCP | agent/mcp.py | 手写 MCP 客户端：`Transport` 抽象 + stdio/Streamable HTTP 两种实现，协议层与传输分离；tools/resources/prompts 三个能力面（第三方工具照样过权限/hooks）（M6-3 / M9-4） |
-| 入口 | app/cli.py · app/ui_streamlit.py · app/replay.py | typer CLI / Streamlit 控制台 / 检查点回放 |
+| 入口 | app/cli.py · app/repl.py · app/ui_streamlit.py · app/replay.py | typer CLI（含 `_Runtime`/`_build_runtime` 唯一 `QueryEngine` 构造点） / **常驻交互模式** / Streamlit 控制台 / 检查点回放 |
 | 评估 | eval/golden_tasks.py · runner.py | 黄金任务 + 完成率/成本回归（M5） |
 
 ## 常用命令
@@ -114,6 +131,9 @@ python -m app.cli --sessions                 # 列出会话：名字/步数/分�
 python -m app.cli --rename "基线方案"          # 给最近会话起名（只动元数据，无 key）
 python -m app.cli --fork --step 3 "换个思路"   # 从第 3 步分叉出新会话并续跑（对话分叉，见下）
 python -m app.cli --resume --session-id "基线方案" "接着改"   # 会话 id **或名字**都能用来指会话
+python -m app.cli --repl                     # 常驻交互模式：一行一个回合（M9-5）
+python -m app.cli --repl "先跑一下测试"        # 带任务：它作为**第一个回合**跑掉再进提示符
+python -m app.cli --repl --resume --session-id <sid>   # 恢复后接着聊（退出时会强制落一次检查点）
 python -m app.cli "任务" --review-edits       # 改动前人工确认：edit/write 先显示 diff（M9-1）
 CODEAGENT_SEARCH_BACKEND=bing python -m app.cli "查 X 并写进文件"   # 联网任务（默认后端 ddg 本机连不上，见下）
 python -m app.cli --mcp .codeagent/mcp.json "任务"   # 加载 MCP server（见 mcp.example.json）

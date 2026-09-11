@@ -626,3 +626,138 @@ def test_preview_is_not_computed_without_a_permissions_engine(tmp_path):
 
     assert result.terminated_reason == "completed"
     assert calls == [], "没有确认交互却算了预览"
+
+
+# ---------- 多回合：`new_state` / `run_turn` / 每轮一份预算（M9-5）----------
+
+def test_new_state_starts_with_only_the_system_message(tmp_path):
+    """`new_state` 只放 system 一条 —— 第一条 user 消息由 `run_turn` 追加。
+
+    两边都追加的话，`run()` 那条路会把任务说两遍（人看不出异常，只多花 token
+    且前缀缓存从第 1 条起就错位）。
+    """
+    engine = make_engine(tmp_path, MockLLM.script())
+    state = engine.new_state("占位任务")
+
+    assert [m["role"] for m in state.messages] == ["system"]
+    assert state.step == 0
+    assert state.session_id == "m1"      # 没有 session 时的兜底归属
+
+
+def test_run_turn_appends_the_user_message_exactly_once(tmp_path):
+    engine = make_engine(
+        tmp_path, MockLLM.script(LLMResult(content="一"), LLMResult(content="二"))
+    )
+    state = engine.new_state("第一件事")
+
+    engine.run_turn(state, "第一件事")
+    engine.run_turn(state, "第二件事")
+
+    users = [m["content"] for m in state.messages if m["role"] == "user"]
+    assert users == ["第一件事", "第二件事"]     # 不重不漏、按顺序
+    assert state.task == "第二件事"              # 轨迹/结论挂的是**本回合**的任务名
+
+
+def test_run_turn_gives_each_turn_its_own_step_budget(tmp_path):
+    """`max_steps` 是"这次运行最多走几步"，不是"这个会话累计几步"。
+
+    旧语义（`state.step < max_steps`）下，第二回合会在**一次模型调用都没发**的
+    情况下直接返回 `max_steps`，而错误文案还建议"拆分子任务"。
+    """
+    tool_call = MockLLM.tool("glob", {"pattern": "*"}).responses[0]
+    engine = make_engine(tmp_path, MockLLM([tool_call] * 4), max_steps=2,
+                         loop_detection_window=10)
+    state = engine.new_state("第一件事")
+
+    first = engine.run_turn(state, "第一件事")
+    second = engine.run_turn(state, "第二件事")
+
+    assert (first.terminated_reason, first.steps) == ("max_steps", 2)
+    assert (second.terminated_reason, second.steps) == ("max_steps", 4)
+    assert state.step == 4      # step 本身照样累计（检查点文件名/分叉/轨迹都靠它）
+
+
+def test_terminated_reason_does_not_leak_across_turns(tmp_path):
+    """上一回合的终止原因必须在本回合开跑前清掉。留着的话，中途落的检查点会把
+    旧值写进 payload —— `app/ui_streamlit.py` 读的正是那个字段。"""
+    tool_call = MockLLM.tool("glob", {"pattern": "*"}).responses[0]
+    engine = make_engine(
+        tmp_path, MockLLM([tool_call]), max_steps=1, loop_detection_window=10
+    )
+    state = engine.new_state("第一件事")
+    engine.run_turn(state, "第一件事")
+    assert state.terminated_reason == "max_steps"
+
+    seen: list[str | None] = []
+
+    def probe(messages, tools):  # noqa: ANN001 - MockLLM 回调签名
+        seen.append(state.terminated_reason)
+        return LLMResult(content="干净地跑完了")
+
+    engine.llm.responses.append(probe)
+    engine.run_turn(state, "第二件事")
+
+    assert seen == [None]
+
+
+# ---------- `ensure_tool_pairing`（中断后的残缺配对）----------
+
+def _pair(state_messages):
+    from agent.state import ensure_tool_pairing
+    return ensure_tool_pairing(state_messages)
+
+
+def test_ensure_tool_pairing_leaves_a_healthy_history_alone():
+    from agent.state import assistant_tool_calls, tool_result, user
+    messages = [
+        user("做点事"),
+        assistant_tool_calls([ToolCall(id="c1", name="read", arguments={"path": "a"})]),
+        tool_result("c1", "内容"),
+    ]
+    before = [dict(m) for m in messages]
+
+    assert _pair(messages) == 0
+    assert messages == before          # 一条都没动（包括不改顺序）
+
+
+def test_ensure_tool_pairing_fills_every_missing_result():
+    """一个 assistant 里 3 个 tool_call、只有 1 条结果 → 补 2 条，且**紧跟在**
+    已有结果之后（顺序错了同样会被端点拒绝）。"""
+    from agent.state import assistant_tool_calls, tool_result, user
+    messages = [
+        user("做点事"),
+        assistant_tool_calls([
+            ToolCall(id="c1", name="read", arguments={"path": "a"}),
+            ToolCall(id="c2", name="read", arguments={"path": "b"}),
+            ToolCall(id="c3", name="read", arguments={"path": "c"}),
+        ]),
+        tool_result("c1", "a 的内容"),
+    ]
+
+    assert _pair(messages) == 2
+    assert [m["role"] for m in messages] == ["user", "assistant", "tool", "tool", "tool"]
+    assert [m["tool_call_id"] for m in messages[2:]] == ["c1", "c2", "c3"]
+    # 补的是**说明性文本**，不是伪造的工具输出 —— 模型据此知道要重调
+    assert "重新调用" in messages[3]["content"]
+
+
+def test_ensure_tool_pairing_is_idempotent():
+    """补过之后再调一次不该再补（常驻 REPL 每个回合入口都会调它）。"""
+    from agent.state import assistant_tool_calls, tool_result, user
+    messages = [
+        user("做点事"),
+        assistant_tool_calls([ToolCall(id="c1", name="read", arguments={"path": "a"})]),
+    ]
+
+    assert _pair(messages) == 1
+    assert _pair(messages) == 0
+    assert len(messages) == 3
+
+
+def test_ensure_tool_pairing_ignores_a_final_assistant_text_message():
+    """以普通文本收尾的历史（最常见的一种）不该被误判成缺配对。"""
+    from agent.state import assistant_text, user
+    messages = [user("做点事"), assistant_text("做完了")]
+
+    assert _pair(messages) == 0
+    assert len(messages) == 2

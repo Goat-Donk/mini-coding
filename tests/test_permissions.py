@@ -90,7 +90,7 @@ def test_confirm_deny_always_remembered(tmp_path):
 
 
 def test_confirm_allow_turn_remembered(tmp_path):
-    """allow_turn → 本回合内同命令放行，turn 结束（新实例）后失效。"""
+    """allow_turn → 本回合内同命令放行，回合结束后失效。"""
     asked = []
     engine = PermissionsEngine(tmp_path, confirm=lambda q: asked.append(q) or "allow_turn")
     ctx = make_ctx(tmp_path)
@@ -100,6 +100,41 @@ def test_confirm_allow_turn_remembered(tmp_path):
     # 新回合（同 workspace 新实例，无 confirm）→ 又需确认（turn 记忆不跨实例）
     engine2 = PermissionsEngine(tmp_path)
     assert engine2.check("bash", {"command": "rm -rf x"}, ctx) is Decision.ASK
+
+
+def test_new_turn_clears_turn_memory_on_the_same_engine(tmp_path):
+    """`new_turn()` 才是"本回合"的边界 —— 不必新建实例（M9-5）。
+
+    上面那条把「回合结束」定义成**新建引擎实例**，在单发 CLI / eval 里这是对的
+    （一个回合 = 一个进程）。常驻 REPL 里不成立：引擎实例是同一个（换会话才换
+    引擎），于是 `_turn` 从不清空，「2) 本回合允许」悄悄变成了"允许到进程退出"
+    —— 与菜单上写着的语义直接矛盾，而且没有任何出口能撤销它。
+    """
+    asked = []
+    engine = PermissionsEngine(tmp_path, confirm=lambda q: asked.append(q) or "allow_turn")
+    ctx = make_ctx(tmp_path)
+    assert engine.check("bash", {"command": "rm -rf x"}, ctx) is Decision.ALLOW
+    assert len(asked) == 1
+
+    engine.new_turn()
+
+    # 同一条命令、同一个引擎 → 重新回到确认（旧行为下这里 len(asked) 还是 1）
+    assert engine.check("bash", {"command": "rm -rf x"}, ctx) is Decision.ALLOW
+    assert len(asked) == 2
+
+
+def test_new_turn_keeps_always_memory(tmp_path):
+    """只清"本回合"那份，**不能**把常驻记忆一起清掉 —— 用户选「3) 一直允许」
+    正是为了不再被问。两个方向都要钉住，否则"清干净一点"看起来更保险。"""
+    asked = []
+    engine = PermissionsEngine(tmp_path, confirm=lambda q: asked.append(q) or "allow_always")
+    ctx = make_ctx(tmp_path)
+    assert engine.check("bash", {"command": "rm -rf x"}, ctx) is Decision.ALLOW
+
+    engine.new_turn()
+
+    assert engine.check("bash", {"command": "rm -rf x"}, ctx) is Decision.ALLOW
+    assert len(asked) == 1
 
 
 # ---------- 规则文件 ----------

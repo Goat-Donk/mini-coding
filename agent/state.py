@@ -64,6 +64,55 @@ def text_of(message: dict) -> str:
     return ""
 
 
+#: 补齐配对时填进 tool 结果的内容。**必须说实话**：这条结果不是工具跑出来的。
+#: 写成空串或 "ok" 会让模型以为那次调用成功了，然后基于一个不存在的结果往下走。
+PAIRING_FILLER = (
+    "[未执行] 这条工具调用没有留下结果（回合被中断）。"
+    "如需它的结果，请重新调用。"
+)
+
+
+def ensure_tool_pairing(messages: list[dict]) -> int:
+    """补齐被中断的回合留下的孤儿 tool_call，返回补了几条。
+
+    **为什么必须有**：OpenAI 兼容端点要求 assistant 消息里每个 `tool_calls[].id`
+    都要有一条对应的 `tool` 消息，否则整个请求 400。单发进程里这从不是问题 ——
+    回合中途 Ctrl+C，进程就死了，下次靠检查点恢复，而检查点是在**完整的步边界**
+    上落的。REPL 要接着用**同一个** `messages` 列表，中断就会留下
+    「assistant(tool_calls=[3 个]) + 只有 1 条 tool 结果」这种形状，下一回合的
+    请求直接 400 —— 而且报错发生在**下一回合**，看起来和中断那一下毫无关系。
+
+    这里复用 `tool_result()` 而不是手写 dict：消息格式是这个模块的契约，
+    多一处手拼就多一处漂移点。
+
+    只补不删：多余的 tool 结果（找不到对应 id）不动 —— 那种形状不会让端点报错，
+    而删掉它就等于替模型丢掉了它真跑出来的证据。
+    """
+    repaired = 0
+    i = 0
+    while i < len(messages):
+        message = messages[i]
+        if message.get("role") != "assistant" or not message.get("tool_calls"):
+            i += 1
+            continue
+        expected = [
+            call.get("id") for call in message["tool_calls"] if isinstance(call, dict)
+        ]
+        # 紧跟在后面的连续 tool 消息就是这个 assistant 的配对结果
+        j = i + 1
+        answered: set[str] = set()
+        while j < len(messages) and messages[j].get("role") == "tool":
+            answered.add(messages[j].get("tool_call_id"))
+            j += 1
+        missing = [cid for cid in expected if cid not in answered]
+        if missing:
+            messages[j:j] = [tool_result(cid, PAIRING_FILLER) for cid in missing]
+            repaired += len(missing)
+            j += len(missing)
+        i = j
+    return repaired
+
+
 # ---------- AgentState ----------
 
 @dataclass

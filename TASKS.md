@@ -330,10 +330,35 @@ step 5  完成
 
 ### 第三批 · 需要前置
 
-- [ ] **M9-5 常驻交互模式（REPL）** —— ④⑤ 的**硬前置**
-  - 现状核实（2026-09-11）：`app/cli.py` 是**单发**的，没有 `while True` / `input()` / REPL，跑完即退
-  - 「跨回合自动推进」「每 N 分钟重复提示词」在一次性进程里**没有意义**，所以 ④⑤ 排在这里之后
-  - 顺带收益：面试稿 §12 的演示动线不再全是单发命令
+- [x] **M9-5 常驻交互模式（REPL）** —— ④⑤ 的**硬前置**
+
+  **✅ 2026-09-11 完成。实现**：新模块 `app/repl.py`（`Repl` 类 + `run_repl()` + 9 个斜杠命令 + `_activate`）；`app/cli.py` 把原先**构造了两遍**的 `QueryEngine(...)` 收成 `_Runtime` + `_build_runtime()`，加 `--repl` 开关；`agent/loop.py` 抽出 `new_state()`、新增 `run_turn()` 与 `_run_loop(budget_start=)`；`agent/permissions.py` 加 `new_turn()`；`agent/state.py` 加 `ensure_tool_pairing()`；`agent/llm.py` 加 `Usage.__sub__`。
+  - **它不是新功能，是「换个用法」**：同一个 `AgentState` 连跑两次。这正好撞上本项目的头号缺陷类（机制在、测试绿、换个用法就静默失效）—— 下面四条**没有一条**是单发路径能观测到的，它们在改动前的代码上都表现为"完全正常"。
+    1. **`terminated_reason` 从不复位**（只在 5 个返回点被写，也不参与循环条件）。单发时"一个回合"和"一个进程"是同一件事，所以从没有过清空动作；常驻进程里不清 = 第二回合全程带着上一回合的旧值，而 `app/ui_streamlit.py` 会从检查点 payload 里把它读出来显示。→ `run_turn` 每回合复位。
+    2. **权限的「本回合」永不过期**：`PermissionsEngine._turn` 全仓零 clear/reset，`tests/test_permissions.py` 把"回合结束"定义成**新建实例**。常驻进程里 `allow_turn` 于是变成**永久放行** —— 与确认框上写着的「2) 本回合允许」直接矛盾。→ `new_turn()` 清 `_turn`、**保留 `_always`**（这是两个不同的承诺，清干净一点看起来更保险，但那等于把"一直允许"降级成"本回合允许"）。
+    3. **`record_discovery` 每回合重放**：守卫是"block 不在 system prompt 里就跳过"，而第二回合 block **还在** prompt 里 → `skill_discovery` 与每条 `skill_shadowed` 事件每回合往轨迹里再写一份。→ 守卫改成认 `state.events` 里记过了没有。
+    4. **中断会让消息配对残缺**：回合中途 Ctrl+C，`state.messages` 可能停在 `assistant(tool_calls=[3 个])` + 只有 1 条 tool 结果 → 下一轮请求直接 400，而**报错发生在下一回合**，与那次 Ctrl+C 看起来毫无关系。单发时进程就死了、靠检查点恢复所以从没暴露。→ `state.ensure_tool_pairing(messages) -> int`，`run_turn` 入口调用，**补了几条就记一条 `pairing_repaired` 事件**（不静默修：事后想不通"模型为什么又说要再调一次"）。
+  - **`max_steps` 改成「每轮一份预算」**（用户拍板，**行为变更**）：`_run_loop` 进循环时记下 `budget_start = state.step`，条件从 `state.step < max_steps` 改成 `state.step - budget_start < max_steps`。`state.step` **本身照样累计不重置** —— 检查点文件名 `step-N.json`、`--fork --step K`、轨迹的 `step` 字段都依赖它单调递增，只改预算的**度量起点**。顺带修掉一个现有陷阱：会话跑满 25 步后 `--resume` 今天会**一次模型调用都不发**、直接又打印「已达到最大步数（请拆分子任务）」，而错误信息指的方向还是错的。
+  - **装配不复制，是这一项防漂移的关键**：REPL 若自己装配一遍（注册工具、接权限、接 hooks、加载 MCP、装 `--review-edits` 的确认回调），迟早漏掉一样 —— CLI 历史上已经**漏接过 hooks 与 permissions 各一次，而两次都是静默的**。`_Runtime.engine(session)` 是唯一 `QueryEngine(...)` 构造点，单发与常驻都从它拿。
+  - **两条硬不变量**（各有测试钉着）：① 不认识的斜杠命令**绝不发给模型** —— 打错一个字母的代价是一次真实的模型调用（钱 + 时间），而模型的回答看起来还挺像回事，于是这个错误不会被发现；② 会话切换失败**不能半切换**，`/resume 不存在的名字` 必须留在当前会话里 ——「session 换了、engine/state 没换」是一个**没有任何报错**的错配：轨迹写进 A、你在看 B，事后只能靠翻 `data/` 发现。`_activate` 三样一起换（engine 必须跟着换，`QueryEngine.session` 是构造期绑定的）。
+  - **`await_user` 在 REPL 里不需要任何特殊机制**：模型提问 → 本轮结束 → 打印问题 → 下一行输入就是回答。这是 M8「把打断建模成数据标志而不是阻塞控制流」的回报，演示时可以顺带讲。反过来，若 REPL 自己 `input()` 一个"回答"，那才是把数据标志退化成阻塞控制流。
+  - **符号命令表 `_COMMANDS` 是 `/help` 正文的唯一来源**：命令与帮助写在两个地方，迟早出现"帮助里有、实际没有"（或者反过来）。有一条测试断言 `/help` 列出的名字**恰好等于** `_COMMANDS` 的键集合。
+  - **退出语必须给出可执行的续跑命令**（M7 教训：一条走不通的指引比没有更糟）。这条让 `_wrap_up` 多做一件事：退出时**无论走了几步都强制落一次检查点** —— 检查点是**按节拍**写的（默认 5 步）且**只在有工具调用的步上 tick**，所以纯聊天、或者只走两三步工具就退出，都写不出检查点，而那行承诺的命令跑起来会直接报"读不到检查点"。**这条是单测与真跑一起挖出来的**（见下）。
+  - **每回合报的是增量，不是会话累计**：`RunResult.steps` / `usage` 五个返回点给的都是 `state.step` / `state.usage`。REPL 用回合前后的快照相减 —— 而不是让 loop 再维护第二套"本回合用量"的记账，那就是「两处各写一遍 → 漂移」。**`Usage` 是可变 dataclass，`state.usage += ...` 是原地累加**，所以快照必须 `dataclasses.replace()` 复制；不复制的话相减恒为 0 **且不报错**，只是"每次都说这回合没花钱"。
+  - **测试**：`tests/test_repl.py` **34 例**（本仓第一条 `CliRunner(input=...)` stdin 端到端也在这里，7 例）+ `tests/test_loop.py` 8 例（多回合契约 + `ensure_tool_pairing` 纯函数）+ `tests/test_permissions.py` 2 例。全量 **559 全绿**（原 515）。
+  - **变异测试 19/19 被抓住**（`m9verify/mutate_m9_5.py`）。八类失效模式各覆盖：每轮预算的起点、回合边界上的复位（`terminated_reason` / `new_turn` 的调用点 / `new_turn` 是否真清 `_turn` / 是否误清 `_always`）、入口重放的去重守卫、中断残局（不补配对 / 补了不记事件）、两条硬不变量（未知命令当任务发 / 半切换）、命令解析（大小写 / `raw` vs `strip` 后的行 / 空行）、增量记账（快照不复制 / `Usage.__sub__` 字段写错）、退出承诺（不强制落检查点 / `/new` 用秒级 id）。**三类需要说明**：
+    - **一个证明过的等价变异体**（未设，不留在列表里骗计数）：`loop.py:214` 的 `_run_loop(..., budget_start=state.step)`。改成省略该实参**在任何输入下都不可观测** —— `_run_loop` 的兜底正是 `if budget_start is None: budget_start = state.step`，而两次读 `state.step` 之间没有任何东西改它（`ensure_tool_pairing` 只可能追加 tool 结果消息，`state.task = text` 与 `messages.append` 都不碰 step）。两处是**恒等**的，不是"碰巧一样"。保留显式传参是因为它把"本轮预算从这一步起"写在调用点上（`run_from` 那条路靠兜底，语义不同），不是为了测出什么。
+    - **一个依赖时序、如实标注的**：`/new` 用 `unique_session_id` 而不是 `new_session_id`（后者粒度是**秒**）。变异回去之后，`/new` 与起始会话撞 id 需要**两次调用落在同一秒内**才算命中 —— 测试里是几毫秒的事，理论上跨秒就会 MISS。这条防的是**真实缺陷**（两个"不同"的会话静默共用同一个检查点目录，后者覆盖前者、全程不报错），它值得留着，只是不假装它是确定性的。
+    - **一个刻意不设变异体**：`_dispatch` 里 `except typer.Exit: pass`（命令级失败不带走 REPL）。去掉它之后 `/fork 三步` 会带着 `typer.Exit` 冒到 `CliRunner`，但 `runner.invoke` 会接住并记进 `result.exception`、`exit_code` 照样是 0，**从输出上分辨不出来**。真要钉住得断言"REPL 之后还能继续跑"——`test_fork_with_a_non_numeric_step_does_not_kill_the_repl` 里那句 `repl.run_turn("继续")` 正是这个意思，它抓的是**行为**，不是这个 except 子句。
+    - **另有一条变异体改写了测试**：空行变异（不再跳过空行）最初 **MISS**。查下来是：空行变成第 3 个回合、吃掉脚本响应，**最后一条真实输入**才 `RuntimeError` —— 但 loop 的 `except Exception` 把它变成 `terminated_reason="error"` 的 `RunResult`，**退出码仍是 0**，而原断言（"第二回合完成"在输出里）照样成立。**测试分不清"跳过"和"变成回合"**。修法：补 `assert "[error]" not in result.output` 与 `assert users == ["读一下 calc.py", "再改一下"]`（直接钉"模型收到的 user 消息序列"），并写明理由。
+  - **真实 LLM 端到端跑了三轮**（DeepSeek 官方通路，工作区 `m9verify/ws_m95/`，素材是一份 `average_word_length` 对空文本 `ZeroDivisionError` 的 `textstat.py`，基线实测 `1 failed, 3 passed`）：
+    - **A（多回合上下文接续 + 修 bug）**：①「跑一下测试，找出失败的那个并修好它，修完再跑一次确认」—— 模型自己 `bash` 跑 pytest → `read` → `edit` 加空列表守卫 → **再 `bash` 跑 pytest**，报 `4 passed`（**6 步 / 20,682 token / 缓存命中 80%**）；②「再补一个测试：空字符串也要返回 0.0」—— 模型**记得上一回合**，直接 `edit` 测试文件再 `bash` 验证，`5 passed`（**3 步 / 13,323 token / 命中 95%**）。第二回合的 prompt 没有重新读源码就写出了正确改动，这是上下文真的接上了的证据。
+    - **B（`/rename` + 重进 + `/fork 2` + 新分支接着跑）**：`/rename 文本统计修复` → 退出 → `--resume --session-id <id>` 恢复（提示符显示 `文本统计修复`）→ `/fork 2` 分叉出 `文本统计修复 @2 分叉`，打印"搬了 2 个检查点"+ 对话分叉警告 + 可执行续跑命令 → 在新分支上「加一个 `median_word_length` 并补测试」→ `9 passed`（**6 步 / 26,832 token / 命中 94%**）。`/sessions` 显示两个会话、血统标着 `← 分叉自 s20260911-161113@2`。
+    - **C（`--review-edits` 现场验收 `new_turn`）**：① 首回合改 `longest_word` 的 docstring → 确认框弹出（带 diff）→ 答「**2) 本回合允许**」→ 生效（**6 步 / 19,547 token / 命中 82%**）；② 第二回合**同一个 `edit` 工具、同一个文件** → **确认框重新弹出**，再答「2」→ 生效（**2 步 / 7,692 token / 命中 96%**）。权限的记忆键是 `_classify` 给的 `arguments["path"]`，两回合都是字面量 `textstat.py`，**键相同** —— 所以"重新问一次"只可能来自回合边界上的清空。**这正是 `_turn` 从不清空那个契约缺口在没有单测介入下的现场复现**（改动前，第二回合会被静默自动放行）。
+    - **检查点计数对上了设计**：A 会话停在 step 9、盘上 8 个检查点（`step-1..5,7,8,9`）—— 前 5 个是工具步的节拍产物，第 8 个（`step-9.json`）是**退出时那次强制落盘**写出来的，而它在 REPL 的实时显示里**并不存在**（那一行报的是"检查点 7 个"）。这一条同时验证了 `_wrap_up` 的强制落盘确实在跑，也说明"实时计数"与"退出后盘上计数"本来就会差一个。C 会话同理（实时 6 个 → 盘上 7 个）。
+    - **三个会话在盘上都可核对**：`data/checkpoints/s20260911-161113|161157|161252/`、`data/sessions/*.jsonl|.meta.json`；`.codeagent/rules/learned.md` 三轮累计提炼出 10 条仓库约定 —— 其中一条是"查找函数定义优先用 `grep` 的 `include` 参数限定文件名，比 `path` 更可靠"，来自 C 首回合模型自己那次**失败的** `grep(pattern=def longest_word, path=textstat.py)`（轨迹里是 ✗）。这是真实轨迹的产物。
+  - **如实说明未做**：① **不是全屏 TUI**（`TASKS.md` 已有决定，⑥ 明确不做）—— 行式输入，没有 ANSI 控制、没有历史滚动；多行输入缓冲 / 历史文件 `readline` / 自动补全也都不做，那是纯终端体验的体力活，对这份作品集要回答的问题（循环、上下文、权限、可恢复性）不加分。② **`/fork` 是对话分叉，工作区文件不回滚**（沿用 M9-3 的语义）—— 这一点在 **B 的真实跑里直接看到了后果**：分叉点是 step 2（修 bug 之前），但盘上文件已经是修好的，于是新分支的模型 `read` 到的是"已经修好"的文件、却又在结论里说了一遍"修好了失败的测试"。REPL 与 CLI 都会把这句话打印出来，但**它不会阻止人误判**。③ 并发多回合（同一个 state 被两个回合同时推进）没有做，也没有测试 —— 当前设计里一个 `Repl` 一次只有一个活跃回合。
+  - **顺带收益已兑现**：面试稿 §12 的演示动线不再全是单发命令（`/sessions` → `/fork` → `/rename` → 接着聊 是一条能一口气演完的连续动线）。
 - [ ] **M9-6 ④ Goal**：进程内 Goal + 暂停/恢复 + **显式完成检查**（后者的判分思路与我们的评估层呼应）
 
 ### 压轴 · 价值最高，但唯一会动核心循环契约
@@ -354,16 +379,20 @@ step 5  完成
 
 ## 进度快照
 
-- 当前里程碑：**M9 进行中**（第一批 M9-1、M9-2 已完成并真跑验证；第二批 M9-3 fork + rename、M9-4 MCP 远程 HTTP + resources/prompts 已完成并真跑验证；下一项 M9-5 常驻交互模式 REPL）
+- 当前里程碑：**M9 进行中**（第一批 M9-1、M9-2 已完成并真跑验证；第二批 M9-3 fork + rename、M9-4 MCP 远程 HTTP + resources/prompts 已完成并真跑验证；**第三批 M9-5 常驻交互模式 REPL 已完成并真跑验证**；下一项 M9-6 ④ Goal）
 - 上一里程碑：**M8 完成**（P1–P7 全部完成；四项真实验证已跑，见上节）
 - 上一里程碑：**M7 完成**（M7-1~M7-6 + Part C 全部完成；四条真实 LLM 端到端验证 V1–V4 已全跑，工作区 `m7verify/`、`m7verify-nolock/` 已 gitignore）
-- 代码状态：**8,310 行源码 / 25 模块 / 515 测试全绿**（`python -m pytest tests/` → `515 passed`）
-  - 口径：源码 = `agent/` + `app/` + `eval/` 里被 git 跟踪的 `.py` 行数（不含 `eval/repos/` 克隆仓）；模块数 = 其中非空的 `.py` 文件数
+- 代码状态：**9,139 行源码 / 26 模块 / 559 测试全绿**（`python -m pytest tests/ -o addopts="" -q` → `559 passed`）
+  - 口径：源码 = `agent/` + `app/` + `eval/` 下的非空 `.py`（不含 `eval/repos/` 克隆仓），模块数 = 其中非空的 `.py` 文件数。**按文件系统数，不按 git 跟踪数** —— 新文件在提交前也该算进去（M9-5 时 `app/repl.py`(503) 与 `tests/test_repl.py`(785) 尚未提交，按 git 数会各少一份，这正是上一条从 8,310 跳到 9,139 里的一部分）。
 - **M8 期间发现并修复的真 bug（真跑挖出来的，不是单测挖的）**：
   1. **`update_plan` 的引导缺失（elicitation gap）**：工具实现了、测试全绿、计划也能落盘 —— 但 system prompt 里**一个字都没提它**，模型 6 步跑完一次都没调。修法：prompt 里写明"任务复杂时先调 `update_plan` 排一份 3~6 步的简短计划"。修前 0 次 / 修后 2 次（同 P7-c 表）
   2. **`--resume` 静默丢掉 `checkpoint_every`**：`from_checkpoint` 的默认值是 5，而 `--resume` 这条路径没转发 → `--resume --checkpoint-every 1` 静默回落成"每 5 步一次"。后果不是报错，而是**恢复出来的这一段一步都不落盘**（kill 在 step 5，续跑到 step 9，检查点数还是 5）。修好后同一段跑出 `[1..10]`
   3. **恢复期的三条事件进不了轨迹**：`record_event` 只在 `state.emitter` 非空时写 JSONL，而 emitter 原先要等 `run_from` 才被引擎接上 —— 于是 `taint_cleared` / `plan_resumed` / `resume_instruction` 一条都落不了盘（`clear_taint` 注释里写的"同时往轨迹里记一条"因此是假的）。修法：`restored.emitter = session.emit` 先接上再记
   - 三条都是**同一个缺陷类**：机制在、测试绿、真跑才发现没生效。回归测试 `tests/test_cli.py::test_resume_honors_checkpoint_every`、`::test_resume_events_reach_the_trajectory`、`tests/test_loop.py::test_default_system_prompt_points_at_update_plan`，并逐条做了变异（3/3、2/2 被捕获）
+- **M9-5 期间发现并修复的真 bug（两条，都是"多回合契约"这一类）：**
+  1. **`/new` 的会话 id 会撞车（秒级粒度）**：`new_session_id()` 的格式是 `s%Y%m%d-%H%M%S`，而常驻进程里 `/new` 紧接着 `/new`、或者一次快速演示里连开两个会话，**完全可能落在同一秒**。撞了的话 `Session.__init__` **不报错**，两个"不同"的会话直接共用同一个检查点目录 —— 后者覆盖前者，**全程静默**。单发路径上这个碰撞要靠"人手动重跑"才会发生，所以从没暴露过。修法：`_new_session` 改用已有的 `unique_session_id()`（循环避让）。**是写测试时被断言 `assert new_id != old_id` 逼出来的**，不是真跑挖的 —— 如实记下来。
+  2. **退出时承诺的续跑命令在纯聊天会话上跑不通**：`_farewell` 打印「继续: `python -m app.cli --repl --resume --session-id <sid>`」，而检查点是**按节拍**写的（默认 5 步）且**只在有工具调用的步上 tick**。纯聊天、或者只走两三步工具就退出，**一个检查点都不落** —— 那条命令跑起来直接报"读不到检查点"。**M7 的原话是"一条走不通的指引比没有指引更糟"，而这次是我们自己打印出来的。** 修法：`_wrap_up` 退出时 `checkpoint(self.state, force=True)`，**先落盘再提炼**。理由与 `_awaiting_user` 里 force 的理由是同一个：流程即将因非步数原因退出，节流的下一次 tick 永远等不来。真跑证据：A 会话实时显示"检查点 7 个"、退出后盘上是 8 个（多出来的 `step-9.json` 就是这一次强制落盘）。
+     - 顺带一个同型判断：`_wrap_up` 只在 `self._turns > 0` 时才做约定提炼 —— `extract_and_learn` 是一次**真实的模型调用**，而它读的是累计轨迹，每回合跑一遍等于把同一段对话提炼 N 次；单发路径也是"一次运行提炼一次"，常驻对齐它。
 - **已拍板（2026-09-11，用户决定）**：
   - **第 0 级分级截断：保持现状**（选项 a）。数据见 P7-d 结论第 4 条 —— 端到端命中率没降、代价被同一步的 LLM 摘要遮蔽，所以不为了微观对照里那 8.8 倍去改取向。**明确不选**的是 (b)「优先截最靠后的合格消息」：(b) 的缓存账更好看（代价降到 1/3.8），但它会**先丢掉最老的上下文**，而"最近的最相关"是比缓存算术更硬的设计约束；也不选 (c) 去掉，因为尾部结论行 8/8 保住这条收益是实测为正的。
   - **`--resume` 的检查点节拍：已修**（见下面第 4 条）。取向定为 **显式传参 > 会话里记的 > 默认 5**，并把实际生效的节拍**打印出来**（这是这次改动唯一的可见性出口）。

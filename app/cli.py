@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import typer
@@ -94,13 +95,17 @@ def _default_workspace() -> Path:
     return Path(os.environ.get("WORKSPACE_ROOT", "workspace")).resolve()
 
 
-def _resolve_sid(workspace_root: Path, ref: str | None) -> str:
-    """把 `--session-id` 的引用解析成 session_id：**先当 id、再当名字**；省略取最近会话。
+def _resolve_session_ref(workspace_root: Path, ref: str | None) -> str | None:
+    """把会话引用（**先当 id、再当名字**）解析成 session_id；省略取最近会话。
 
     单独一个函数是因为原先"取会话 id"这件事在 `_print_plan` 与 `--resume` 两处
     各写了一遍（都是 `session_id or latest_session(...)` 加一句 None 检查）。
     加名字解析时只改一处、另一处照旧忽略 —— 那就是本项目的头号缺陷类：
     机制在某条路径生效、在另一条路径静默不生效。收成一处，两条路径一起拿到。
+
+    **解析不了返回 None 并打印原因，不退出** —— 「要不要结束进程」是调用方的事：
+    `--resume` 解析不了就该退出（见下面的 `_resolve_sid`），而常驻 REPL 里的
+    `/resume 不存在的名字` 必须留在原地（半切换比报错糟得多）。
     """
     if ref:
         try:
@@ -112,12 +117,20 @@ def _resolve_sid(workspace_root: Path, ref: str | None) -> str:
                 f"（用 python -m app.cli --sessions 看完整清单）",
                 fg=typer.colors.YELLOW,
             )
-            raise typer.Exit(1)
+            return None
     sid = latest_session(workspace_root)
     if sid is None:
         typer.secho(
             "没有可恢复的会话检查点（data/checkpoints/ 为空）", fg=typer.colors.YELLOW
         )
+        return None
+    return sid
+
+
+def _resolve_sid(workspace_root: Path, ref: str | None) -> str:
+    """`_resolve_session_ref` 的"解析不了就结束进程"版本（`--resume`/`--plan`/…）。"""
+    sid = _resolve_session_ref(workspace_root, ref)
+    if sid is None:
         raise typer.Exit(1)
     return sid
 
@@ -174,9 +187,19 @@ def _do_rename(workspace_root: Path, ref: str | None, name: str) -> None:
 
 
 def _do_fork(
-    workspace_root: Path, ref: str | None, step: int | None, name: str | None
-) -> str:
-    """从某一步分叉出新会话，返回新会话 id。"""
+    workspace_root: Path,
+    ref: str | None,
+    step: int | None,
+    name: str | None,
+) -> tuple[Session, object]:
+    """从某一步分叉出新会话，返回 `(Session, AgentState)`（并打印分叉信息）。
+
+    返回会话与状态而不只是 id：常驻 REPL 的 `/fork` 要**直接切过去**，只要一个 id
+    是切不过去的（还得再 `from_checkpoint` 一次，多一次读盘、也多一处能忘的地方）。
+
+    结尾那句"怎么接着跑"由**调用方**打印，因为单发（`python -m app.cli --resume …`）
+    与 REPL（人已经在里面了）要说的话不一样 —— 但那句话依赖 sid，只有调用方知道。
+    """
     sid = _resolve_sid(workspace_root, ref)
     try:
         fork, restored = Session.fork(workspace_root, sid, step=step, name=name)
@@ -200,11 +223,7 @@ def _do_fork(
         "分叉后的 agent 看到的是当前的文件",
         fg=typer.colors.YELLOW,
     )
-    typer.secho(
-        f'  继续: python -m app.cli --resume --session-id {fork.session_id} "你的指示"',
-        fg=typer.colors.CYAN,
-    )
-    return fork.session_id
+    return fork, restored
 
 
 #: 确认菜单：编号 → 权限引擎的粒度串（见 agent/permissions.GRANULARITY）。
@@ -267,106 +286,56 @@ def _build_llm(mock: bool) -> BaseLLM:
     return DeepSeekClient()
 
 
-def _print_plan(workspace_root: Path, session_id: str | None, step: int | None) -> None:
-    """打印某个会话的计划清单（`--plan`）。
+@dataclass
+class _Runtime:
+    """**除「当前会话」之外**的全部装配结果（M9-5）。
 
-    计划是**检查点里的一个字段**，读它就够了 —— 所以这条路径不需要 API key、
-    不建会话、不跑任务（也因此它在 `_build_llm` 之前处理）。
+    单发路径与常驻 REPL 共用它。为什么必须共用：REPL 若自己装配一遍，迟早漏掉
+    `ask_user` 注册、skills 工具、MCP 加载或 `--review-edits` 的确认回调 ——
+    而 CLI 历史上**已经漏接过 hooks 与 permissions 各一次**（两个入口各装各的，
+    一个装了、另一个没装，且失败是静默的）。装配点只有一处，就不会有第二次。
+
+    会话不在这里：`QueryEngine.session` 是**构造期绑定**的，REPL 换会话就得换
+    引擎，所以 `engine(session)` 是方法而不是字段。
     """
-    sid = _resolve_sid(workspace_root, session_id)
-    try:
-        _, state = Session.from_checkpoint(workspace_root, sid, step=step)
-    except FileNotFoundError as exc:
-        typer.secho(f"读不到检查点: {exc}", fg=typer.colors.YELLOW)
-        raise typer.Exit(1)
-    typer.secho(
-        f"会话 {_session_label(workspace_root, sid)} 的计划:",
-        fg=typer.colors.CYAN, bold=True,
-    )
-    # 空清单不要复用 render_plan 的"已清空"文案：那是 update_plan 清空动作的说法，
-    # 而这里只是"这个会话没排过计划"。
-    typer.echo(render_plan(state.plan) if state.plan else "（该会话没有计划清单）")
 
+    workspace_root: Path
+    llm: BaseLLM
+    registry: ToolRegistry
+    permissions: PermissionsEngine
+    hooks: object
+    memory: MemoryManager
+    memory_blocks: list[str]
+    skills: object
+    context: ContextManager
+    printer: EventPrinter
+    mcp_clients: list = field(default_factory=list)
+    mock: bool = False
 
-@app.command()
-def run(
-    task: str = typer.Argument(
-        "", help="任务描述；--resume 时作为**续跑指示**追加进会话（可省略）"
-    ),
-    mock: bool = typer.Option(False, "--mock", help="无 key 演示"),
-    resume: bool = typer.Option(False, "--resume", help="从检查点续跑（不新建会话）"),
-    plan: bool = typer.Option(
-        False, "--plan",
-        help="只打印最近会话的**任务计划清单**后退出（agent 自己排的，不是 TASKS.md）",
-    ),
-    session_id: str | None = typer.Option(
-        None, "--session-id",
-        help="会话 id **或名字**（--resume/--fork/--rename/--plan 时指定；默认取最近会话）",
-    ),
-    step: int | None = typer.Option(
-        None, "--step", help="--resume/--fork 时指定步数（默认最近检查点）"
-    ),
-    sessions: bool = typer.Option(
-        False, "--sessions", help="列出所有会话（名字/步数/分叉来源）后退出",
-    ),
-    rename: str | None = typer.Option(
-        None, "--rename", help="给会话起个人看得懂的名字后退出（只动元数据，不需要 key）",
-    ),
-    fork: bool = typer.Option(
-        False, "--fork",
-        help="从 --step 那一步分叉出新会话（**对话**分叉，不回滚工作区文件）",
-    ),
-    checkpoint_every: int | None = typer.Option(
-        None, "--checkpoint-every",
-        help="每 N 步写一次检查点；省略时新会话用 5、--resume 沿用该会话当初的值",
-    ),
-    mcp: Path | None = typer.Option(
-        None, "--mcp", help="MCP 配置文件路径（如 .codeagent/mcp.json），加载后注册远端工具"
-    ),
-    clear_taint: bool = typer.Option(
-        False, "--clear-taint",
-        help="复位本会话的污染标记（**人的动作**；误报被收紧时用它解锁）",
-    ),
-    review_edits: bool = typer.Option(
-        False, "--review-edits",
-        help="改动前人工确认：edit/write 每次都把 diff 显示出来等你批准",
-    ),
-):
-    """在 workspace 内执行一个任务（或从检查点续跑、分叉、改名、列会话）。"""
-    workspace_root = _default_workspace()
-
-    # ---- 不需要 API key 的只读/元数据路径，全部放在 `_build_llm` 之前。
-    # 顺序：先列（纯读）→ 再 plan（读检查点）→ 再改名（写元数据）→ 再分叉。
-    if sessions:
-        _print_sessions(workspace_root)
-        raise typer.Exit()
-    if plan:
-        # 放在"任务不能为空"检查之前：--plan 本来就不带任务
-        _print_plan(workspace_root, session_id, step)
-        raise typer.Exit()
-    if rename is not None and not fork:
-        # 只改名：不跑任务。`--fork` 一起给时改名的是**分叉出来的那个**，
-        # 所以那种情况留给下面的分叉路径处理。
-        _do_rename(workspace_root, session_id, rename)
-        raise typer.Exit()
-
-    forked_sid: str | None = None
-    if fork:
-        forked_sid = _do_fork(workspace_root, session_id, step, rename)
-        if not task.strip():
-            # 只分叉、不续跑：分叉本身是零成本的（不动模型），而续跑要花钱。
-            # 不带上任务就退出，把"要不要接着跑"留给用户显式说 —— 上面已经
-            # 打出了可执行的续跑命令。
-            raise typer.Exit()
-
-    if not resume and forked_sid is None and not task.strip():
-        typer.secho(
-            '请提供任务描述，例如：python -m app.cli "读 README 并总结项目结构"',
-            fg=typer.colors.YELLOW,
+    def engine(self, session: Session) -> QueryEngine:
+        """按会话装配引擎。**这是唯一一处 `QueryEngine(...)` 构造。**"""
+        return QueryEngine(
+            self.llm, self.registry, workspace_root=self.workspace_root,
+            context=self.context, session=session, memory_blocks=self.memory_blocks,
+            on_event=self.printer, permissions=self.permissions, hooks=self.hooks,
+            skills=self.skills,
         )
-        raise typer.Exit(1)
-    workspace_root.mkdir(parents=True, exist_ok=True)
 
+    def close(self) -> None:
+        """回收 MCP 连接（子进程 + 管道），**幂等** —— 常驻 REPL 每个回合都可能调。"""
+        for client in self.mcp_clients:
+            client.close()
+        self.mcp_clients = []
+
+
+def _build_runtime(
+    workspace_root: Path, *, mock: bool, mcp: Path | None, review_edits: bool
+) -> _Runtime:
+    """装配一个运行环境（`_Runtime`）并打印一行启动信息。
+
+    照着 `run()` 里原先那段逐字搬过来的，只把结尾的 `QueryEngine(...)` 换成
+    `runtime.engine(session)` —— 也就是把「两处各写一遍」收成一处。
+    """
     llm = _build_llm(mock)
     registry = ToolRegistry.default(workspace_root)
     registry.register(SubagentTool(llm, workspace_root))  # M4-2 research 子代理
@@ -456,6 +425,213 @@ def run(
             f"skills: {len(skills.skills)} 个（索引进提示词，正文按需加载）{shadow_note}",
             fg=typer.colors.BRIGHT_BLACK,
         )
+    return _Runtime(
+        workspace_root=workspace_root,
+        llm=llm,
+        registry=registry,
+        permissions=permissions,
+        hooks=hooks,
+        memory=memory,
+        memory_blocks=memory_blocks,
+        skills=skills,
+        context=context,
+        printer=printer,
+        mcp_clients=mcp_clients,
+        mock=mock,
+    )
+
+
+def _reinject_plan(state) -> None:
+    """恢复会话时把计划清单**补投一次**（单发与 REPL 共用一处）。
+
+    恢复时补、而不是每轮都贴：每轮贴等于把"计划有没有变"变成"消息有没有变"，
+    一变就破坏 `_PREFIX_LEN` 之后的前缀缓存。用 user 角色 + 说明来源：计划是
+    agent 自己产出的，不加以说明地当成"用户说的话"塞进去，模型会以为是人给的指令。
+    """
+    if not state.plan:
+        return
+    state.messages.append(
+        user_message(
+            "（会话恢复：这是你之前列的计划清单，继续按它推进）\n"
+            + render_plan(state.plan)
+        )
+    )
+    state.record_event("plan_resumed", items=len(state.plan))
+    typer.secho(f"计划恢复: {len(state.plan)} 条", fg=typer.colors.CYAN)
+
+
+def _extract_learned(runtime: _Runtime, events: list[dict], taint: str, *,
+                     terminated_reason: str | None = None) -> None:
+    """任务后提炼仓库约定（M4-1；单发与 REPL 共用一处）。
+
+    受污染的会话写到 `learned.pending.md`（不自动注入，等人复核）—— 判据是
+    **会话标记**，不是提炼出来的内容像不像被带偏（内容过滤会误伤正常条目）。
+
+    停在提问处的会话**不提炼**：那是一段半程轨迹，模型当时正因为信息不足在猜，
+    把它猜的东西提炼成"仓库约定"再自动注入后续所有会话，是污染而不是学习。
+    续跑那一轮会照常提炼（那时轨迹是完整的），所以什么都没丢。
+    """
+    if runtime.mock:
+        return
+    if terminated_reason == "await_user":
+        typer.secho(
+            "本轮停在提问处（半程轨迹），不做约定提炼 —— 续跑完成后照常提炼",
+            fg=typer.colors.BRIGHT_BLACK,
+        )
+        return
+    learned = runtime.memory.extract_and_learn(events, taint=taint)
+    if learned:
+        target = (
+            ".codeagent/rules/learned.pending.md（会话被标记为受污染，待人工复核）"
+            if taint == TAINT_HIGH
+            else ".codeagent/rules/learned.md"
+        )
+        typer.secho(
+            f"已提炼 {len(learned)} 条仓库约定 → {target}",
+            fg=typer.colors.YELLOW if taint == TAINT_HIGH else typer.colors.GREEN,
+        )
+
+
+def _print_plan(workspace_root: Path, session_id: str | None, step: int | None) -> None:
+    """打印某个会话的计划清单（`--plan`）。
+
+    计划是**检查点里的一个字段**，读它就够了 —— 所以这条路径不需要 API key、
+    不建会话、不跑任务（也因此它在 `_build_llm` 之前处理）。
+    """
+    sid = _resolve_sid(workspace_root, session_id)
+    try:
+        _, state = Session.from_checkpoint(workspace_root, sid, step=step)
+    except FileNotFoundError as exc:
+        typer.secho(f"读不到检查点: {exc}", fg=typer.colors.YELLOW)
+        raise typer.Exit(1)
+    typer.secho(
+        f"会话 {_session_label(workspace_root, sid)} 的计划:",
+        fg=typer.colors.CYAN, bold=True,
+    )
+    # 空清单不要复用 render_plan 的"已清空"文案：那是 update_plan 清空动作的说法，
+    # 而这里只是"这个会话没排过计划"。
+    typer.echo(render_plan(state.plan) if state.plan else "（该会话没有计划清单）")
+
+
+@app.command()
+def run(
+    task: str = typer.Argument(
+        "", help="任务描述；--resume 时作为**续跑指示**追加进会话（可省略）"
+    ),
+    mock: bool = typer.Option(False, "--mock", help="无 key 演示"),
+    resume: bool = typer.Option(False, "--resume", help="从检查点续跑（不新建会话）"),
+    plan: bool = typer.Option(
+        False, "--plan",
+        help="只打印最近会话的**任务计划清单**后退出（agent 自己排的，不是 TASKS.md）",
+    ),
+    session_id: str | None = typer.Option(
+        None, "--session-id",
+        help="会话 id **或名字**（--resume/--fork/--rename/--plan 时指定；默认取最近会话）",
+    ),
+    step: int | None = typer.Option(
+        None, "--step", help="--resume/--fork 时指定步数（默认最近检查点）"
+    ),
+    sessions: bool = typer.Option(
+        False, "--sessions", help="列出所有会话（名字/步数/分叉来源）后退出",
+    ),
+    rename: str | None = typer.Option(
+        None, "--rename", help="给会话起个人看得懂的名字后退出（只动元数据，不需要 key）",
+    ),
+    fork: bool = typer.Option(
+        False, "--fork",
+        help="从 --step 那一步分叉出新会话（**对话**分叉，不回滚工作区文件）",
+    ),
+    checkpoint_every: int | None = typer.Option(
+        None, "--checkpoint-every",
+        help="每 N 步写一次检查点；省略时新会话用 5、--resume 沿用该会话当初的值",
+    ),
+    mcp: Path | None = typer.Option(
+        None, "--mcp", help="MCP 配置文件路径（如 .codeagent/mcp.json），加载后注册远端工具"
+    ),
+    clear_taint: bool = typer.Option(
+        False, "--clear-taint",
+        help="复位本会话的污染标记（**人的动作**；误报被收紧时用它解锁）",
+    ),
+    review_edits: bool = typer.Option(
+        False, "--review-edits",
+        help="改动前人工确认：edit/write 每次都把 diff 显示出来等你批准",
+    ),
+    repl: bool = typer.Option(
+        False, "--repl",
+        help="常驻交互模式：进提示符，一行一个回合（可带任务作为第一回合）",
+    ),
+):
+    """在 workspace 内执行一个任务（或从检查点续跑、分叉、改名、列会话）。"""
+    workspace_root = _default_workspace()
+
+    # ---- 不需要 API key 的只读/元数据路径，全部放在 `_build_llm` 之前。
+    # 顺序：先列（纯读）→ 再 plan（读检查点）→ 再改名（写元数据）→ 再分叉。
+    if sessions:
+        _print_sessions(workspace_root)
+        raise typer.Exit()
+    if plan:
+        # 放在"任务不能为空"检查之前：--plan 本来就不带任务
+        _print_plan(workspace_root, session_id, step)
+        raise typer.Exit()
+    if rename is not None and not fork:
+        # 只改名：不跑任务。`--fork` 一起给时改名的是**分叉出来的那个**，
+        # 所以那种情况留给下面的分叉路径处理。
+        _do_rename(workspace_root, session_id, rename)
+        raise typer.Exit()
+
+    forked_sid: str | None = None
+    if fork:
+        fork_session, _fork_state = _do_fork(workspace_root, session_id, step, rename)
+        forked_sid = fork_session.session_id
+        if not task.strip() and not repl:
+            # 只分叉、不续跑：分叉本身是零成本的（不动模型），而续跑要花钱。
+            # 不带上任务就退出，把"要不要接着跑"留给用户显式说 —— 下面已经
+            # 打出了可执行的续跑命令。（`--repl` 时不退出：人已经在终端前，
+            # 进去之后第一行输入就是"要不要接着跑"。）
+            typer.secho(
+                f'  继续: python -m app.cli --resume --session-id {forked_sid} "你的指示"',
+                fg=typer.colors.CYAN,
+            )
+            raise typer.Exit()
+
+    if not resume and forked_sid is None and not task.strip() and not repl:
+        typer.secho(
+            '请提供任务描述，例如：python -m app.cli "读 README 并总结项目结构"',
+            fg=typer.colors.YELLOW,
+        )
+        raise typer.Exit(1)
+    workspace_root.mkdir(parents=True, exist_ok=True)
+
+    # M9-5：装配收进 `_build_runtime`（原先这里与下面 `else` 分支各构造一遍
+    # `QueryEngine(...)`，参数逐字相同）—— 单发与常驻 REPL 共用同一份装配，
+    # 就不会再出现"一个入口接了、另一个没接"（hooks/permissions 都漏接过一次）。
+    runtime = _build_runtime(
+        workspace_root, mock=mock, mcp=mcp, review_edits=review_edits
+    )
+
+    if repl:
+        # 常驻交互模式：整个进程一条 `_Runtime`，会话由 REPL 自己切换。
+        # 带任务 = 第一回合；`--resume`/`--fork` 则拿那个会话当起始会话。
+        #
+        # **导入放在函数里**：`app/repl.py` 在模块级 `from app.cli import ...` 复用
+        # 上面的会话解析/打印 helper（这正是"两处各写一遍 → 漂移"的解药），
+        # 所以 cli 反过来在模块级导入 repl 会成环。放在这里时 cli 已经加载完了。
+        from app.repl import run_repl
+
+        try:
+            run_repl(
+                runtime,
+                task=task,
+                start_session_id=forked_sid or (session_id if resume else None),
+                resume=resume or forked_sid is not None,
+                step=step,
+                checkpoint_every=checkpoint_every,
+                clear_taint=clear_taint,
+            )
+        finally:
+            runtime.close()
+        raise typer.Exit()
+
     typer.secho("---", fg=typer.colors.BRIGHT_BLACK)
 
     try:
@@ -501,11 +677,7 @@ def run(
             # 记一条"因此是假的）。引擎启动时会重新接一个"session + 实时回调"的组合
             # 出口，这里先接 session 那半边不会写重复：两边写的是不同的事件。
             restored.emitter = session.emit
-            engine = QueryEngine(
-                llm, registry, workspace_root=workspace_root, context=context,
-                session=session, memory_blocks=memory_blocks, on_event=printer,
-                permissions=permissions, hooks=hooks, skills=skills,
-            )
+            engine = runtime.engine(session)
             typer.secho(
                 f"恢复会话 {_session_label(workspace_root, sid)}（step {restored.step}）→ 续跑",
                 fg=typer.colors.CYAN, bold=True,
@@ -527,14 +699,7 @@ def run(
                 # "消息有没有变"，一变就破坏 `_PREFIX_LEN` 之后的前缀缓存。
                 # 用 user 角色 + 说明来源：计划是 agent 自己产出的，不加以说明地
                 # 当成"用户说的话"塞进去，模型会以为是人给的指令。
-                restored.messages.append(
-                    user_message(
-                        "（会话恢复：这是你之前列的计划清单，继续按它推进）\n"
-                        + render_plan(restored.plan)
-                    )
-                )
-                restored.record_event("plan_resumed", items=len(restored.plan))
-                typer.secho(f"计划恢复: {len(restored.plan)} 条", fg=typer.colors.CYAN)
+                _reinject_plan(restored)
             if task.strip():
                 # 续跑指示：`--resume "..."` 曾经**静默丢掉**这个参数（run_from 用的是
                 # state.task），于是「拒绝文案让你 --clear-taint 复位后重试」这条动线
@@ -555,11 +720,7 @@ def run(
                     DEFAULT_CHECKPOINT_EVERY if checkpoint_every is None else checkpoint_every
                 ),
             )
-            engine = QueryEngine(
-                llm, registry, workspace_root=workspace_root, context=context,
-                session=session, memory_blocks=memory_blocks, on_event=printer,
-                permissions=permissions, hooks=hooks, skills=skills,
-            )
+            engine = runtime.engine(session)
             typer.secho(f"会话: {session.session_id}", fg=typer.colors.CYAN, bold=True)
             typer.secho(f"任务: {task}", fg=typer.colors.CYAN, bold=True)
             if clear_taint:
@@ -573,36 +734,16 @@ def run(
             result = engine.run(task)
     finally:
         # MCP 连接是资源（子进程 + 管道），任务结束必须回收，不能等 GC
-        for client in mcp_clients:
-            client.close()
+        runtime.close()
 
     typer.secho("---", fg=typer.colors.BRIGHT_BLACK)
 
-    # M4-1 任务后提取：把轨迹里可复用的约定写回 learned.md（跨会话生效）
-    # 受污染的会话写到 learned.pending.md（不自动注入，等人复核）—— 判据是
-    # 会话标记，不是提炼出来的内容像不像被带偏（内容过滤会误伤正常条目）。
-    #
-    # 停在提问处的会话**不提炼**：那是一段半程轨迹，模型当时正因为信息不足在猜，
-    # 把它猜的东西提炼成"仓库约定"再自动注入后续所有会话，是污染而不是学习。
-    # 续跑那一轮会照常提炼（那时轨迹是完整的），所以什么都没丢。
-    if not mock:
-        if result.terminated_reason == "await_user":
-            typer.secho(
-                "本轮停在提问处（半程轨迹），不做约定提炼 —— 续跑完成后照常提炼",
-                fg=typer.colors.BRIGHT_BLACK,
-            )
-        else:
-            learned = memory.extract_and_learn(result.events, taint=result.taint)
-            if learned:
-                target = (
-                    ".codeagent/rules/learned.pending.md（会话被标记为受污染，待人工复核）"
-                    if result.taint == TAINT_HIGH
-                    else ".codeagent/rules/learned.md"
-                )
-                typer.secho(
-                    f"已提炼 {len(learned)} 条仓库约定 → {target}",
-                    fg=typer.colors.YELLOW if result.taint == TAINT_HIGH else typer.colors.GREEN,
-                )
+    # M4-1 任务后提取（跨会话生效）。**只在**这里做一次 —— REPL 在退出时调同一个
+    # helper，两份实现迟早会有一份漏掉"受污染写 pending"或"半程轨迹不提炼"。
+    _extract_learned(
+        runtime, result.events, result.taint,
+        terminated_reason=result.terminated_reason,
+    )
     if result.taint != TAINT_NONE:
         typer.secho(
             f"本会话污染标记: {result.taint}"
@@ -634,8 +775,8 @@ def run(
     ratio = usage.cache_hit_ratio
     cache_line = f"，缓存命中 {ratio:.0%}" if ratio is not None else ""
     ctx_line = ""
-    if context.last_stats is not None:
-        s = context.last_stats
+    if runtime.context.last_stats is not None:
+        s = runtime.context.last_stats
         ctx_line = f"，上下文 {s.warning_level} ({s.utilization:.0%}/{s.total_tokens} tokens)"
     checkpoints = session.list_checkpoints()
     cp_line = f"，检查点 {len(checkpoints)} 个" if checkpoints else ""

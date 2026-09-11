@@ -52,6 +52,25 @@ class Usage:
             prompt_cache_miss_tokens=self.prompt_cache_miss_tokens + other.prompt_cache_miss_tokens,
         )
 
+    def __sub__(self, other: "Usage") -> "Usage":
+        """差值用量（`self - other`）。
+
+        M9-5 REPL 需要它：一次运行的 `RunResult.usage` 是**会话累计**的
+        （loop 里每个返回点给的都是 `state.usage`），而 REPL 每回合要报的是
+        **这一回合**花了多少。用回合前后的快照相减即可，不必让 loop 再维护
+        第二套"本回合用量"的记账 —— 那就是「两处各写一遍 → 漂移」。
+
+        字段**可以为负**（没有 clamp）：这是刻意的。负数只有一个来源 ——
+        调用方把顺序搞反了。把它悄悄夹成 0 会让"我到底减对了没有"变得不可见，
+        而这里的调用方就是 REPL 自己，测出来比藏起来好。
+        """
+        return Usage(
+            prompt_tokens=self.prompt_tokens - other.prompt_tokens,
+            completion_tokens=self.completion_tokens - other.completion_tokens,
+            prompt_cache_hit_tokens=self.prompt_cache_hit_tokens - other.prompt_cache_hit_tokens,
+            prompt_cache_miss_tokens=self.prompt_cache_miss_tokens - other.prompt_cache_miss_tokens,
+        )
+
 
 @dataclass
 class ToolCall:

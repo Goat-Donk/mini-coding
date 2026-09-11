@@ -16,7 +16,8 @@
 ```mermaid
 flowchart TB
     subgraph ENTRY["入口层 app/"]
-        CLI["cli.py<br/>typer CLI · --resume · --plan"]
+        CLI["cli.py<br/>typer CLI · --resume · --plan · --repl"]
+        REPL["repl.py<br/>常驻交互（M9-5）：一行一个回合"]
         UI["ui_streamlit.py<br/>实时事件 · 权限按钮 · 指标"]
         RP["replay.py<br/>检查点回放（纯函数）"]
     end
@@ -51,6 +52,7 @@ flowchart TB
     end
 
     CLI --> LOOP
+    REPL --> LOOP
     UI --> LOOP
     RP --> SESS
     LOOP --> LLM
@@ -82,9 +84,9 @@ sequenceDiagram
     participant G as 门禁链
     participant S as Session
 
-    U->>Q: run(task)
+    U->>Q: run(task)　或　run_turn(state, text)（常驻模式，M9-5）
     Q->>Q: 组 system prompt（记忆块 + 工具 schema）
-    loop 每步（上限 max_steps=25）
+    loop 每步（**本轮预算** max_steps=25，M9-5）
         Q->>C: prepare(state)
         C->>C: provider-usage-first 记账 → 分级 compact
         C-->>Q: 布局稳定的 messages
@@ -109,14 +111,23 @@ sequenceDiagram
 | terminated_reason | 触发条件 | 语义 |
 |---|---|---|
 | `completed` | 模型不再调工具（且内容非空，或空响应重试用尽） | 正常完成 |
-| `max_steps` | 达到 `max_steps`（默认 25） | 坍缩防护：硬上限 |
+| `max_steps` | 达到 `max_steps`（默认 25） | 坍缩防护：**每轮一份预算**（M9-5，见下） |
 | `loop_detected` | 最近 4 步工具签名集合完全一致 | 坍缩防护：原地打转 |
 | `error` | 循环内抛异常 | 明确失败，**不假装成功** |
 | `await_user` | 模型调了 `ask_user`（`ToolResult.await_user=True`） | **半程暂停**，不是结论：等人补充信息后 `--resume "回答"` 续跑 |
 
+> **`max_steps` 的语义（M9-5 变更）**：从「整个 state 的累计步数上限」改成
+> **「本次运行 / 本回合的步数预算」**。`state.step` 本身照样累计不重置（检查点文件名
+> `step-N.json`、`--fork --step K`、轨迹的 `step` 字段都依赖它单调递增），只改预算的
+> **度量起点** —— `_run_loop` 进循环时记下 `budget_start = state.step`，条件从
+> `state.step < max_steps` 变成 `state.step - budget_start < max_steps`。
+> 旧语义下有一个陷阱：会话跑满 25 步之后 `--resume` 会**一次模型调用都不发**、
+> 直接又打印「已达到最大步数（请拆分子任务）」，而错误信息指的方向还是错的。
+> 在单发路径上两种语义等价（一个进程只有一个回合），所以这是**常驻模式逼出来的**修正。
+
 ## 3. 核心层
 
-### 3.1 QueryEngine（`agent/loop.py`，547 行）
+### 3.1 QueryEngine（`agent/loop.py`，681 行）
 
 **只读工具并发，写工具串行** —— 直接照搬 Claude Code `query.ts` 的语义，也是与串行参考实现的主要差异：
 
@@ -144,7 +155,7 @@ flowchart LR
 `BaseLLM` 两个实现，**接口完全一致**，所以循环、子代理、评估层共用一套代码：
 
 - `DeepSeekClient`：走 openai SDK（DeepSeek 兼容 OpenAI 协议），`chat()` 返回 `LLMResult(content, tool_calls, usage)`，`complete()` 给 compact 摘要用。
-- `MockLLM`：`script(*responses)` 脚本化响应序列 / `text("...")` 固定响应 / `tool_then_text(...)`。**测试与无 key 演示都靠它**——515 个测试全部离线，不打网络。
+- `MockLLM`：`script(*responses)` 脚本化响应序列 / `text("...")` 固定响应 / `tool_then_text(...)`。**测试与无 key 演示都靠它**——559 个测试全部离线，不打网络。
 
 `Usage` 里单独保留 `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`——这是 DeepSeek 磁盘缓存的**实测**字段，整个缓存命中率指标和成本估算都建立在它之上（不是估算出来的）。
 
@@ -267,6 +278,50 @@ python -m app.cli --resume --session-id "换个思路" "接着改"   # 名字和
 **`--sessions` 不是附赠**：没有它，`--rename` 写的名字与 `--fork` 记的血统**没有任何消费者** —— 机制在、测试绿、文档写了，但没有任何东西把人引到它上面。清单的键集合取「检查点目录 ∪ `data/sessions/*.jsonl`」，所以跑到一半被 kill、还没到第一个检查点的会话也在里面。
 
 **名字的两条判据合起来才成立**：写入侧 `validate_name` 拒绝「与任何已有 session_id 或会话名相同」，读取侧 `resolve_session` **先当 id、再当名字**。少了写入侧的拒绝，重名会让 `--resume --session-id <名字>` 安静地跑到先遍历到的那个会话上（带着另一个任务的上下文）；名字等于某个 id 时那个 id 就永远解析不到自己。所以不去读取侧加优先级"猜"。
+
+### 3.7 常驻交互模式（`app/repl.py`，M9-5）
+
+**同一个 `AgentState` 连跑两次** —— REPL 不是新功能，是「换个用法」。它的价值恰在于
+这个用法第一次让下面四条**单发进程里结构上不可观测**的契约成为真实路径：
+
+| 契约 | 单发时为什么看不见 | 违反后的表现 |
+|---|---|---|
+| `run_turn` 复位 `terminated_reason` | "一个回合"和"一个进程"是同一件事 | 第二回合全程带着上一回合的旧值（控制台会从检查点里读出来显示） |
+| `run_turn` 调 `permissions.new_turn()` | `_turn` 随进程一起消失，所以从没有过清空动作 | `allow_turn` 变成**永久放行**，与确认框写的「2) 本回合允许」矛盾 |
+| `record_discovery` 认 `state.events` 去重 | 只有一轮，重放一次看不出来 | `skill_discovery` 每回合往轨迹里再写一份 |
+| 入口 `ensure_tool_pairing` | 回合中途 Ctrl+C 后进程就死了，靠检查点恢复 | 下一轮请求是 400 形状，而**报错发生在下一回合**，与那次 Ctrl+C 看起来无关 |
+
+**装配不复制。** `app/cli.py` 里原先 `QueryEngine(...)` 被构造了两遍（`--resume` 一条路、
+全新会话一条路，参数逐字相同）—— 这本身就是「两处各写一遍」。收成 `_Runtime.engine(session)`
+一处之后，单发与常驻从同一个地方拿引擎。REPL 若自己装配一遍（注册工具、接权限、接 hooks、
+加载 MCP、装 `--review-edits` 的确认回调），迟早漏掉一样 —— **CLI 历史上漏接过 hooks 与
+permissions 各一次，两次都是静默的**。
+
+**两条硬不变量**：① 不认识的斜杠命令**绝不发给模型**（打错一个字母 = 一次真实的模型调用，
+而回答看起来还挺像回事，所以这个错误不会被发现）；② 会话切换失败**不能半切换**（`_activate`
+三样一起换，engine 必须跟着换 —— `QueryEngine.session` 是构造期绑定的；"session 换了、
+engine/state 没换"是一个没有任何报错的错配：轨迹写进 A、你在看 B）。
+
+**`await_user` 不需要任何特殊机制**：模型提问 → 本轮结束 → 打印问题 → 下一行输入就是回答。
+这是 M8「把打断建模成数据标志而不是阻塞控制流」的回报 —— 反过来，若 REPL 自己 `input()`
+一个"回答"，那才是把数据标志退化成阻塞控制流。
+
+**退出时的承诺必须真能兑现**：`_farewell` 打印「继续: … `--repl --resume --session-id <sid>`」，
+而检查点是**按节拍**写的、且**只在有工具调用的步上 tick** —— 纯聊天或只走两三步就退出，
+一个检查点都不落，那条命令跑起来直接报"读不到检查点"。所以 `_wrap_up` **退出时强制落一次**
+（理由与 `_awaiting_user` 里 `force=True` 相同：流程即将因非步数原因退出，节流的下一次 tick
+永远等不来）。M7 的教训是「一条走不通的指引比没有指引更糟」—— 而这次那条指引是我们自己打印的。
+
+**它明确不是全屏 TUI**（⑥ 已决定不做）：行式输入，没有 ANSI 控制、没有历史滚动。
+多行输入缓冲 / 历史文件 / 自动补全也不做 —— 纯终端体验的体力活，对这份作品集要回答的
+问题（循环、上下文、权限、可恢复性）不加分。
+
+```bash
+python -m app.cli --repl                        # 进提示符
+python -m app.cli --repl "先跑一下测试"          # 带任务：它作为第一个回合
+python -m app.cli --repl --resume --session-id <sid>   # 恢复后接着聊
+# 提示符内：/help /exit /new /resume /fork /plan /sessions /rename /clear-taint
+```
 
 ## 4. 治理层
 

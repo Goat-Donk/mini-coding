@@ -60,7 +60,7 @@ class Usage:
     # properties:
     #   total_tokens = prompt + completion
     #   cache_hit_ratio = hit / (hit + miss)  （分母为 0 时返回 None）
-    # 支持 __iadd__ / __add__（累加到会话总 usage）
+    # 支持 __iadd__ / __add__（累加到会话总 usage）与 __sub__（★M9-5：取回合增量）
 
 @dataclass
 class ToolCall:
@@ -604,6 +604,22 @@ class AgentState:
 - tool_calls 的 arguments 在 `assistant_tool_calls` 里统一 `json.dumps(ensure_ascii=False)`。
 - content=None 是合法 assistant tool-use 消息（OpenAI 要求）。
 
+#### `ensure_tool_pairing(messages) -> int`（★M9-5）
+
+补上**孤儿 `tool_call` 的应答消息**，返回补了几条。复用已有的 `assistant_tool_calls` /
+`tool_result` 两个构造函数，不新造消息形状。
+
+**为什么需要它**：回合中途 Ctrl+C，`state.messages` 可能停在
+`assistant(tool_calls=[3 个])` + 只有 1 条 tool 结果 —— 下一轮请求直接 400。
+单发进程里这一刀下去进程就死了、靠检查点恢复，所以从没暴露过；REPL 要接着用
+同一个 state 就必须补上。**而报错发生在下一回合**，与那次 Ctrl+C 看起来毫无关系 ——
+这是它值得单独成一个函数的原因。
+
+三条性质（各有纯函数用例）：**幂等**（补过的不会被补第二遍）、**位置正确**（补的
+结果消息紧跟已有结果，不破坏"assistant tool_calls 后跟 N 条 tool 结果、顺序与 calls
+对应"这条 OpenAI 硬性要求）、**以普通文本收尾时不误判**（不能把"模型这轮只想说话"
+当成残缺）。调用方 `run_turn` 补了几条就记一条 `pairing_repaired` 事件 —— **不静默修**。
+
 ---
 
 ## 6. agent/context.py（◐M1 占位 → M3 补全，★ 差异化 + MiniCode 吸收）
@@ -791,22 +807,56 @@ class QueryEngine:
                  memory_blocks: list[str] | None = None,   # M4 注入
                  context: ContextManager | None = None,
                  session: object | None = None):       # M3 接 session（轨迹/检查点）
+
+    # ---- 单发入口（M1 起）----
+    def new_state(self, task: str) -> AgentState:
+        # 建一份全新 state + 拼装 system prompt（见 7.2）。
+        # ★ M9-5 抽出来的：原先这段写在 run() 里、state 建在本地就丢掉，
+        #   于是 REPL 要跨回合持有 state 就得把「prompt 渲染 + 记忆块拼装 +
+        #   session_id 归属」再写一遍 —— 就是「两处各写一遍 → 漂移」。
     def run(self, task: str, *, cwd: Path | None = None) -> RunResult:
-        # 1) state = AgentState(...)；system_prompt 拼装（见 7.2）
-        # 2) while state.step < max_steps:
-        #      messages = self.context.prepare(state)（M1=原样）
-        #      result = llm.chat(messages, registry.schemas())
-        #      state.usage += result.usage; state.step += 1
-        #      state.record_event("llm_call", tool_calls=[...], usage=..., step=state.step)
-        #      if result.tool_calls:
-        #         loop 检测（7.3）
-        #         execute_tool_calls(result.tool_calls, state, ctx)
-        #         continue
-        #      else:
-        #         state.terminated_reason = "completed"
-        #         return RunResult(final_text=result.content, ...)
+        # = new_state(task) + run_from(state, ..., push_user=True)，两行。
+        #   （M9-5 之后 run() 自己不再有任何循环逻辑）
+
+    # ---- 多回合入口（★M9-5）----
+    def run_turn(self, state: AgentState, text: str, *, cwd: Path | None = None) -> RunResult:
+        """一个用户回合 = 常驻模式（app/repl.py）的一行输入。顺序固定不可调换：
+             1) state.ensure_tool_pairing() → 补上被中断打断的 tool 结果配对，
+                补了几条就记一条 pairing_repaired 事件（**不静默修**）
+             2) state.terminated_reason = None        # 上一回合的值不许跨回合
+             3) permissions.new_turn()                # 见 §9.1：本回合记忆作废
+             4) state.task = text；messages.append(user(text))
+             5) _run_loop(..., budget_start=state.step)   # ★ 本轮一份步数预算
+        user 消息由 run_turn 追加、不由调用方追加：--resume 那条路径是 CLI 自己
+        append 的，两处各写一遍的话，漏了就是「模型收到一个没有提问方的回合」。
+        """
+
+    def _run_loop(self, state, task, cwd, *, budget_start: int | None = None):
+        if budget_start is None:
+            budget_start = state.step
+        # while state.step - budget_start < self.max_steps:   ← ★M9-5 行为变更
+        #   messages = self.context.prepare(state)（M1=原样）
+        #   result = llm.chat(messages, registry.schemas())
+        #   state.usage += result.usage; state.step += 1
+        #   state.record_event("llm_call", tool_calls=[...], usage=..., step=state.step)
+        #   if result.tool_calls:
+        #      loop 检测（7.3）
+        #      execute_tool_calls(result.tool_calls, state, ctx)
+        #      continue
+        #   else:
+        #      state.terminated_reason = "completed"
+        #      return RunResult(final_text=result.content, ...)
         # 3) 循环外：terminated_reason = "max_steps"（或 loop_detected）
         #     final_text = "已达到最大步数 / 检测到重复循环，任务中止"
+
+        # ★ M9-5：max_steps 的语义从「整个 state 的累计步数上限」改成
+        #   **「本次运行/本回合的步数预算」**。state.step 本身照样累计不重置
+        #   （检查点文件名 step-N.json、--fork --step K、轨迹的 step 字段都
+        #   依赖它单调递增），只改预算的**度量起点**。
+        #   四个入口（run / run_from / run_turn / 控制台）由此统一拿到
+        #   「本次运行有多少步」。顺带修掉一个陷阱：会话跑满 max_steps 之后
+        #   `--resume` 在旧语义下**一次模型调用都不发**、直接又打印「已达到
+        #   最大步数（请拆分子任务）」，而错误信息指的方向还是错的。
 
     def _gate_and_run(self, call, state, ctx) -> ToolResult:
         # 门禁链：hooks.run_pre（可阻断）→ permissions.check → tool.run → hooks.run_post
@@ -872,6 +922,27 @@ DEFAULT_SYSTEM_PROMPT = f"""\
 - test_loop_detected：MockLLM 连续返回相同工具调用 → reason=loop_detected
 - test_e2e_real_files：MockLLM 脚本化（glob → read → edit → 文本）在 tmp_path 真实文件上跑通（验证工具链真实可用）
 
+### 7.6 多回合契约（★M9-5）
+
+常驻 REPL 让「同一个 `AgentState` 连跑两次」第一次成为一条真实路径。下面五条是
+**单发进程里结构上不可观测**的契约，各有测试钉着：
+
+| 契约 | 单发时为什么看不见 | 违反后的表现 |
+|---|---|---|
+| `run_turn` 复位 `terminated_reason` | "一个回合"和"一个进程"是同一件事，从没有过清空动作 | 第二回合全程带着上一回合的旧值；控制台从检查点 payload 里读出来显示 |
+| `run_turn` 调 `permissions.new_turn()` | 同上（`_turn` 会随进程一起消失） | `allow_turn` 变成**永久放行**，与确认框写的「2) 本回合允许」矛盾 |
+| `record_discovery` 认 `state.events` 去重 | 只有一轮，重放一次看不出来 | `skill_discovery` / `skill_shadowed` 每回合往轨迹里再写一份 |
+| 入口 `ensure_tool_pairing` | 回合中途 Ctrl+C 后进程就死了，靠检查点恢复 | 下一轮请求是 400 形状，而**报错发生在下一回合**，与那次 Ctrl+C 看起来无关 |
+| 步数预算是**每轮一份** | 一个进程只有一个回合，累计与每轮等价 | 第二回合一次模型调用都不发、直接说"已达到最大步数" |
+
+`ensure_tool_pairing(messages) -> int` 补的是**孤儿 `tool_call` 的应答消息**（复用
+`assistant_tool_calls` / `tool_result` 两个已有构造函数），返回补了几条。它**幂等**，
+且以普通文本收尾时**不误判**（不能把"模型这轮只想说话"当成残缺）。补了必须记一条
+`pairing_repaired` 事件 —— 静默修的话，事后翻轨迹只会看到模型莫名其妙又说要再调一次。
+
+`tests/test_loop.py` 里这五条各有一组用例（含 `ensure_tool_pairing` 的 4 条纯函数用例：
+healthy 不动 / 补全且紧跟已有结果 / 幂等 / 以普通文本收尾不误判）。
+
 ---
 
 ## 8. app/cli.py（◐M1 最小版 → 后续增强）
@@ -882,6 +953,35 @@ DEFAULT_SYSTEM_PROMPT = f"""\
 - ToolRegistry.default(workspace_root)；QueryEngine 组装
 - 打印：每步事件（工具调用名+参数摘要+结果截断）+ 最终结论 + 总 token/步骤
 - **M2+**：加 `--resume`、权限 ask 交互、`--checkpoint-dir`（M3）
+
+### 8.0 `_Runtime` / `_build_runtime()`：装配只写一遍（★M9-5）
+
+```python
+@dataclass
+class _Runtime:                      # 除 session/state 之外的全部装配结果
+    llm; registry; permissions; hooks; memory; memory_blocks
+    skills; context; printer; mcp_clients
+    workspace_root: Path
+    def engine(self, session) -> QueryEngine: ...   # ★ 唯一 QueryEngine(...) 构造点
+    def close(self) -> None: ...
+
+def _build_runtime(workspace_root, *, mock, mcp, review_edits) -> _Runtime: ...
+```
+
+原先 `QueryEngine(...)` 在 `run()` 里被构造了**两遍**（`--resume` 一条路、全新会话一条路，
+参数逐字相同）—— 这本身就是「两处各写一遍」。收成一处不只是整洁：**REPL 也必须从
+同一个 `_Runtime` 拿引擎**。REPL 若自己装配一遍（注册工具、接权限、接 hooks、加载 MCP、
+装 `--review-edits` 的确认回调），迟早漏掉一样 —— CLI 历史上**漏接过 hooks 与 permissions
+各一次，而两次都是静默的**。
+
+### 8.0b `--repl`：常驻交互模式（★M9-5）
+
+见 §8.3 `app/repl.py`。CLI 侧只多一个开关：
+
+- `--repl` **不带任务** → 建立/恢复会话后直接进提示符（"进来随便看看"）。
+- `--repl` **带任务** → 该任务**作为第一个回合**跑掉再进提示符（"我有个任务，跑完接着聊"）。
+  两者是同一条路径而不是两个入口（`run_repl` 里就一句 `if task.strip(): repl.run_turn(task)`）。
+- 与 `--resume` / `--fork` / `--clear-taint` / `--checkpoint-every` / `--review-edits` 正交可组合。
 
 ### 8.1 `--review-edits`：改动前人工确认（★M9-1）
 
@@ -933,6 +1033,84 @@ permissions = PermissionsEngine(..., confirm=_confirm_prompt if review_edits els
 
 **测试**：`tests/test_ui_streamlit.py`（AppTest 无头跑通 mock 任务；验收 `python -m pytest tests/test_ui_streamlit.py`）。
 
+### 8.3 app/repl.py（★M9-5 常驻交互模式）
+
+**文件**：`app/repl.py`；运行 `python -m app.cli --repl`（可带任务 / `--resume` / `--fork`）。
+
+它存在的理由是 `TASKS.md` 给它的定位 —— **④ Goal / ⑤ Loop 的硬前置**：「跨回合自动推进」
+「每 N 分钟重复提示词」在"跑完就退出"的一次性进程里没有任何意义，连"下一个回合"这个
+概念都不存在。**它自己持有 `AgentState`**，一整个进程用同一份 `messages`。
+
+```python
+class Repl:
+    def __init__(self, runtime: _Runtime, *, checkpoint_every=None, clear_taint=False): ...
+    def start(self, *, start_session_id=None, resume=False, step=None) -> None: ...
+    def loop(self) -> None:            # 读一行 → 一个回合；只有 EOF / 提示符处 Ctrl+C / /exit 会离开
+    def run_turn(self, text) -> RunResult | None:   # 只做显示与记账，循环逻辑在 engine.run_turn 里
+    def _activate(self, session, state=None) -> None:   # ★ 三样一起换：session / state / **engine**
+    def _dispatch(self, line) -> None:  # 斜杠命令分派
+    def _report(self, result, before_usage, before_step) -> None:   # 本回合增量
+    def _farewell(self, reason) -> None:   # 退出语：必须给可执行的续跑命令
+    def _wrap_up(self) -> None:            # ★ 退出时强制落检查点 + 一次约定提炼
+```
+
+**提示符**：`codeagent [名字或 sid 前 8 位 · step 12 · high] › `（污染级别只在非 `none`
+时显示 —— 常显一个 "none" 会让人不再看这一段，等它真的变成 high 时也照样不看）。
+
+**9 个斜杠命令**（每个都复用已有函数、零新机制）：
+
+| 命令 | 复用 |
+|---|---|
+| `/help` | `help_text()`，正文由 `_COMMANDS` 表生成 |
+| `/exit` | **标志位**而不是 `typer.Exit`（后者会被 `_dispatch` 的 except 吞掉） |
+| `/new` | `Session` + `engine.new_state("")` → `_activate` |
+| `/resume [id\|名字]` | `_resolve_session_ref` + `Session.from_checkpoint` |
+| `/fork [步]` | `cli._do_fork` |
+| `/plan` | `render_plan`（空清单不复用"已清空"文案 —— 那是 `update_plan` 清空动作的说法） |
+| `/sessions` | `cli._print_sessions` |
+| `/rename <名>` | `set_session_name` |
+| `/clear-taint` | `state.clear_taint(reason="repl:/clear-taint")` —— **人的动作** |
+
+**两条硬不变量**（各有测试钉着）：
+
+1. **不认识的斜杠命令绝不发给模型**。打错一个字母的代价是一次真实的模型调用
+   （钱 + 时间），而模型的回答看起来还挺像回事 —— 于是这个错误不会被发现，
+   只会觉得"这次答得有点怪"。只打印提示 + 指向 `/help`。
+   命令判据用 **`raw.startswith("/")`**（strip **之前**的行）而不是 `line`，
+   这样 `/etc/hosts 这个路径看一下` 这种以空格开头的输入仍然是任务。
+2. **切换失败不能半切换**。`/resume 不存在的名字` 必须在 `_activate` **之前**返回 ——
+   于是"当前会话仍活跃"是**结构性成立**的，而不是靠每处记得清理。「session 换了、
+   engine/state 没换」是一个**没有任何报错**的错配：轨迹写进 A、你在看 B，事后只能
+   靠翻 `data/` 发现。`_activate` 三样一起换，engine 必须跟着换（`QueryEngine.session`
+   是构造期绑定的）。
+
+**`await_user` 不需要任何特殊机制**：模型提问 → 本轮结束 → 打印问题 → **下一行输入就是
+回答**。这是 M8「把打断建模成数据标志而不是阻塞控制流」的回报。反过来，若 REPL 自己
+`input()` 一个"回答"，那就是把数据标志退化成阻塞控制流。
+
+**每回合报的是增量**（步数 / token / 缓存命中 / 上下文水位 / 检查点数），不是会话累计。
+`RunResult.steps` / `usage` 五个返回点给的都是 `state.step` / `state.usage`，所以 REPL
+用回合前后的快照相减 —— 而不是让 loop 再维护第二套"本回合用量"的记账（那是「两处各写
+一遍 → 漂移」）。**`Usage` 是可变 dataclass、`state.usage += ...` 是原地累加**，所以快照
+必须 `dataclasses.replace()` 复制；不复制的话相减恒为 0 **且不报错**，只是"每次都说这
+回合没花钱"。`Usage.__sub__` 与已有的 `__iadd__` 同处一个类。
+
+**`_wrap_up`：退出时强制落一次检查点，再做一次约定提炼**（M4-1）。
+`_farewell` 刚对着用户承诺了「继续: … `--repl --resume --session-id <sid>`」，
+而检查点是**按节拍**写的（默认 5 步）且**只在有工具调用的步上 tick** —— 纯聊天、
+或者只走两三步工具就退出，都写不出检查点，那条命令跑起来会直接报"读不到检查点"。
+理由与 `_awaiting_user` 里 `force=True` 的理由相同：流程即将因非步数原因退出，
+节流的下一次 tick 永远等不来。**先落盘再提炼**。提炼只做一次（`_turns == 0` 时
+直接返回）：`extract_and_learn` 是一次**真实的模型调用**，而它读的是累计轨迹，
+每回合跑一遍等于把同一段对话提炼 N 次；单发路径也是"一次运行提炼一次"，这里对齐它。
+
+**它明确不是全屏 TUI**（`TASKS.md` 里 ⑥ 已决定不做）：行式输入，没有 ANSI 控制、
+没有历史滚动。多行输入缓冲 / 历史文件 `readline` / 自动补全也都不做 —— 那是纯终端
+体验的体力活，对这份作品集要回答的问题（循环、上下文、权限、可恢复性）不加分。
+
+**测试**：`tests/test_repl.py`（34 例）。本仓第一条 `CliRunner(input=...)` 的 stdin
+端到端也在其中（7 例）—— 在这之前 `tests/test_cli.py` 没有任何 stdin 测试。
+
 ---
 
 ## 9. 后续里程碑模块规格（占位，届时展开补全）
@@ -943,6 +1121,33 @@ permissions = PermissionsEngine(..., confirm=_confirm_prompt if review_edits els
 - 三类请求：**path**（读/写/列/搜）、**command**、**edit**；每类 allowlist/denylist + 决策记忆（once/turn/always 落内存或文件）
 - 危险命令黑名单从 bash.py 提取共享；路径沙箱复用 files._resolve 语义
 - `PermissionsEngine.check(tool_name, arguments, ctx, *, details=None) -> 决策`；ask → 回调用户确认
+
+#### `new_turn()`：让「本回合」真的是一回合（★M9-5）
+
+```python
+def new_turn(self) -> None:
+    """开始一个新回合：清空**本回合**记忆（self._turn），保留 self._always。"""
+    self._turn.clear()
+```
+
+**调用点在 `QueryEngine._run_loop` 入口**，不在这里的判断逻辑里 —— 那是唯一一处能让
+四个入口（CLI 单发 / CLI REPL / Streamlit 控制台 / `eval/runner`）都拿到它的地方。
+在单发路径上它是 **no-op**（一次运行本来就只有一回合），所以不改变任何现有行为。
+
+在此之前 `_turn` **从来没有任何 clear/reset**（全仓零命中），`tests/test_permissions.py`
+把"回合结束"定义成**新建实例**。这在单发进程里是等价的，在常驻进程里不是：
+`allow_turn` 于是变成**永久放行**，与确认框上写着的「2) 本回合允许」直接矛盾。
+
+**`_always` 刻意不清** —— 那是另一个承诺（"一直允许"），清掉等于把用户明确选过的
+"总是"降级成"本回合"。有两条测试分别钉这两侧：`test_new_turn_clears_turn_memory_on_the_same_engine`
+与 `test_new_turn_keeps_always_memory`，各有一个变异体（"方法在、接线在，但什么也没做"
+与"顺手把 `_always` 也清了，看起来更保险"）。
+
+**记忆键**来自 `_classify(tool_name, arguments)`：`edit`/`write` 类是 `arguments["path"]`、
+`bash` 是 `arguments["command"]`、其他按工具名。所以"同一工具 + 同一路径"**键必然相同**，
+跨回合重新被问只可能来自回合边界上的清空 —— 这一点在 `m9verify/repl_c.log` 的真实跑里
+现场复现过（两回合都是 `edit` + `textstat.py`，第二回合重新弹确认框）。
+
 
 #### `details`：确认文案里的"将要改什么"（★M9-1）
 
@@ -986,6 +1191,7 @@ def dump_state(state: AgentState) -> dict    # 全字段快照；不可序列化
 def load_state(payload: dict, session_id: str) -> AgentState   # 新旧格式都吃
 def state_dict(payload: dict) -> dict        # 读者入口：兼容两种格式取 state
 def latest_session(workspace_root: Path) -> str | None  # 按检查点 mtime 选最近会话
+def unique_session_id(workspace_root: Path) -> str    # ★ 让开已存在的 id（循环加后缀）
 def _stored_cadence(payload: dict) -> int | None  # 读会话当初的节拍；缺失/非法 → None
 ```
 

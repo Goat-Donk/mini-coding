@@ -229,6 +229,26 @@ class PermissionsEngine:
         """
         self._rules["external"]["allow"] = list(self._rules["external"]["allow"]) + list(names)
 
+    def new_turn(self) -> None:
+        """开始一个新回合：清空**本回合**记忆（`_turn`），保留 `_always`。
+
+        这个方法存在的唯一理由是 M9-5 的常驻 REPL。在此之前 `_turn` **从来
+        没有被清空过**（全仓零 clear/reset），因为"一个回合"和"一个进程"在单发
+        CLI / eval 里是同一件事 —— 引擎跑完一个任务，进程就退了，谁也没机会
+        观察到下一次判定。`tests/test_permissions.py` 里"回合结束"的定义正是
+        **新建一个引擎实例**。
+
+        常驻进程里这个等价关系不成立了：用户在确认框上选「2) 本回合允许」，
+        选完之后那个授权会**一直有效到进程退出** —— 与菜单上写着的"本回合"
+        直接矛盾，而且没有任何出口能撤销它。一个只在单发路径上成立的语义，
+        在换用法之后静默地变成了另一个语义，正是本项目记录在案的头号缺陷类。
+
+        调用点是 `QueryEngine._run_loop` 的入口（一处），不是各入口各调一遍：
+        这样 CLI 单发 / CLI REPL / 控制台 / eval 四条路一起拿到它，而单发路径上
+        它是个 no-op（一次运行本来就只有一回合），不改变任何既有行为。
+        """
+        self._turn.clear()
+
     # ---------- 主入口 ----------
 
     def check(

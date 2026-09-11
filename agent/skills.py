@@ -257,8 +257,18 @@ def record_discovery(state, discovery: SkillDiscovery, block: str) -> None:
     为什么值得记：`--resume` 用的 system prompt 是**会话当初那份**（它在检查点
     里），所以"这轮到底有没有 skills 索引"是个只有轨迹能回答的问题 —— 事后看
     一份对话想不通模型为什么没按 skill 做，翻轨迹一眼就知道当时有没有。
+
+    **每个会话只记一次**（M9-5）：本函数在 `_run_loop` 的入口被调用，而常驻
+    REPL 的每个回合都会走一遍入口。原先的守卫是"block 不在 system prompt 里就
+    跳过"，可第二回合 block **还在** prompt 里（`state.system_prompt` 是会话
+    建好时渲染的那一份，不随回合变）—— 于是 `skill_discovery` 与每条
+    `skill_shadowed` 会**每回合往轨迹里再写一份**。单发只有一轮，看不出来；
+    多跑几轮，同一件事就在轨迹里堆成 N 份副本，而"这轮带了哪些 skill"本来是个
+    一眼能答的问题。
     """
     if not discovery.skills or block not in state.system_prompt:
+        return
+    if any(e.get("type") == "skill_discovery" for e in state.events):
         return
     state.record_event(
         "skill_discovery",
