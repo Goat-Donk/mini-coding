@@ -1246,41 +1246,97 @@ def render_message(message: dict) -> str    # tool 结果截断 500；tool_calls
 - 测试：tests/test_ui_replay.py（6 个：消息渲染/tool 截断/多模态兜底/会话排序/步骤读取/
   AppTest 无异常 + 回放区出现该会话）。
 
-### 9.8 agent/mcp.py（M6-3 已实现：MCP 客户端，有余力项）
+### 9.8 agent/mcp.py（M6-3 起步，M9-4 补传输与能力面：MCP 客户端）
+
+**分层：`Transport`（怎么把一条 JSON-RPC 消息送出去、拿回来）与 `MCPClient`（说什么）分开。**
+加 HTTP 传输时协议层（`_request` / `_notify` / `list_tools` / `call_tool` / 会话自愈）**一行未改**。
+这不是设计洁癖，是同一个错误不想修两遍：超时整形、id 关联、错误包装、会话重建这四件事在两种传输上
+必须完全一致，写两遍必然漂移 —— 而**只测单一传输的套件看不见分歧**。
 
 ```python
-PROTOCOL_VERSION = "2025-06-18";  DEFAULT_TIMEOUT = 20.0
+PROTOCOL_VERSION = "2025-06-18";  DEFAULT_TIMEOUT = 20.0;  MAX_LISTED_ITEMS = 20
 
 class MCPError(RuntimeError): ...
+class MCPTimeout(MCPError): ...          # 让报错能带上方法名（传输层不知道在等哪个方法）
+class MCPSessionExpired(MCPError): ...   # HTTP 404 + 带 session id → 可自愈的那一类
+
+class Transport(ABC):                    # timeout 是它的属性：超时只有这一个真相源
+    def start(self) -> None
+    def send(self, payload: dict) -> None            # 响应（若有）进内部队列
+    def receive(self, timeout: float) -> dict | None # None = 通道结束；超时抛 MCPError
+    def close(self) -> None
+    def hint(self) -> str                            # 出错时的补充上下文
+
+class StdioTransport(Transport):         # Popen + stdout/stderr 各一个后台抽干线程
+class HttpTransport(Transport):          # Streamable HTTP：POST 同时承担收发，无需后台线程
+    session_id: str | None
+
+def build_transport(spec, *, workspace_root=None) -> Transport   # **唯一一处**判断 command/url
+def _decode_body(raw, content_type) -> list[dict]   # JSON 单条，或 SSE 若干条
+def _parse_sse(text) -> list[dict]                  # 空行才是分发点；末尾无空行也收下
+class _NoRedirect(HTTPRedirectHandler): ...         # 3xx 不跟随，如实报出目标地址
 
 class MCPClient:
-    def __init__(self, command: list[str], *, name="mcp", timeout=20.0, cwd=None): ...
-    def start(self) -> MCPClient          # Popen + initialize 握手 + initialized 通知
-    def list_tools(self) -> list[dict]    # tools/list → [{name, description, inputSchema, annotations}]
-    def call_tool(self, name, arguments) -> ToolResult   # tools/call → content 拍平成文本
-    def close(self) -> None               # 关 stdin → terminate → kill 兜底
-    def __enter__/__exit__                # with 用法
-    server_info: dict;  protocol_version: str | None
+    def __init__(self, transport: Transport, *, name="mcp"): ...
+    def start(self) -> MCPClient          # transport.start() + initialize 握手 + initialized 通知
+    @property
+    def timeout(self) -> float            # 转发 transport.timeout（不另存一份）
+    def list_tools(self) -> list[dict]
+    def call_tool(self, name, arguments) -> ToolResult
+    def list_resources(self) -> list[dict]
+    def read_resource(self, uri) -> ToolResult        # blob（base64）不解码，如实报字节数
+    def list_prompts(self) -> list[dict]
+    def get_prompt(self, name, arguments=None) -> ToolResult
+    def close(self) -> None;  __enter__/__exit__
+    server_info: dict;  protocol_version: str | None;  capabilities: dict
 
-class MCPToolAdapter(Tool):
+class MCPToolAdapter(Tool):               # 远端工具 → 本项目 Tool
     input_model = BaseModel               # 占位：schema/run 均覆写
     def is_read_only(self) -> bool        # 只信 server 的 annotations.readOnlyHint，默认 False
     def is_external(self) -> bool         # True：第三方工具，权限引擎默认不放行（M7）
     def schema(self) -> dict              # 用远端 inputSchema，不从 pydantic 生成
     def run(self, arguments, ctx) -> ToolResult   # 跳过本地校验，参数原样透传
 
+class MCPResourceTool(Tool):  name = "read_resource"   # 只读 + 外部（M9-4）
+class MCPPromptTool(Tool):    name = "get_prompt"      # 只读 + 外部；参数是两个平行数组
+
 def load_mcp_servers(config_path, registry, *, workspace_root=None)
         -> tuple[list[MCPClient], list[str], list[str]]   # (clients, 注册名, 已授权名)
+def _register_capability_tools(...) -> None   # 能力声明 **且** 列表非空才注册那个工具面
+def _register(registry, tool, alias, allow_patterns, registered, allowed) -> None
 def _is_allowed(raw_name, final_name, patterns) -> bool    # 远端名或注册名命中 allow 即免确认
-def _flatten_content(content) -> str      # text 拼接；resource/其它类型给可读占位（不静默丢）
+def _render_resources/_render_prompts(client_name, items) -> str   # 描述里列出可用项
+def _flatten_content(content) -> str      # text 拼接；dict 归一成单元素列表；其余给可读占位
+def _blob_size(blob) -> int               # base64 → 原始字节数（**要算 `=` 填充**）
 ```
 
 - **为什么手写而非用官方 `mcp` SDK**：官方 SDK 是 async（anyio），而 QueryEngine 是同步循环，
-  为一个工具把整条循环改成 async 不划算；MCP stdio 就是「JSON-RPC 2.0 按行分隔」，
-  协议面很窄（3 个方法），手写更透明且不引入新依赖。
-- **传输实现**：stdout/stderr 各一个后台线程抽干（管道阻塞读没法设超时，Windows 上
-  `select` 也不支持 pipe）；stdout → 队列，请求按 `id` 关联响应；stderr → 环形缓冲
-  （40 行），出错时把 server 的真实报错带进异常信息，而不是干巴巴一句"超时"。
+  为一个工具把整条循环改成 async 不划算；MCP 的协议面很窄（JSON-RPC 2.0 + 十来个方法），
+  手写更透明且不引入新依赖（HTTP 传输用标准库 `urllib`，与 `tools/web.py` 同一手法）。
+- **传输实现**：
+  - **stdio**：stdout/stderr 各一个后台线程抽干（管道阻塞读没法设超时，Windows 上 `select`
+    也不支持 pipe）；stdout → 队列，请求按 `id` 关联响应；stderr → 环形缓冲（40 行），出错时
+    把 server 的真实报错带进异常信息，而不是干巴巴一句"超时"。EOF 时往队列塞 `None` 哨兵，
+    让等待中的请求立刻知道 server 没了。
+  - **HTTP（Streamable HTTP，2025-06-18）**：单个端点收 POST，响应**可能**是
+    `application/json`（一条消息）也可能是 `text/event-stream`（若干条，最后一条通常是本次响应）
+    —— spec 允许两种，客户端必须都认。POST 本身**同时承担收发**，所以不需要后台线程：
+    `send()` 把响应解析进队列，`receive()` 从队列取。`initialize` 回 `Mcp-Session-Id` 就记住，
+    后续每个请求都带上；同时带 `MCP-Protocol-Version`，`Accept` **必须同时**列出
+    `application/json` 与 `text/event-stream`（spec 的 MUST）。
+  - **`Accept` / `Content-Type` / `MCP-Protocol-Version` 不可被用户 `headers` 覆盖**（认证头之类照常补充）：
+    让它们"可配置"等于提供一个必然把自己配坏的口子。
+  - **会话自愈**：带 session id 的请求收到 404 → `MCPSessionExpired` → `_request` 重新
+    initialize 开一个新会话再重试**一次**（只重试一次：server 每次都回 404 时无限重试等于把超时改成死循环）。
+  - **`_raise_for_http_error` 的判断顺序有讲究**：`404 + 带 session id` 必须排在
+    "正文里有 JSON-RPC error" **之前**。真实 server 回 404 时正文里常常也放一条 error，反过来
+    "会话过期"会被报成一次普通调用失败 —— 文案看着完全合理，但自愈那条路**永远走不到**。
+  - **重定向不跟随**：`urllib` 默认把 301/302/303 上的 POST **改写成 GET**，一次 `tools/call`
+    变成一次静默的读请求。宁可报一句能照着改配置的话（含目标地址）。
+  - **`timeout` 只在传输层存一份**；`MCPTimeout` 单独一个类型，由 `_request` 补上方法名
+    （HTTP 侧还带端点地址，stdio 侧带 server stderr 末尾）—— 否则两种传输的诊断信息不一致。
+  - **明确未做**（如实标注）：独立 GET SSE 流（server 主动发起请求那条长连接）与
+    `Last-Event-ID` 断点续传。tools/resources/prompts 三件事都走 POST 请求-响应，用不到它们。
 - **安全边界（重要）**：MCP 工具来自第三方 server，**不受 workspace 沙箱约束**。所以
   ① 必须显式配置（`--mcp`）才注册，不进 `ToolRegistry.default`；
   ② 只读性只信 server 声明的 `readOnlyHint`，没声明就当可写（串行，绝不并发跑未知副作用）；
@@ -1288,8 +1344,25 @@ def _flatten_content(content) -> str      # text 拼接；resource/其它类型�
   ④ **权限默认不放行**（M7）：`is_external()` 为真的工具由 `_classify` 归到 `external`
   类，`_rule_check` 命中 `rules["external"]["allow"]` 才 `ALLOW`，否则 `ASK`。
   这正是把权限/钩子做成独立层的回报：接入新工具来源无需改循环。
+  ⑤ `url` **不做 SSRF 校验**，与 `web_fetch` 刻意不同：那个 URL 是**模型**给的，这个是人写在
+  `mcp.json` 里的显式 opt-in —— 校验一个用户自己填的地址没有意义。
+- **resources / prompts 能力面（M9-4）**：server 在 `initialize` 里声明了该能力、**且列表非空**时，
+  才注册 `read_resource` / `get_prompt`。只判能力的话，一个声明了 `resources` 却一处资源都没有的
+  server 会拿到一个**永远调不通**的工具（白占 schema token，模型每次调用都失败一次）。两个工具面
+  都是**只读 + 外部**（进并发只读批，且权限默认不放行）。工具描述里**列出可用 uri / 提示词名与
+  参数名（含必填性）**，不列的话模型只能瞎猜一个试试 —— 那正是 M8 `update_plan` 栽过的
+  elicitation gap 形状。描述恒在上下文里，列出来是**零额外往返**；封顶 `MAX_LISTED_ITEMS = 20`
+  并如实说「另有 N 处未列出」（一个挂了 500 处资源的 server 不该把 schema 撑爆）。
 - **配置**（`.codeagent/mcp.json`）：
-  `{"servers": {"<别名>": {"command": ["python","-m","some_server"], "timeout": 20, "allow": ["工具名"]}}}`
+  ```json
+  {"servers": {"<别名>": {"command": ["python","-m","some_server"],   // 或
+                          "url": "https://host/mcp",                   // 二选一
+                          "headers": {"Authorization": "Bearer ..."},  // 仅 HTTP
+                          "timeout": 20, "allow": ["工具名"]}}}
+  ```
+  `command` 与 `url` **二选一只在 `build_transport` 里判断**（两处各判一遍必然漂移，最后表现成
+  "配了 url 却被当成 stdio 去起子进程"）；两个都给 → 报错并跳过该 server，**不静默选一个**。
+  `--mcp` 的**相对路径按工作区解析**，不按进程 CWD（help 里给的例子就是 `.codeagent/mcp.json`）。
   `allow` 是**免确认白名单**，支持 fnmatch（`"e*"` / `"*"`）。匹配在 `load_mcp_servers`
   里做，因为只有那一处同时知道「远端名」与「注册名」（重名时后者加了 `<别名>__` 前缀）——
   否则用户得去猜前缀，配置就成了实现细节的泄漏。`load_mcp_servers` 返回的第三个值
@@ -1298,12 +1371,19 @@ def _flatten_content(content) -> str      # text 拼接；resource/其它类型�
 - **容错**：单个 server 启动失败/崩溃只打印 stderr 提示并跳过，不影响其它 server 与主流程
   （MCP 是增强项，不该成为启动路径上的单点故障）；与内置工具重名时加 `<别名>__` 前缀，
   **不静默遮蔽**内置工具。客户端由调用方 `close()`（子进程 + 管道是资源，不等 GC）。
-- 测试：tests/test_mcp.py（14 个）+ tests/fake_mcp_server.py——**真子进程、真管道、
-  真 JSON-RPC**（不是 mock）：握手/列工具/成功·isError·未知工具/只读注解透传/
-  跳过本地校验/重名加前缀/坏 server 不炸主流程/崩溃与超时诊断/**allow 白名单语义**/
-  **经真实 QueryEngine 循环调用 MCP 工具**。权限侧的判定与拒绝文案在
-  tests/test_permissions.py（外部工具默认 `ASK`、授权后 `ALLOW`、裸名与加前缀名都能配、
-  拒绝理由含出处与解除方式）。
+- 测试：tests/test_mcp.py（**47 个**）+ `tests/fake_mcp_core.py` / `fake_mcp_server.py` /
+  `fake_mcp_http_server.py`——**真子进程、真管道、真 socket、真 JSON-RPC**（不是 mock）：
+  握手/列工具/成功·isError·未知工具/只读注解透传/跳过本地校验/重名加前缀/坏 server 不炸主流程/
+  崩溃与超时诊断/**allow 白名单语义**/**经真实 QueryEngine 循环调用 MCP 工具**；
+  传输层覆盖 JSON 与 SSE 两种响应 / SSE 里夹通知 / session 与协议版本头 / 会话过期后重新
+  initialize / 重定向如实报错 / 缺 `Accept` 被拒 / **同一条操作序列走两种传输逐项比对（含报错文案）**；
+  能力面覆盖文本与二进制资源 / 模板参数 / 描述里列出可用项 / 能力缺失或列表为空则不注册 / 与 allow 的接线。
+  权限侧的判定与拒绝文案在 tests/test_permissions.py（外部工具默认 `ASK`、授权后 `ALLOW`、
+  裸名与加前缀名都能配、拒绝理由含出处与解除方式）。
+- **真实远程 HTTP 端到端验证过**（DeepWiki `https://mcp.deepwiki.com/mcp`，走公网）：握手拿到
+  `serverInfo DeepWiki 2.14.3`，DeepSeek 实际调用 `read_wiki_structure` 成功（1 步 / 2425ms）。
+  该 server **无状态**（不回 `Mcp-Session-Id`），客户端照常工作；它声明了 `resources` / `prompts`
+  但列表均为空，于是正确地**没有**注册那两个工具面。
 
 ---
 
@@ -1477,7 +1557,7 @@ python -m app.cli "给 README 加一行说明并验证"     # 真实 DeepSeek（
 python -m eval.golden_tasks --clone --limit 10   # M5-1：拉 tinydb 并列出真实 fix 提交
 python -m eval.runner --limit 3                  # M5-2：真实跑 3 个黄金任务出回归报告
 python -m eval.runner --limit 2 --mock           # M5-2 无 key 冒烟（judge 会如实失败）
-python -m app.cli --mcp .codeagent/mcp.json "任务"  # M6-3 加载 MCP server 后执行任务
+python -m app.cli --mcp .codeagent/mcp.json "任务"  # M6-3/M9-4 加载 MCP server（stdio 或 HTTP）后执行任务
 python -m app.cli --sessions                    # M9-3 会话清单：名字 / 步数 / 分叉来源（无 key）
 python -m app.cli --rename "基线方案"             # M9-3 起名（只动元数据，无 key）
 python -m app.cli --fork --step 3 "换个思路"      # M9-3 从第 3 步分叉并续跑（对话分叉）

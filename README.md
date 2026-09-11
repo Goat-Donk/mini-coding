@@ -4,7 +4,7 @@
 **核心循环手写**（不套 LangGraph / Agent SDK），支撑层用成熟库（openai SDK / pydantic v2 / streamlit / typer / pytest）。
 
 > **一句话**：把 Claude Code 的架构用 Python 重写一遍——不是移植代码，是移植设计。
-> 7,728 行源码 / 25 个模块 / 482 个测试。真实跑分见[评估章节](#评估eval)。
+> 8,310 行源码 / 25 个模块 / 515 个测试。真实跑分见[评估章节](#评估eval)。
 📄 文档：[技术方案 `docs/TECH_SPEC.md`](docs/TECH_SPEC.md) · [架构详解 `docs/architecture.md`](docs/architecture.md) · [任务清单 `TASKS.md`](TASKS.md) · [参考笔记 `docs/reference/`](docs/reference/)
 
 ---
@@ -22,7 +22,7 @@
 | **真·轨迹驱动评估** | 从 tinydb 真实 git history 挖 bug 修复提交构造黄金任务，隐藏测试判分，出完成率/成本回归报告 | SWE-bench 思路 |
 | **分层记忆 + 自进化** | `CODEAGENT.md` / `CLAUDE.md` / `.codeagent/rules/*.md` 分层 + `@include` + hash 去重 + 预算；任务后提取约定写回，**下次会话自动生效** | CLAUDE.md 机制 |
 | **research 子代理** | 把 `(X+Y)×N` 的探索外包，主上下文只收结论 `Z`；子代理只读、无 subagent 工具（天然禁递归） | SubAgent 上下文经济学 |
-| **MCP 客户端** | 手写 MCP stdio 客户端接入标准 MCP server；**第三方工具照样过权限与 hooks**，且**默认不放行**——必须列进 `mcp.json` 的 `allow` 才免确认 | MCP（工具接入标准） |
+| **MCP 客户端** | 手写 MCP 客户端，**两种传输**（stdio 子进程 / Streamable HTTP）与协议层**分开**——加 HTTP 时协议层一行未改；三种能力面（tools / resources / prompts），能力声明与列表**都非空**才注册工具面，描述里列出可用 uri 与提示词参数。**第三方工具照样过权限与 hooks**，且**默认不放行**——必须列进 `mcp.json` 的 `allow` 才免确认 | MCP（工具接入标准） |
 | **第三方工具授权** | `Tool.is_external()` → 权限引擎单独归类，默认 `ask`（无交互确认 → 拒绝），拒绝文案带出处与解除方式；子进程环境按名清洗凭据类变量 | 权限与安全审查 |
 | **注入文本检测 + 会话污染标记** | `agent/security.py` 对已知文本模式做**概率性**检测（只出告警）；`high` 标记让**三类不可逆动作**（网络外发 / 读凭据 / 写记忆文件）在 `PermissionsEngine` 的**后置天花板**上从 allow 降为 ask —— 该位置在记忆之后，`allow_always` 短路不了它 | 权限与安全审查 |
 | **联网工具 + SSRF 拦截** | `web_fetch` / `web_search` 两个工具；**先解析域名再判结果 IP**（判 hostname 字面量是漏的），解析失败即拒绝；`::ffff:` 映射、CGNAT、NAT64/6to4 内嵌地址都拆开判；**每一跳重定向都重查**（只数跳数不校验目标等于不设防）。顺带让上面那条天花板的「网络外发」第一次有了真实对象 | WebFetch / WebSearch |
@@ -253,14 +253,31 @@ python -m app.cli "修掉 calc.py 里的减法 bug" --review-edits
 **接 MCP server**（复制 [`mcp.example.json`](mcp.example.json) 为 `.codeagent/mcp.json`）：
 
 ```json
-{"servers": {"fs": {
-  "command": ["npx", "-y", "@modelcontextprotocol/server-filesystem", "."],
-  "allow": ["read_file", "list_directory"]
-}}}
+{"servers": {
+  "fs": {
+    "command": ["npx", "-y", "@modelcontextprotocol/server-filesystem", "."],
+    "allow": ["read_file", "list_directory"]
+  },
+  "deepwiki": {
+    "url": "https://mcp.deepwiki.com/mcp",
+    "headers": {"Authorization": "Bearer <可选>"},
+    "allow": ["read_wiki_structure"]
+  }
+}}
 ```
+
+`command` 走 **stdio**（起子进程），`url` 走 **Streamable HTTP**（M9-4）——**二选一，同时给会报配置错误**，
+不会静默挑一个。两种传输共用同一份协议层，所以超时、id 关联、错误文案、会话重建的行为完全一致
+（有一条测试跑同一条操作序列走两种传输逐项比对）。HTTP 侧不跟随重定向：`urllib` 默认会把 302 上的
+POST **改写成 GET**，一次 `tools/call` 会变成一次静默的读请求。
 
 MCP 工具**必须显式配置才注册**——第三方 server 不受 workspace 沙箱约束，所以只读性只信 server 声明的
 `readOnlyHint`（没声明就当可写、串行执行），但它们**照样走权限与 hooks 门禁链**。
+
+server 声明的 `resources` / `prompts` 能力会额外注册 `read_resource` / `get_prompt` 两个工具面
+（**能力声明与列表都非空**才注册——注册一个永远调不通的工具等于白占 schema），工具说明里会列出
+可用 uri 与提示词的参数名，模型不用靠试错去猜。实测 DeepWiki 声明了这两种能力但列表为空，
+于是正确地**没有**注册。
 
 > **⚠️ 行为变更（M7）**：MCP 工具**列进 `allow` 才免确认**，没列的一律判定 `ask` ——
 > CLI 无交互确认 → 拒绝，并把「给对应 server 加 `allow`」写进拒绝理由回喂模型。
@@ -349,11 +366,11 @@ $ python -m eval.runner --limit 2
 | 治理 | `agent/permissions.py` `hooks.py` `memory.py` `security.py` | 1,499 |
 | 技能 | `agent/skills.py` | 271 |
 | 工具 | `agent/tools/base.py` `bash.py` `files.py` `web.py` `subagent.py` `ask.py` `plan.py` `skills.py` | 1,771 |
-| MCP | `agent/mcp.py` | 386 |
-| 入口 | `app/cli.py` `ui_streamlit.py` `replay.py` | 1,083 |
+| MCP | `agent/mcp.py` | 961 |
+| 入口 | `app/cli.py` `ui_streamlit.py` `replay.py` | 1,090 |
 | 评估 | `eval/golden_tasks.py` `runner.py` | 490 |
-| **源码合计** | **25 个模块** | **7,728** |
-| 测试 | `tests/` | 8,022（482 个用例） |
+| **源码合计** | **25 个模块** | **8,310** |
+| 测试 | `tests/` | 9,064（515 个用例） |
 
 > 口径：源码 = `agent/` + `app/` + `eval/` 里**被 git 跟踪**的 `.py` 行数（不含 `eval/repos/` 下的克隆仓，它被 gitignore）；模块数 = 其中**非空**的 `.py` 文件数（4 个空 `__init__.py` 不计）。
 
@@ -435,7 +452,7 @@ coding_agent/
 
 **这份清单会过时**：它不是「设计上不允许」，是「截至 `a455dda` 还没做」。逐条修掉其中任何一条，都应该同时改这张表。
 
-### 四、这四条是**真跑过真实 LLM** 验出来的（不是单测）
+### 四、这些是**真跑过真实 LLM** 验出来的（不是单测）
 
 上面这些边界里，有几条不是读代码推出来的，是拿 DeepSeek 官方通路真跑出来的（不是 mock）：
 
@@ -445,6 +462,10 @@ coding_agent/
 | MCP 授权 | 同一个 server（`mcp-server-time`）、同一个任务，只改 `allow` | 不配 `allow` → 工具被拒，拒绝文案带出处与**确切改法**；配上 → `MCP 授权: 2/2 个工具免确认`，真实时间返回 |
 | 注入检出 → 收紧 → 人解锁 | 工作区放一个含载荷的文件，让 agent 读到 | 轨迹里有 `security_finding`（5 个规则族 / 7 处命中 / 行号 / `level=high`，**不含原文摘录**）与 `gate_block`（带 `source` 与完整理由）；`--clear-taint` 复位后重试成功 |
 | **不锁定** | agent 自己写含载荷的测试文件、再读回、再跑 `pytest` | 8 次工具调用、**0 次 `gate_block`**、任务正常完成 —— 这是「只收紧不可逆动作」这条误报政策的验收点 |
+| **远程 HTTP MCP**（M9-4） | 真网络 + 真第三方 server：DeepWiki 的 Streamable HTTP 端点，`mcp.json` 里只写 `url` | 握手拿到 `protocolVersion 2025-06-18` / `serverInfo DeepWiki 2.14.3`；DeepSeek 实际调用 `read_wiki_structure(repoName=pallets/flask)` 成功（1 步、2425ms、prompt 6190 token、缓存命中 45%），答案与直连该端点拿到的一致。该 server 是**无状态**的（不回 `Mcp-Session-Id`），客户端照常工作 |
+
+> **⚠️ 这一条只覆盖到"传输"这一半，如实标注**：`resources` / `prompts` 两个能力面**只对着本地假 server 验证过**。试过的一批公开远端 server 里**没有一个能连上且暴露非空的 resources/prompts**（DNS 不通 / 超时 / 只有 2 个 tools）。两个能力面的**代码路径**是真的（真 socket、真 JSON-RPC、变异测试覆盖），但「接一个真远程 server 读资源」这件事**没跑过**，别讲成跑过。
+> 有意思的是这次真跑给我们的注册条件提供了实证：DeepWiki 在 `initialize` 里**声明了** `resources` 与 `prompts` 两种能力，但两个列表都是空的（原文 `{"resources": []}`）—— 只判能力声明的话，它就会拿到一个**永远调不通**的工具，而「声明了且列表非空」两条都判，它就被正确地跳过了。
 
 **这轮验证挖出并修掉了两个真 bug**（都在 `a455dda`，各带一条回归测试）：
 

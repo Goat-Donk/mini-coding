@@ -144,7 +144,7 @@ flowchart LR
 `BaseLLM` 两个实现，**接口完全一致**，所以循环、子代理、评估层共用一套代码：
 
 - `DeepSeekClient`：走 openai SDK（DeepSeek 兼容 OpenAI 协议），`chat()` 返回 `LLMResult(content, tool_calls, usage)`，`complete()` 给 compact 摘要用。
-- `MockLLM`：`script(*responses)` 脚本化响应序列 / `text("...")` 固定响应 / `tool_then_text(...)`。**测试与无 key 演示都靠它**——482 个测试全部离线，不打网络。
+- `MockLLM`：`script(*responses)` 脚本化响应序列 / `text("...")` 固定响应 / `tool_then_text(...)`。**测试与无 key 演示都靠它**——515 个测试全部离线，不打网络。
 
 `Usage` 里单独保留 `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`——这是 DeepSeek 磁盘缓存的**实测**字段，整个缓存命中率指标和成本估算都建立在它之上（不是估算出来的）。
 
@@ -439,18 +439,40 @@ class Tool:
 > 真跑验证走的是 `bing` 后端（照 98KB 真实响应写的）。这个事实写在代码注释、这里和 `TASKS.md`，
 > 而不是让它看起来像验证过。
 
-### MCP 接入（`agent/mcp.py`，M6-3）
+### MCP 接入（`agent/mcp.py`，M6-3 起步 · M9-4 补传输与能力面）
 
 标准 MCP server 的工具也能接进来当普通工具用——**重点是它不需要改循环**：
 
 ```mermaid
 flowchart LR
-    A[".codeagent/mcp.json<br/>显式配置"] --> B["MCPClient.start()<br/>Popen + initialize 握手"]
-    B --> C["tools/list<br/>远端工具描述"]
-    C --> D["MCPToolAdapter<br/>包成本项目的 Tool"]
-    D --> E["ToolRegistry"]
-    E --> F["QueryEngine._gate_and_run<br/>hooks → permissions → 执行"]
-    F --> G["tools/call<br/>JSON-RPC 到子进程"]
+    A[".codeagent/mcp.json<br/>显式配置"] --> B["build_transport<br/>command→stdio / url→HTTP"]
+    B --> C["MCPClient.start()<br/>initialize 握手 + initialized 通知"]
+    C --> D["tools/list · resources/list · prompts/list"]
+    D --> E["MCPToolAdapter<br/>MCPResourceTool / MCPPromptTool"]
+    E --> F["ToolRegistry"]
+    F --> G["QueryEngine._gate_and_run<br/>hooks → permissions → 执行"]
+    G --> H["tools/call · resources/read · prompts/get"]
+```
+
+**分层：`Transport`（怎么送）与 `MCPClient`（说什么）分开。** 加 HTTP 传输时，协议层
+（`_request` / `_notify` / `list_tools` / `call_tool` / 会话自愈）**一行未改**。这不是设计洁癖，
+是同一个错误不想修两遍：超时整形、id 关联、错误包装、会话重建这四件事在两种传输上必须完全一致，
+写两遍必然漂移——而**只测单一传输的套件看不见分歧**。有一条测试专门跑同一条操作序列走两种传输、
+逐项比对结果**和报错文案**。
+
+```mermaid
+flowchart TB
+    subgraph P["协议层（传输无关）"]
+        MC["MCPClient<br/>_request / list_* / call_tool"]
+    end
+    subgraph T["传输层（唯一的超时真相源）"]
+        ST["StdioTransport<br/>Popen + 抽干线程 + 队列"]
+        HT["HttpTransport<br/>POST 同时收发，无需线程"]
+    end
+    MC --> ST
+    MC --> HT
+    ST -. "子进程 stdin/stdout" .-> S1["本地 MCP server"]
+    HT -. "Streamable HTTP<br/>JSON 或 SSE" .-> S2["远端 MCP server"]
 ```
 
 - **必须显式配置才注册**（第三方 server 不受 workspace 沙箱约束，绝不进 `ToolRegistry.default`）；
@@ -461,7 +483,33 @@ flowchart LR
   「接上第三方 server 就默认信任」是错的默认值，而门禁链本身不会替你做这个判断——
   能走门禁 ≠ 门禁有正确策略，这是 A2 修的东西。
 
-传输实现的两个要点：stdout/stderr 各一个后台线程抽干（管道阻塞读没法设超时，Windows 上 `select` 也不支持 pipe），stdout → 队列（请求按 id 关联，`queue.get(timeout)` 天然支持超时），stderr → 环形缓冲（出错时带上 server 的真实报错）。适配器覆写 `schema()`（用远端 `inputSchema`）与 `run()`（跳过本地 pydantic 校验，参数原样透传——远端才是权威校验方）。
+**stdio 传输**的两个要点：stdout/stderr 各一个后台线程抽干（管道阻塞读没法设超时，Windows 上
+`select` 也不支持 pipe），stdout → 队列（请求按 id 关联，`queue.get(timeout)` 天然支持超时），
+stderr → 环形缓冲（出错时带上 server 的真实报错）。EOF 时往队列塞 `None` 哨兵，
+让等待中的请求立刻知道 server 没了。
+
+**HTTP 传输**（Streamable HTTP，2025-06-18）：单个端点收 POST，响应**可能**是 `application/json`
+（一条消息）也可能是 `text/event-stream`（若干条，最后一条通常是本次响应）——spec 允许两种，
+客户端必须都认。POST 本身同时承担收发，所以**不需要后台线程**。`initialize` 回
+`Mcp-Session-Id` 就记住并带上后续每个请求；`Accept` **必须同时**列出两种 content type（spec 的 MUST）。
+带 session id 的请求收到 404 → 重新 initialize 开一个新会话再重试**一次**（只一次：server 每次都
+回 404 时无限重试等于把超时改成死循环）。**重定向不跟随**——`urllib` 默认把 302 上的 POST
+改写成 GET，一次 `tools/call` 会变成一次静默的读请求。**明确未做**：独立 GET SSE 流与
+`Last-Event-ID` 断点续传（三个能力面都走 POST 请求-响应，用不到；假 server 的 GET 一律 405 钉住这一点）。
+
+**三个能力面**：`tools` 之外还有 `resources` / `prompts`（`read_resource` / `get_prompt`，
+都是只读 + 外部）。**两条都满足才注册**：server 声明了该能力**且列表非空**——只判能力的话，
+一个声明了 `resources` 却一处资源都没有的 server 会拿到一个**永远调不通**的工具。工具描述里
+**列出可用 uri / 提示词名与参数名（含必填性）**，封顶 20 条并如实说「另有 N 处未列出」——
+不列的话模型只能瞎猜一个试试，那正是 M8 `update_plan` 栽过的 elicitation gap 形状。
+
+适配器覆写 `schema()`（用远端 `inputSchema`）与 `run()`（跳过本地 pydantic 校验，参数原样透传——远端才是权威校验方）。
+
+> **真实远程 HTTP 端到端验证过**（DeepWiki `https://mcp.deepwiki.com/mcp`，走公网）：握手拿到
+> `protocolVersion 2025-06-18` / `serverInfo DeepWiki 2.14.3`，DeepSeek 实际调用
+> `read_wiki_structure(repoName=pallets/flask)` 成功（1 步 / 2425ms）。该 server **无状态**
+> （不回 `Mcp-Session-Id`），客户端照常工作；它声明了 `resources` / `prompts` 但两个列表都是空的，
+> 于是正确地**没有**注册那两个工具面。
 
 ### research 子代理（`agent/tools/subagent.py`）
 
@@ -522,7 +570,7 @@ flowchart LR
 | SubAgent 只回结论 | `agent/tools/subagent.py` | 单 research 子代理，只读白名单，无递归 |
 | block-at-submit hooks | `agent/hooks.py` | 一致（git commit 检查测试标记） |
 | `/resume` + JSONL 轨迹 | `agent/session.py` | 做到 **step 级**检查点，可任务中途续跑 |
-| MCP 工具接入 | `agent/mcp.py` | 手写同步 stdio 客户端（官方 SDK 是 async，与同步循环阻抗大）；MCP 工具走同一套权限/hooks |
+| MCP 工具接入 | `agent/mcp.py` | 手写同步客户端 + `Transport` 抽象（官方 SDK 是 async，与同步循环阻抗大）；stdio 与 Streamable HTTP 两种传输共用同一套协议层；MCP 工具走同一套权限/hooks |
 | （无） | `eval/` | Claude Code 没有内置评估；本项目加了轨迹驱动评估 |
 | CONTEXT_COLLAPSE 等五种压缩 | `context.py` 三级 compact | 只做 分级截断 + snip + LLM 摘要（复杂度/收益比最优） |
 

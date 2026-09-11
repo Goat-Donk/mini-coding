@@ -1,13 +1,19 @@
 {
   "_说明": "MCP 配置示例。复制为 .codeagent/mcp.json 后按需修改——.codeagent/ 已 gitignore，本地配置不会进仓库。",
-  "_用法": "python -m app.cli --mcp .codeagent/mcp.json \"任务\"",
-  "_字段": "servers.<别名>.command = [可执行文件, 参数...]（必填）；timeout = 单次请求超时秒数（可选，默认 20）；allow = 允许免确认调用的工具名列表（可选，支持 fnmatch 通配）。工具名与内置工具冲突时自动加 <别名>__ 前缀。",
+  "_用法": "python -m app.cli --mcp .codeagent/mcp.json \"任务\"（相对路径按**工作区**解析，不是进程 CWD）",
+  "_字段": "servers.<别名> 二选一：command = [可执行文件, 参数...] 走 stdio（起子进程）；url = \"https://host/mcp\" 走 Streamable HTTP。两个都给会报配置错误，不会静默挑一个。可选：headers = 额外请求头（仅 HTTP；Accept / Content-Type / MCP-Protocol-Version 是协议要求，用户配置覆盖不了）；timeout = 单次请求超时秒数（默认 20，stdio 与 HTTP 共用同一个值）；allow = 允许免确认调用的工具名列表（支持 fnmatch 通配）。工具名与内置工具冲突时自动加 <别名>__ 前缀。",
+  "_能力面": "server 在 initialize 里声明了 resources / prompts 能力、且对应列表非空时，会额外注册 read_resource / get_prompt 两个工具面（描述里列出可用 uri 与提示词参数名）。allow 对它们同样生效。",
   "_安全": "MCP 工具来自第三方 server，不受 workspace 沙箱约束。因此**未列进 allow 的工具默认不放行**（权限引擎给 ask；CLI 无交互确认 → 拒绝）。要放行哪个就显式写出来，不要图省事写 \"*\"。",
   "servers": {
     "fs": {
       "command": ["npx", "-y", "@modelcontextprotocol/server-filesystem", "."],
       "timeout": 20,
       "allow": ["read_file", "list_directory"]
+    },
+    "deepwiki": {
+      "url": "https://mcp.deepwiki.com/mcp",
+      "timeout": 60,
+      "allow": ["read_wiki_structure"]
     }
   }
 }

@@ -4,8 +4,11 @@
 后半段用 typer 的 CliRunner 真跑 CLI：CLI 曾漏接权限引擎（只有 Streamlit 接了），
 导致「危险命令拦截」在 CLI 路径上不生效 —— 这里把这个接线锁住。
 """
+import json
 import re
+import sys
 import threading
+from pathlib import Path
 
 from typer.testing import CliRunner
 
@@ -985,3 +988,29 @@ def test_session_name_appears_in_the_plan_banner(tmp_path, monkeypatch):
     assert result.exit_code == 0, result.output
     assert "计划会话" in result.output
 
+
+
+# ---------------------------------------------------------------- MCP 接线
+
+
+def test_mcp_config_path_is_relative_to_the_workspace(tmp_path, monkeypatch):
+    """`--mcp .codeagent/mcp.json` 按**工作区**解析，不按进程 CWD。
+
+    这是真实跑挖出来的：help 里给的例子就是 `.codeagent/mcp.json`，而它是
+    CWD 相对路径 —— 设了 WORKSPACE_ROOT 从别处跑时，照着 help 抄下来只会拿到
+    一句「MCP 配置不存在: <CWD 下的那个路径>」。**一条照着文档抄却走不通的
+    指引，比没有指引更糟**（M7 的原话）。按工作区解析同时也与本项目「路径一律
+    落在 workspace_root 内」的约定一致。
+    """
+    (tmp_path / ".codeagent").mkdir()
+    (tmp_path / ".codeagent" / "mcp.json").write_text(
+        json.dumps({"servers": {"fake": {"command": [
+            sys.executable, str(Path(__file__).parent / "fake_mcp_server.py"),
+            "--note-path", str(tmp_path / "note.txt")]}}}),
+        encoding="utf-8",
+    )
+    result = _invoke(tmp_path, monkeypatch, MockLLM.script(LLMResult(content="结束")),
+                     ("--mcp", ".codeagent/mcp.json"))
+    assert result.exit_code == 0, result.output
+    assert "MCP 加载失败" not in result.output
+    assert "注册 5 个工具" in result.output, result.output

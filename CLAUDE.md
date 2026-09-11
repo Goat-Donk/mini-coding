@@ -4,11 +4,11 @@
 
 ## 项目定位
 
-求职作品集：**CodeAgent** —— 参考 [pengchengneo/Claude-Code](https://github.com/pengchengneo/Claude-Code) 源码架构，用 Python 从零实现的小型 AI Coding Agent（7,728 行 / 25 模块 / 482 测试）。核心循环手写（不套 Agent SDK），支撑层用成熟库（openai / pydantic / streamlit / typer / pytest）。差异化：cache-aware 上下文 + 缓存省钱指标、step 级检查点恢复 + **step 级分叉/会话命名**、block-at-submit hooks、轨迹驱动评估（真实 tinydb 提交 + 隐藏测试）、记忆自进化、MCP 工具接入、注入文本检测 + 会话污染天花板、联网工具 + SSRF 拦截、skills 渐进披露、计划清单跨回合、提问暂停/续答、改动前 diff 复核。
+求职作品集：**CodeAgent** —— 参考 [pengchengneo/Claude-Code](https://github.com/pengchengneo/Claude-Code) 源码架构，用 Python 从零实现的小型 AI Coding Agent（8,310 行 / 25 模块 / 515 测试）。核心循环手写（不套 Agent SDK），支撑层用成熟库（openai / pydantic / streamlit / typer / pytest）。差异化：cache-aware 上下文 + 缓存省钱指标、step 级检查点恢复 + **step 级分叉/会话命名**、block-at-submit hooks、轨迹驱动评估（真实 tinydb 提交 + 隐藏测试）、记忆自进化、MCP 工具接入（**stdio + Streamable HTTP 两种传输**）、注入文本检测 + 会话污染天花板、联网工具 + SSRF 拦截、skills 渐进披露、计划清单跨回合、提问暂停/续答、改动前 diff 复核。
 
 > 数字口径（改数字时请沿用）：**源码 = `agent/` + `app/` + `eval/` 里被 git 跟踪的 `.py` 行数**（不含 `eval/repos/` 的克隆仓，它被 gitignore）；**模块数 = 其中非空的 `.py` 文件数**（4 个空 `__init__.py` 不计）；**测试 = `tests/` 行数 / pytest 用例数**。
 
-**已验证状态**：真实 LLM 端到端跑通（修 bug 全流程、kill+`--resume` 续跑、eval 出真实报告 50% 1/2）。README「评估」章节有真实数字与口径说明。**M6 收尾后又补齐三项此前只是单测覆盖的验证**：compact 在真实 token 压力下真实触发（当时是两级；M8 加了分级截断，现为三级 compact）、MCP 接真实第三方 server（官方 `mcp-server-time`）并确认仍走权限/hook 门禁链、Streamlit 控制台用真实 Chrome 打开并操作控件跑通 mock 任务。
+**已验证状态**：真实 LLM 端到端跑通（修 bug 全流程、kill+`--resume` 续跑、eval 出真实报告 50% 1/2）。README「评估」章节有真实数字与口径说明。**M6 收尾后又补齐三项此前只是单测覆盖的验证**：compact 在真实 token 压力下真实触发（当时是两级；M8 加了分级截断，现为三级 compact）、MCP 接真实第三方 server（官方 `mcp-server-time`，stdio）并确认仍走权限/hook 门禁链、Streamlit 控制台用真实 Chrome 打开并操作控件跑通 mock 任务。**M9-4 又补了一项**：MCP 接**真实远程 HTTP** server（DeepWiki 的 Streamable HTTP 端点，走公网）并端到端跑通工具调用。
 
 **CLI 治理链路**：`app/cli.py` 两处 `QueryEngine` 都已接 `PermissionsEngine`（默认 allow、危险命令 ask→无确认交互→拒绝、路径越界 deny、**第三方/MCP 工具须在 `mcp.json` 的 `allow` 里显式授权否则 ask**）与 hooks（`default_engine()`：block-at-submit + marker 自动维护 + **注入检测**）。两个入口共用 `hooks.default_engine()`，避免接线漂移（CLI 曾整体漏接 hooks）。`tests/test_cli.py` 有 26 例锁住这个接线。
 **唯一例外是 `--review-edits`（M9-1）**：它给 CLI 装上 `confirm` 回调并把 `edit`/`write` 抬成 ask，于是改动落盘前人能看到 diff。**默认关闭是刻意的** —— 我们的 CLI 本来没有确认回调，把 edit 改成默认 ask 会让每次改动都退化成拒绝、整条 CLI 不可用（那就把安全机制变成了路障；TS 原版靠 TTY 模式兜住，我们没有）。所以它是 opt-in，默认路径与 eval 一字不变。
@@ -59,6 +59,20 @@
 - 变异测试 **31/31** 被抓住（`m9verify/mutate_m9_2.py`）：判据漏格 / 拦截位置 / 接线三类各覆盖。
 - **如实标注**：① 默认搜索后端 `ddg`（**对齐 TS 原版**的刻意选择，非因为好用）在本机**连不上**（直连超时 8.2s、代理 SSL EOF 7.6s），其解析正则**未经真实响应校准** —— 代码注释、`TASKS.md` 都写明；真跑验证走 `CODEAGENT_SEARCH_BACKEND=bing`（照 98KB 真实响应写的）。② **只读并发批内，外发与产生污染的读是并发执行的**，该次外发按**批前**污染级别判定 —— 物理顺序，不是漏洞，但看起来像洞，已写进 `TASKS.md` 与 `docs/TECH_SPEC.md`。
 
+**已做 M9-4 MCP 传输抽象 + HTTP + resources/prompts**，机制是：
+- **`Transport`（怎么送）与 `MCPClient`（说什么）分开**：加 HTTP 传输时协议层**一行未改**。这不是洁癖，是**同一个错误不想修两遍** —— 超时整形、id 关联、错误包装、会话重建这四件事在两种传输上必须完全一致，写两遍必然漂移，而**只测单一传输的套件看不见分歧**。有一条测试专门跑同一条操作序列走两种传输、逐项比对结果**和报错文案**。
+- **`timeout` 只存传输层一份**（`MCPClient.timeout` 是转发属性）。两处各存一份迟早对不上（一个 20s 一个 30s，表现成"有时报超时有时不报"）。
+- **`MCPTimeout` 单独一个异常类型**：传输层只知道"没人来"，知道"在等哪个方法"的只有协议层 —— 合成一句放在 `_request` 里，两种传输的诊断才一致（否则 stdio 报得出方法、HTTP 报不出）。同理 HTTP 超时要带上端点地址（stdio 给的是 server stderr 末尾）。
+- **`_raise_for_http_error` 的判断顺序是有讲究的**：`404 + 带 session id` 必须排在"正文里有 JSON-RPC error"**之前**。真实 server 回 404 时常常正文里也放一条 error，反过来的话"会话过期"被报成一次普通调用失败 —— 文案看着完全合理，但自愈那条路（重新 initialize + 重试）**永远走不到**，一次 server 重启就废掉整个任务。假 server 特意用这种正文钉顺序。
+- **重定向不跟随**（`_NoRedirect`）：`urllib` 默认把 302 上的 POST **改写成 GET**，一次 `tools/call` 变成一次静默的读请求。宁可报一句能照着改的配置错误。
+- **HTTP 明确未做**（如实标注）：独立 GET SSE 流（server 主动发起请求那条长连接）与 `Last-Event-ID` 断点续传。tools/resources/prompts 三件事都走 POST 请求-响应，用不到。`GET` 假 server 一律 405，钉住客户端不会偷偷去开它。
+- **resources / prompts 两个工具面**：`read_resource` / `get_prompt`（都是只读 + 外部）。**两条都满足才注册**：server 声明了该能力**且列表非空** —— 只判能力的话，一个声明了 `resources` 却一处资源都没有的 server 会拿到一个**永远调不通**的工具。**真跑对上了**：DeepWiki 声明了两种能力，两个列表都是空的（原文 `{"resources": []}`），于是正确地没注册。
+- **描述里必须列出可用 uri / 提示词名与参数名**：不列的话模型不知道有什么可读，只能瞎猜一个试试 —— 这正是 M8 `update_plan` 那个 elicitation gap 的形状。描述恒在上下文里，列出来是**零额外往返**。封顶 `MAX_LISTED_ITEMS = 20` 并如实说"另有 N 处未列出"。
+- **`command` 与 `url` 二选一只在 `build_transport` 一处判断**（两处各判一遍 = 漂移，最后表现成"配了 url 却被当成 stdio 去起子进程"）。
+- **`--mcp` 的相对路径按工作区解析，不按进程 CWD**（真实跑挖出来的：help 的例子 `.codeagent/mcp.json` 是 CWD 相对的，设了 `WORKSPACE_ROOT` 从别处跑就报"配置不存在"）。
+- 变异测试 **41/41** 被抓住（`m9verify/mutate_m9_4.py`）。**一处已验证的等价变异体**（已从列表删掉，理由写在脚本头部）：`_parse_sse` 里 `if line.startswith(":")` 那条注释行判断**算术上不可观测** —— 以 `:` 开头的行 `partition(":")` 出来的 field 恒为空串，永远不等于 `"data"`。
+- **真实远程 HTTP 端到端跑过**（DeepWiki `https://mcp.deepwiki.com/mcp`，真网络真 server）：握手拿到 `protocolVersion 2025-06-18` / `serverInfo DeepWiki 2.14.3`；DeepSeek 驱动实际调用 `read_wiki_structure(repoName=pallets/flask)` 成功（1 步、2425ms、缓存命中 45% → 终局 86%）。**该 server 不回 `Mcp-Session-Id`（无状态模式），我们的客户端照常工作**。
+
 ## 硬约束（不可违反）
 
 - LLM 只用 DeepSeek（国内 API）；生产 `deepseek-chat`，测试用 MockLLM
@@ -82,7 +96,7 @@
 | 记忆 | agent/memory.py | 分层指令文件(@include+去重+预算) + 提取 + 简化 consolidation（M4） |
 | 技能 | agent/skills.py | SKILL.md 渐进披露：只把 name+简介进 system prompt，正文由 load_skill 按需取（M8） |
 | 安全 | agent/security.py | 注入文本检测（**概率性，只出告警**）+ 会话级污染标记 + 来源框架（M7） |
-| MCP | agent/mcp.py | 手写 MCP stdio 客户端 + 工具适配器（第三方工具照样过权限/hooks）（M6） |
+| MCP | agent/mcp.py | 手写 MCP 客户端：`Transport` 抽象 + stdio/Streamable HTTP 两种实现，协议层与传输分离；tools/resources/prompts 三个能力面（第三方工具照样过权限/hooks）（M6-3 / M9-4） |
 | 入口 | app/cli.py · app/ui_streamlit.py · app/replay.py | typer CLI / Streamlit 控制台 / 检查点回放 |
 | 评估 | eval/golden_tasks.py · runner.py | 黄金任务 + 完成率/成本回归（M5） |
 

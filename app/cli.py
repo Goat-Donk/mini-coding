@@ -385,9 +385,16 @@ def run(
     mcp_clients: list = []
     mcp_allowed: list[str] = []
     if mcp is not None:
+        # 相对路径按**工作区**解析，不按进程 CWD。`--mcp .codeagent/mcp.json` 正是
+        # help 里给的例子，而它在 CWD != 工作区时（比如设了 WORKSPACE_ROOT 从别处跑）
+        # 会报"配置不存在" —— 一句照着文档抄却走不通的指引。这与本项目"路径一律落在
+        # workspace_root 内"的约定也一致。
+        mcp_path = Path(mcp)
+        if not mcp_path.is_absolute():
+            mcp_path = workspace_root / mcp_path
         try:
             mcp_clients, registered, mcp_allowed = load_mcp_servers(
-                mcp, registry, workspace_root=workspace_root
+                mcp_path, registry, workspace_root=workspace_root
             )
         except (FileNotFoundError, MCPError) as exc:
             typer.secho(f"MCP 加载失败: {exc}", fg=typer.colors.RED)

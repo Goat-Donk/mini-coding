@@ -304,7 +304,29 @@ step 5  完成
   - **一处我自己造的假 bug（记下来，形态比 bug 本身更值得记）**：全量日志最后一行是 `[100%]` 就没了、**没有 `NNN passed in …` 汇总行**，我据此断定"汇总被吞了"，一路追到 `streamlit.testing.v1` 接管 `sys.stdout`，还照这个结论往 `tests/conftest.py` 加了个 autouse fixture。**全错**：`pyproject.toml` 的 `addopts` 里已经有 `-q`，我每条命令又传一个，合起来是 **`-qq`** —— pytest 在这个详细度下**本来就不打印汇总行**。`-o addopts="" -q` 立刻就有。fixture 已撤销，判断依据写进 `CLAUDE.md` 常用命令下面。
     教训与 M7/M9-2 那几条**方向相反**：那些是"测试绿了、机制其实没工作"（我把机制想得太好），这条是**"工具正常、我把工具想得太坏"** —— 同一个毛病的另一面：**在归因给库/框架之前，先穷尽自己的调用方式**。附带收获是数字因此对上了：汇总行一回来就看见是 **482** 而不是文档里的 481（我在统计之后又补过测试），源码 7,728 / tests 8,022 一并核准，四处文档同步。
   - **如实说明**：分叉的**默认名**用的是源会话名（`{源名} @{步} 分叉`），未起过名的会话回落成 `{源 id} @{步} 分叉`；重名时自动让开（`-2`/`-3`）而不是报错。**没有做**：工作区快照（所以它是对话分叉）、跨工作区分叉、把 `name` 塞进 `AgentState`（名字是**人给的标签**，不是"任务跑到哪了"，放进去等于让 state 多两个既不影响推理又要跟着全字段往返一起走的字段）。
-- [ ] **M9-4 ⑩ MCP 远程 HTTP + resources/prompts**：面试稿 §10「下一步」第一条**已经承诺了** HTTP/SSE，做了就是兑现；且「协议层复用、只换传输」正是分层设计的证明
+- [x] **M9-4 ⑩ MCP 远程 HTTP + resources/prompts**：面试稿 §10「下一步」第一条**已经承诺了** HTTP/SSE，做了就是兑现；且「协议层复用、只换传输」正是分层设计的证明
+
+  **✅ 2026-09-11 完成。实现**：`agent/mcp.py` 重构成两层 —— `Transport`（抽象基类，`start/send/receive/close/hint` + `timeout`）下面挂 `StdioTransport`（原样搬过来）与新的 `HttpTransport`；`MCPClient` 只管"说什么"（握手、id 关联、超时整形、错误包装、会话自愈）。新增 `MCPTimeout` / `MCPSessionExpired` 两个异常、`_NoRedirect`、`_decode_body` / `_parse_sse`、`MCPResourceTool` / `MCPPromptTool` + `_render_resources` / `_render_prompts`、`build_transport`（**唯一一处判断用哪种传输**）。假 server 拆成 `fake_mcp_core.py`（协议面，两个壳共用）+ `fake_mcp_server.py`（stdio 壳）+ 新的 `fake_mcp_http_server.py`（真 HTTP 壳，`ThreadingHTTPServer`）。`app/cli.py` 只多了"相对 `--mcp` 路径按工作区解析"。
+  - **分层不是洁癖，是"同一个错误不想修两遍"**：超时整形、id 关联、错误包装、会话重建这四件事在两种传输上必须完全一致，写两遍必然漂移，而**只测单一传输的套件看不见分歧**。所以有一条测试跑**同一条操作序列走两种传输**，逐项比对 `serverInfo` / `protocolVersion` / `capabilities` / 三个 list / 调用输出 / 资源正文，**连未知工具的报错文案都要逐字相同**。
+  - **`timeout` 只存传输层一份**（`MCPClient.timeout` 是转发属性）。socket 连接超时与"等响应等到什么时候"必须是同一个值 —— 两处各存一份，表现是"有时报超时有时不报"。
+  - **`MCPTimeout` 单独一个类型**是为了让报错带上**方法名**：传输层只知道"没人来"，知道"在等哪个方法"的只有协议层，合成一句放在 `_request` 里，两种传输的诊断才一致（否则 stdio 报得出方法、HTTP 报不出）。HTTP 侧还要带上**端点地址**（stdio 给的是 server stderr 末尾）。
+  - **`_raise_for_http_error` 的判断顺序就是这一项的全部意义**：`404 + 带 session id` 必须排在"正文里有 JSON-RPC error"**之前**。真实 server 回 404 时正文里常常也放一条 error，反过来的话"会话过期"被报成一次普通调用失败 —— **文案看着完全合理**，但自愈那条路（重新 initialize + 重试）永远走不到，一次 server 重启就废掉整个任务。假 server 的 404 正文**故意**也塞了一条 JSON-RPC error 来钉这个顺序。
+  - **重定向不跟随**（`_NoRedirect`）：`urllib` 默认把 301/302/303 上的 POST **改写成 GET** —— 一次 `tools/call` 变成一次静默的读请求，用户看到的是"工具调用失败"，真正的病因（`mcp.json` 里的 url 少个斜杠 / 还是 http）一个字都不会出现。现在报的是「重定向到 X；请把 mcp.json 里的 url 直接写成最终地址」。
+  - **协议头不可被用户配置覆盖**：`Accept` 必须**同时**列出 `application/json` 与 `text/event-stream`（spec 的 MUST），`Content-Type`、`MCP-Protocol-Version` 同理。让它们"可配置"等于提供一个必然把自己配坏的口子；认证头之类照常补充。
+  - **resources / prompts 的注册判据是两条**：server 声明了该能力 **且** 列表非空。只判能力的话，一个声明了 `resources` 却一处资源都没有的 server 会拿到一个**永远调不通**的工具（白占 schema token，模型每次调用都失败一次）。**真跑对上了**：DeepWiki 声明了两种能力、两个列表都是空的（原始响应就是 `{"resources": []}`），于是正确地没注册。
+  - **描述里必须列出可用 uri 与提示词的参数名**：不列的话模型不知道有什么可读，只能瞎猜一个试试 —— 正是 M8 `update_plan` 那个 elicitation gap 的形状（机制全在，没有任何东西把模型引向它）。描述恒在上下文里，列出来是**零额外往返**。封顶 `MAX_LISTED_ITEMS = 20` 并如实说「另有 N 处未列出」。
+  - **`--mcp` 的相对路径改成按工作区解析**（真实跑才暴露）：help 里给的例子就是 `.codeagent/mcp.json`，而它按进程 CWD 解析 —— 设了 `WORKSPACE_ROOT` 从别处跑，照着 help 抄下来只会得到「MCP 配置不存在」。**一条照着文档抄却走不通的指引，比没有指引更糟**（M7 的原话）。
+  - **测试**：`tests/test_mcp.py` 42 → **47 例**（新增 SSE 解析边界、content 整形全类型、坏条目丢弃、`timeout`/`cwd` 落位、握手末尾的 `notifications/initialized`）+ `tests/test_cli.py` 1 例。全量 **515 全绿**。假 server 为此加了 `--require-initialized` 开关（spec 里那条通知是 MUST，而"什么通知都收"的 server 永远测不出漏发）。
+  - **变异测试 41/41 被抓住**（`m9verify/mutate_m9_4.py`）。五类失效模式各覆盖：协议层漏进传输细节（id 关联 / EOF 哨兵 / 超时方法名 / 另存一份超时值 / 漏发 initialized）、HTTP 规范细节（session 头 / 版本头 / Accept / 重定向 / 记住 session / headers 覆盖 / 超时端点 / 202 空正文）、会话自愈（**判断顺序反了** / 不重试）、SSE 与 content 整形（不当 SSE 解析 / 空行不分发 / 末尾不 flush / 单块 content / image 与 resource 占位 / base64 填充 / 坏条目）、能力面接线与 elicit（能力面没接 / 不看能力声明 / 列表空也注册 / 不加前缀 / allow 不认注册名 / 单台挂了炸主流程 / 描述不列 uri 或参数名 / 封顶与"另有 N"）。
+    - **一处已验证的等价变异体**（已从列表删掉，不留在里面骗计数）：`_parse_sse` 里 `if line.startswith(":")`（跳过 SSE 心跳注释）。它是**算术上不可观测**的，不是"暂时没测到"：注释行的判据是"以 `:` 开头"，而取字段用的是 `line.partition(":")` —— 以 `:` 开头的行 partition 出来的 field **恒为空串**，永远不等于 `"data"`（实测 `':data: {"x":1}'` → field=`''`）。保留那一行是把 spec 的规则显式写出来，但要如实说明**没有任何测试能抓住它**。
+    - **一处"看起来该有、其实抓不住"的**：`if cap not in caps: continue`（能力没声明就跳过）。去掉它，后面 `except MCPError` 那条兜底也会把 `-32601` 吞掉、照样不注册 —— 从**注册结果**上看两种实现完全一样。所以它只能从**副作用**上钉：少了判断，一台不支持 resources 的 server 每次启动都会多打一行 `…/list 失败` 警告，而每台 server 都报一行噪声等于训练用户无视警告。对应测试因此断言 stderr 里**没有**那句话。
+  - **真实远程 HTTP MCP 端到端跑通（DeepWiki，走公网真 server）**：工作区 `m9verify/ws_m94/`，`.codeagent/mcp.json` 里只写 `url`。
+    - 握手：`protocolVersion 2025-06-18`、`serverInfo {name: DeepWiki, version: 2.14.3}`、capabilities 含 `tools/resources/prompts/experimental`。
+    - **该 server 不回 `Mcp-Session-Id`（无状态模式）**，客户端照常工作 —— 说明 session 是可选增强而不是流程里的硬依赖。
+    - 它声明了 `resources` / `prompts` 但**两个列表都是空的**（绕过客户端过滤直接看原始响应：`{"resources": []}` / `{"prompts": []}`），于是 `read_resource` / `get_prompt` 正确地**没有注册** —— 这条设计判据本来只能靠假 server 模拟，真 server 上对上了。
+    - DeepSeek 驱动实跑：`read_wiki_structure(repoName=pallets/flask)` 真实成功（**1 步、2425ms、prompt 6190 + completion 112、缓存命中 45%**），返回的章节目录里含 `2.3 Blueprints`，模型的最终回答与之逐字一致。
+    - 同轮探过但**用不了**的公网 server（如实记录，免得下次重复踩）：`remote.mcpservers.org`（DNS 解析不了）、`gitmcp.io` / `huggingface.co/mcp`（连接超时）、`docs.mcp.cloudflare.com`（连接超时）；`mcp.context7.com` 可用但同样只有 tools（2 个）、无 resources/prompts。**结论：能连上的公网 server 里没找到一个暴露非空 resources/prompts 的**，所以那两个工具面的真实对端仍是本地假 server —— 这一条如实标为**未在真实远程 server 上验证**。
+  - **如实说明未做**：① 独立 GET SSE 流（server 主动发起请求那条长连接）与 `Last-Event-ID` 断点续传 —— tools/resources/prompts 三件事都走 POST 请求-响应，用不到；假 server 的 `GET` 一律 405，钉住客户端不会偷偷去开它。② `url` **不做 SSRF 校验**，与 `web_fetch` 刻意不同：那个 URL 是**模型**给的，这个是人写在 `mcp.json` 里的显式 opt-in，校验一个用户自己填的地址没有意义。
 
 ### 第三批 · 需要前置
 
@@ -332,10 +354,10 @@ step 5  完成
 
 ## 进度快照
 
-- 当前里程碑：**M9 进行中**（第一批 M9-1、M9-2 已完成并真跑验证；第二批 M9-3 fork + rename 已完成并真跑验证；下一项 M9-4 MCP 远程 HTTP + resources/prompts）
+- 当前里程碑：**M9 进行中**（第一批 M9-1、M9-2 已完成并真跑验证；第二批 M9-3 fork + rename、M9-4 MCP 远程 HTTP + resources/prompts 已完成并真跑验证；下一项 M9-5 常驻交互模式 REPL）
 - 上一里程碑：**M8 完成**（P1–P7 全部完成；四项真实验证已跑，见上节）
 - 上一里程碑：**M7 完成**（M7-1~M7-6 + Part C 全部完成；四条真实 LLM 端到端验证 V1–V4 已全跑，工作区 `m7verify/`、`m7verify-nolock/` 已 gitignore）
-- 代码状态：**7,175 行源码 / 25 模块 / 449 测试全绿**（`python -m pytest tests/` → `449 passed`）
+- 代码状态：**8,310 行源码 / 25 模块 / 515 测试全绿**（`python -m pytest tests/` → `515 passed`）
   - 口径：源码 = `agent/` + `app/` + `eval/` 里被 git 跟踪的 `.py` 行数（不含 `eval/repos/` 克隆仓）；模块数 = 其中非空的 `.py` 文件数
 - **M8 期间发现并修复的真 bug（真跑挖出来的，不是单测挖的）**：
   1. **`update_plan` 的引导缺失（elicitation gap）**：工具实现了、测试全绿、计划也能落盘 —— 但 system prompt 里**一个字都没提它**，模型 6 步跑完一次都没调。修法：prompt 里写明"任务复杂时先调 `update_plan` 排一份 3~6 步的简短计划"。修前 0 次 / 修后 2 次（同 P7-c 表）
