@@ -29,6 +29,7 @@ from agent.hooks import default_engine
 from agent.llm import BaseLLM, DeepSeekClient, MockLLM, LLMResult, ToolCall
 from agent.loop import QueryEngine
 from agent.permissions import PermissionsEngine
+from agent.pricing import DEFAULT_MODEL as PRICING_MODEL, snapshot_for
 from agent.session import Session, new_session_id, state_dict
 from agent.skills import discover_skills
 from agent.tools.ask import build_ask_tool
@@ -44,9 +45,11 @@ from app.replay import (
 
 DEFAULT_WORKSPACE = Path(os.environ.get("WORKSPACE_ROOT", "workspace")).resolve()
 
-# DeepSeek 输入缓存定价（元/百万 tokens，公开价，2025）：命中 ¥0.5/M vs 未命中 ¥2/M
-CACHE_HIT_PRICE_CNY = 0.5
-CACHE_MISS_PRICE_CNY = 2.0
+# DeepSeek 输入缓存定价：查 `agent/pricing.py` 的快照表，**不在这里再抄一份常量**。
+# （原来这里硬编码了命中/未命中两个价，且**漏了输出价** —— 两份常量迟早漂移。）
+_PRICE = snapshot_for(PRICING_MODEL)
+CACHE_HIT_PRICE_CNY = _PRICE.input_hit
+CACHE_MISS_PRICE_CNY = _PRICE.input_miss
 # 上下文预算（与 ContextManager 默认一致，仅用于 UI 分级展示）
 CONTEXT_BUDGET = 64_000
 
@@ -259,7 +262,8 @@ if usage_pts:
         saved_cny = total_hit * (CACHE_MISS_PRICE_CNY - CACHE_HIT_PRICE_CNY) / 1e6
         st.caption(
             f"累计缓存命中率 {overall:.0%} · 命中 {total_hit:,} tokens · "
-            f"估算省钱 ¥{saved_cny:.3f}（命中 ¥{CACHE_HIT_PRICE_CNY}/M vs 未命中 ¥{CACHE_MISS_PRICE_CNY}/M）"
+            f"估算省钱 ¥{saved_cny:.3f}（命中 ¥{CACHE_HIT_PRICE_CNY}/M vs 未命中 ¥{CACHE_MISS_PRICE_CNY}/M"
+            f"，按定价快照 {_PRICE.id}）"
         )
     else:
         st.caption("本轮暂无缓存流量（DeepSeek 首次调用会把 prompt 写入磁盘缓存）")

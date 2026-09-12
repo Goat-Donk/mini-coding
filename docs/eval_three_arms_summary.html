@@ -1,0 +1,784 @@
+<title>CodeAgent 三臂评测结论</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Condensed:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=Noto+Sans+SC:wght@300;400;500;700&display=swap">
+
+<style>
+  :root {
+    --ground: #eef1f4;
+    --surface: #ffffff;
+    --surface-2: #f5f8fa;
+    --ink: #17212c;
+    --ink-soft: #55636e;
+    --ink-faint: #7d8b96;
+    --rule: #ccd5dd;
+    --rule-strong: #a9b6c1;
+    --blue: #1d5b86;
+    --blue-soft: #e3edf5;
+    --amber: #8d5f0c;
+    --amber-soft: #f7edd9;
+    --red: #93341f;
+    --red-soft: #f8e6e1;
+    --green: #2b6448;
+    --green-soft: #e3f0e8;
+
+    --font-display: "IBM Plex Sans Condensed", "Noto Sans SC", system-ui, sans-serif;
+    --font-body: "Noto Sans SC", "IBM Plex Sans", system-ui, sans-serif;
+    --font-mono: "IBM Plex Mono", ui-monospace, "Cascadia Mono", monospace;
+
+    --measure: 62rem;
+    --radius: 3px;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground: #0f151b;
+      --surface: #161e26;
+      --surface-2: #1b242e;
+      --ink: #e6edf3;
+      --ink-soft: #a5b3bf;
+      --ink-faint: #7b8a97;
+      --rule: #2b3742;
+      --rule-strong: #3f4e5b;
+      --blue: #74b6de;
+      --blue-soft: #16303f;
+      --amber: #dca945;
+      --amber-soft: #34280e;
+      --red: #e28e80;
+      --red-soft: #3a1e19;
+      --green: #7fc6a0;
+      --green-soft: #16301f;
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --ground: #0f151b;
+    --surface: #161e26;
+    --surface-2: #1b242e;
+    --ink: #e6edf3;
+    --ink-soft: #a5b3bf;
+    --ink-faint: #7b8a97;
+    --rule: #2b3742;
+    --rule-strong: #3f4e5b;
+    --blue: #74b6de;
+    --blue-soft: #16303f;
+    --amber: #dca945;
+    --amber-soft: #34280e;
+    --red: #e28e80;
+    --red-soft: #3a1e19;
+    --green: #7fc6a0;
+    --green-soft: #16301f;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--font-body);
+    font-size: 15px;
+    line-height: 1.72;
+    font-weight: 400;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .sheet {
+    max-width: var(--measure);
+    margin: 0 auto;
+    padding-block: 2.5rem 4rem;
+    padding-inline: 1.25rem;
+    display: flex;
+    flex-direction: column;
+    gap: 2.75rem;
+  }
+
+  /* ---- masthead ---- */
+
+  .masthead {
+    display: flex;
+    flex-direction: column;
+    gap: 1.25rem;
+    padding-bottom: 1.5rem;
+    border-bottom: 2px solid var(--ink);
+  }
+
+  .eyebrow {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0.6rem 1rem;
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--ink-soft);
+  }
+
+  .eyebrow .stamp {
+    border: 1px solid var(--rule-strong);
+    border-radius: var(--radius);
+    padding: 0.1rem 0.45rem;
+    color: var(--blue);
+    letter-spacing: 0.1em;
+  }
+
+  h1 {
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: clamp(2rem, 5.5vw, 3.1rem);
+    line-height: 1.06;
+    letter-spacing: -0.015em;
+    margin: 0;
+    text-wrap: balance;
+  }
+
+  .standfirst {
+    margin: 0;
+    max-width: 46rem;
+    color: var(--ink-soft);
+    font-size: 0.98rem;
+  }
+
+  .checks {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+    list-style: none;
+    margin: 0;
+    padding: 0;
+  }
+
+  .checks li {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.04em;
+    color: var(--green);
+    background: var(--green-soft);
+    border: 1px solid color-mix(in srgb, var(--green) 35%, transparent);
+    border-radius: var(--radius);
+    padding: 0.16rem 0.5rem;
+  }
+
+  .checks li::before { content: "✓ "; }
+
+  /* ---- sections ---- */
+
+  section {
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+  }
+
+  h2 {
+    font-family: var(--font-display);
+    font-size: 0.8rem;
+    font-weight: 600;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--ink-soft);
+    margin: 0;
+    padding-bottom: 0.5rem;
+    border-bottom: 1px solid var(--rule);
+    display: flex;
+    gap: 0.7rem;
+    align-items: baseline;
+  }
+
+  h2 .num {
+    font-family: var(--font-mono);
+    color: var(--blue);
+    font-weight: 500;
+  }
+
+  h3 {
+    font-family: var(--font-display);
+    font-size: 1.12rem;
+    font-weight: 600;
+    letter-spacing: 0.005em;
+    margin: 0;
+    text-wrap: balance;
+  }
+
+  p { margin: 0; }
+  strong { font-weight: 700; }
+  em { font-style: normal; background: var(--amber-soft); padding: 0 0.15em; border-radius: 2px; }
+
+  .prose { display: flex; flex-direction: column; gap: 0.85rem; max-width: 48rem; }
+
+  code, .mono {
+    font-family: var(--font-mono);
+    font-size: 0.86em;
+    font-variant-numeric: tabular-nums;
+  }
+
+  code {
+    background: var(--surface-2);
+    border: 1px solid var(--rule);
+    border-radius: 2px;
+    padding: 0.05em 0.32em;
+  }
+
+  /* ---- finding blocks ---- */
+
+  .findings { display: flex; flex-direction: column; gap: 1rem; }
+
+  .finding {
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-left: 3px solid var(--blue);
+    border-radius: var(--radius);
+    padding: 1.15rem 1.25rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+  }
+
+  .finding.proven { border-left-color: var(--green); }
+  .finding.null { border-left-color: var(--ink-faint); }
+
+  .finding-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0.5rem 0.9rem;
+  }
+
+  .verdict {
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    padding: 0.14rem 0.5rem;
+    border-radius: var(--radius);
+    white-space: nowrap;
+  }
+
+  .verdict.proven { color: var(--green); background: var(--green-soft); }
+  .verdict.null { color: var(--ink-soft); background: var(--surface-2); }
+
+  .finding .score {
+    font-family: var(--font-mono);
+    font-size: 1.3rem;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    color: var(--ink);
+  }
+
+  .cue {
+    font-size: 0.86rem;
+    color: var(--ink-soft);
+    border-top: 1px dashed var(--rule);
+    padding-top: 0.6rem;
+    display: flex;
+    gap: 0.5rem;
+  }
+
+  .cue::before {
+    content: "⚠";
+    color: var(--amber);
+    flex: none;
+  }
+
+  /* ---- tables ---- */
+
+  .scroll { overflow-x: auto; }
+
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    font-size: 0.86rem;
+    background: var(--surface);
+  }
+
+  caption {
+    caption-side: top;
+    text-align: left;
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    padding-bottom: 0.5rem;
+  }
+
+  th, td {
+    border-bottom: 1px solid var(--rule);
+    padding: 0.5rem 0.7rem;
+    text-align: right;
+    vertical-align: baseline;
+  }
+
+  th:first-child, td:first-child {
+    text-align: left;
+    font-weight: 400;
+  }
+
+  thead th {
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: 0.82rem;
+    letter-spacing: 0.02em;
+    color: var(--ink);
+    border-bottom: 1.5px solid var(--rule-strong);
+  }
+
+  tbody tr:last-child td { border-bottom: none; }
+
+  .n { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+  .n.big { font-weight: 600; }
+  .n.win { color: var(--green); }
+  .n.bad { color: var(--red); }
+  .n.fix { color: var(--amber); font-weight: 600; }
+  .n.old { color: var(--ink-faint); text-decoration: line-through; text-decoration-thickness: 1px; }
+
+  td .stack { display: flex; flex-direction: column; align-items: flex-end; line-height: 1.35; }
+  td .stack .tag {
+    font-family: var(--font-mono);
+    font-size: 0.64rem;
+    letter-spacing: 0.08em;
+    color: var(--ink-faint);
+  }
+  td .stack .tag.fix { color: var(--amber); }
+
+  tr.hi td { background: var(--blue-soft); }
+  tr.hi th { background: var(--blue-soft); }
+
+  .note {
+    font-size: 0.84rem;
+    color: var(--ink-soft);
+    display: flex;
+    gap: 0.5rem;
+  }
+  .note::before { content: "▸"; color: var(--blue); flex: none; }
+
+  /* ---- code diagram ---- */
+
+  pre {
+    margin: 0;
+    background: var(--surface-2);
+    border: 1px solid var(--rule);
+    border-radius: var(--radius);
+    padding: 1rem 1.1rem;
+    overflow-x: auto;
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    line-height: 1.75;
+    color: var(--ink);
+  }
+
+  pre b { color: var(--amber); font-weight: 600; }
+  pre i { color: var(--red); font-style: normal; }
+  pre u { color: var(--green); text-decoration: none; }
+
+  /* ---- rule list ---- */
+
+  .rules { display: flex; flex-direction: column; gap: 0.75rem; }
+
+  .rule-item {
+    display: flex;
+    gap: 0.85rem;
+    background: var(--red-soft);
+    border: 1px solid color-mix(in srgb, var(--red) 25%, transparent);
+    border-radius: var(--radius);
+    padding: 0.85rem 1rem;
+    font-size: 0.88rem;
+  }
+
+  .rule-item .mark {
+    font-family: var(--font-mono);
+    color: var(--red);
+    font-weight: 600;
+    flex: none;
+  }
+
+  .rule-item .body { display: flex; flex-direction: column; gap: 0.2rem; }
+  .rule-item .body b { color: var(--ink); }
+
+  /* ---- caveats ---- */
+
+  ul.caveats {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+    border-top: 1px solid var(--rule);
+  }
+
+  ul.caveats li {
+    display: flex;
+    gap: 0.9rem;
+    padding: 0.75rem 0;
+    border-bottom: 1px solid var(--rule);
+    font-size: 0.88rem;
+    color: var(--ink-soft);
+  }
+
+  ul.caveats li .idx {
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    color: var(--ink-faint);
+    padding-top: 0.2rem;
+    flex: none;
+  }
+
+  ul.caveats li b { color: var(--ink); }
+
+  /* ---- script blocks ---- */
+
+  .script { display: flex; flex-direction: column; gap: 1rem; }
+
+  blockquote {
+    margin: 0;
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: var(--radius);
+    padding: 1.1rem 1.25rem 1.1rem 1.4rem;
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+
+  blockquote::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: 3px;
+    background: var(--blue);
+    border-radius: var(--radius) 0 0 var(--radius);
+  }
+
+  blockquote .who {
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--blue);
+  }
+
+  blockquote p { font-size: 0.94rem; }
+
+  .kicker {
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-left: 3px solid var(--amber);
+    border-radius: var(--radius);
+    padding: 1rem 1.2rem;
+    font-size: 0.94rem;
+  }
+
+  footer {
+    border-top: 1px solid var(--rule);
+    padding-top: 1rem;
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    letter-spacing: 0.06em;
+    color: var(--ink-faint);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem 1.2rem;
+    justify-content: space-between;
+  }
+
+  @media (max-width: 560px) {
+    body { font-size: 14.5px; }
+    .sheet { padding-block: 1.5rem 3rem; gap: 2rem; }
+    th, td { padding: 0.45rem 0.5rem; font-size: 0.8rem; }
+    .finding .score { font-size: 1.1rem; }
+  }
+</style>
+
+<div class="sheet">
+
+  <header class="masthead">
+    <div class="eyebrow">
+      <span class="stamp">评测报告</span>
+      <span>2026-09-12</span>
+      <span>CodeAgent · eval layer</span>
+    </div>
+    <h1>CodeAgent 三臂评测结论</h1>
+    <p class="standfirst">
+      同一批 <strong>21 个闸门后有效任务</strong>、三条臂、同一把尺子。模型 <span class="mono">deepseek-chat</span>（DeepSeek 官方通路），仓库 HEAD <span class="mono">4aa53111d72c</span>。跑之前先做六项交叉验证，<strong>逐字段一致才出数</strong>。
+    </p>
+    <ul class="checks">
+      <li>模型</li>
+      <li>仓库 HEAD</li>
+      <li>定价快照</li>
+      <li>闸门有效数</li>
+      <li>有效任务集</li>
+      <li>候选集</li>
+    </ul>
+  </header>
+
+  <section>
+    <h2><span class="num">01</span> 两条结论</h2>
+    <div class="findings">
+
+      <article class="finding proven">
+        <div class="finding-head">
+          <span class="verdict proven">有受控证据</span>
+          <h3>多轮循环的价值是被证明的</h3>
+        </div>
+        <p class="score"><span class="mono">66.7%</span> vs <span class="mono">0%</span></p>
+        <p>
+          <code>agent</code> 与 <code>one-step</code> 同工具、同提示、同流程，<strong>只差 <code>max_steps</code> 一个数</strong>，是全套里唯一的受控对。<code>one-step</code> 21/21 撞满一步预算、21/21 工作区<strong>零变更</strong>。
+        </p>
+        <p class="cue">
+          但不能读成「循环让模型变聪明了」：<code>one-step</code> 是<strong>没有机会</strong>产出改动，不是"产出了但不够好"。这一对量的是<strong>「给不给得起第二次机会」</strong>。
+        </p>
+      </article>
+
+      <article class="finding null">
+        <div class="finding-head">
+          <span class="verdict null">样本内不显著</span>
+          <h3>单臂之间的能力差距只剩 3 个任务</h3>
+        </div>
+        <p class="score"><span class="mono">3</span> / 21</p>
+        <p>
+          <code>agent</code>(14) 与 <code>single-shot</code>(16) 落到同一批任务上逐个比，把<strong>输出合规</strong>与<strong>步数预算</strong>两样非能力因素剥掉之后，真正的能力差异只剩 3 个任务 —— 21 个样本里的 3 个，<strong>不足以支撑任何架构结论</strong>。
+        </p>
+        <p class="cue">
+          所以「多轮循环值多少」<strong>不能</strong>用 <code>agent</code> vs <code>single-shot</code> 回答 —— 那个差里混着非能力因素。要测循环本身，看上面那一对。
+        </p>
+      </article>
+
+    </div>
+  </section>
+
+  <section>
+    <h2><span class="num">02</span> 数字</h2>
+    <div class="scroll">
+      <table>
+        <caption>三条臂 · 同一批有效任务 · 分母不同不可相减</caption>
+        <thead>
+          <tr>
+            <th scope="col">指标</th>
+            <th scope="col">agent<br><span class="mono">多轮循环</span></th>
+            <th scope="col">one-step<br><span class="mono">max_steps=1</span></th>
+            <th scope="col">single-shot<br><span class="mono">无工具·一次调用</span></th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <th scope="row">有效任务</th>
+            <td class="n">21</td><td class="n">21</td><td class="n">21</td>
+          </tr>
+          <tr>
+            <th scope="row">计分（完成率分母）</th>
+            <td class="n">21</td><td class="n">21</td>
+            <td class="n"><span class="n old">14</span> → <span class="n fix">19</span></td>
+          </tr>
+          <tr class="hi">
+            <th scope="row">通过</th>
+            <td class="n big">14</td><td class="n big">0</td>
+            <td class="n big"><span class="n old">11</span> → <span class="n fix">16</span></td>
+          </tr>
+          <tr>
+            <th scope="row">完成率（通过 / 计分）</th>
+            <td class="n win">66.7%</td><td class="n bad">0.0%</td>
+            <td class="n"><span class="n old">78.6%</span> → <span class="n fix">84.2%</span></td>
+          </tr>
+          <tr>
+            <th scope="row">补丁未应用</th>
+            <td class="n">0</td><td class="n">0</td>
+            <td class="n"><span class="n old">7</span> → <span class="n fix">2</span></td>
+          </tr>
+          <tr>
+            <th scope="row">撞 max_steps</th>
+            <td class="n">3 <span class="tag">推定</span></td>
+            <td class="n">21 <span class="tag">精确</span></td>
+            <td class="n">0</td>
+          </tr>
+          <tr>
+            <th scope="row">token</th>
+            <td class="n">2,892,745</td><td class="n">42,073</td><td class="n">341,337</td>
+          </tr>
+          <tr>
+            <th scope="row">估算成本</th>
+            <td class="n">¥2.0754</td><td class="n">¥0.0408</td><td class="n">¥0.8423</td>
+          </tr>
+          <tr>
+            <th scope="row">每次成功修复的边际成本</th>
+            <td class="n">¥0.1482</td><td class="n">—</td>
+            <td class="n"><span class="n old">¥0.0766</span> → <span class="n fix">¥0.0526</span></td>
+          </tr>
+          <tr>
+            <th scope="row">oracle 基线（金标准补丁）</th>
+            <td class="n">100%</td><td class="n">100%</td><td class="n">100%</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note">
+      <span><code>single-shot</code> 的<strong>留档值是 52.4%（11/21）</strong>，其中 5 个假阴性是<strong>我自己的解析器缺陷</strong>造成的，经零成本离线重算修正为 <strong>84.2%（16/19）</strong>。归因见第 04 节。</span>
+    </p>
+    <p class="note">
+      <span>分母 <code>judged</code> 已摘掉「补丁未落地」与「判定器没跑成」—— 那两类是<strong>评测方</strong>的锅，不该算模型没修好。所以 <span class="mono">84.2%</span>（分母 19）与 <span class="mono">66.7%</span>（分母 21）<strong>不能相减</strong>。</span>
+    </p>
+  </section>
+
+  <section>
+    <h2><span class="num">03</span> 配对比较与归因解耦</h2>
+    <div class="scroll">
+      <table>
+        <caption>agent vs single-shot（修正后）· 同一批 21 个任务</caption>
+        <thead>
+          <tr><th scope="col">四格</th><th scope="col">个数</th><th scope="col">任务</th></tr>
+        </thead>
+        <tbody>
+          <tr><th scope="row">都修好</th><td class="n">11</td><td class="mono" style="color:var(--ink-faint)">—</td></tr>
+          <tr><th scope="row">只有 agent</th><td class="n">3</td><td class="mono">0e1ba9ca · 45a4d4b3 · 9eaf5626</td></tr>
+          <tr><th scope="row">只有 single-shot</th><td class="n">5</td><td class="mono">06d64f46 · 1e865a86 · 5bb3a9e5 · 9f55011e · f3b18d2a</td></tr>
+          <tr><th scope="row">都没修好</th><td class="n">2</td><td class="mono">03f8df75 · 770486ff</td></tr>
+          <tr class="hi"><th scope="row">并集（任一臂修好）</th><td class="n big">19 / 21</td><td class="mono">留档 18/21 = 85.7% → 修正 19/21 = 90.5%</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note">
+      <span><strong>并集不是任何单臂的成绩。</strong>它是「两条通路合起来能覆盖多少」，最常被误记成「agent 的 90.5%」—— 一被追问逐任务表就露馅。</span>
+    </p>
+
+    <div class="scroll">
+      <table>
+        <caption>把这 8 个独占任务按原因归类 —— 这一步才是关键</caption>
+        <thead>
+          <tr><th scope="col">独占方</th><th scope="col">原因</th><th scope="col">个数</th><th scope="col">是否能力</th></tr>
+        </thead>
+        <tbody>
+          <tr><th scope="row">只有 agent</th><td style="text-align:left">输出合规（没输出 diff / 上下文对不上）</td><td class="n">2</td><td class="mono" style="text-align:left;color:var(--ink-faint)">否</td></tr>
+          <tr><th scope="row">只有 agent</th><td style="text-align:left"><strong>纯能力</strong></td><td class="n">1</td><td class="mono" style="text-align:left;color:var(--amber)">是</td></tr>
+          <tr><th scope="row">只有 single-shot</th><td style="text-align:left">预算（agent 撞满 25 步）</td><td class="n">3</td><td class="mono" style="text-align:left;color:var(--ink-faint)">否</td></tr>
+          <tr><th scope="row">只有 single-shot</th><td style="text-align:left"><strong>纯能力</strong></td><td class="n">2</td><td class="mono" style="text-align:left;color:var(--amber)">是</td></tr>
+          <tr class="hi"><th scope="row">合计</th><td style="text-align:left"><strong>剥掉非能力因素后的真实能力差异</strong></td><td class="n big">3</td><td class="mono" style="text-align:left">—</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h2><span class="num">04</span> 评测审计：5 个假阴性</h2>
+    <div class="prose">
+      <p>
+        <strong>这是本轮最该讲的一段：我的评测器在给模型扣分。</strong>
+        <code>single-shot</code> 交补丁要过我自己写的 diff 抠取器，而它的开围栏<strong>只认</strong> <code>```</code> / <code>```diff</code> / <code>```patch</code>。模型回复里 diff 块前面常有一个 <code>```python</code> —— 它当不了开围栏，于是围栏配对整个错位一格：
+      </p>
+    </div>
+<pre>散文 ```python          <i>← 当不了开围栏</i>
+  ...code...
+<b>```diff</b>                 <i>← 被上一个散文块当成【闭围栏】吃掉</i>
+  ...真正的 diff...      <i>← 从此没有开围栏 ⇒ findall 抠不到</i>
+```                     <i>← 兜底分支从这里一路切到全文结尾</i>
+<i>...模型后面的说明文字...</i>  <i>← 整段喂给 git apply ⇒ corrupt patch</i></pre>
+    <p class="note">
+      <span>它<strong>一条测试都不会变红</strong>，却直接改掉头号指标。</span>
+    </p>
+
+    <div class="scroll">
+      <table>
+        <caption>7 个「补丁未应用」逐条归因</caption>
+        <thead>
+          <tr><th scope="col">责任方</th><th scope="col">个数</th><th scope="col">任务</th></tr>
+        </thead>
+        <tbody>
+          <tr class="hi"><th scope="row"><strong>我的解析器</strong>（修好后都是真通过）</th><td class="n big">5</td><td class="mono">dcf0a013 · 6a84ca9c · 1e865a86 · f959c8cf · 08305a1e</td></tr>
+          <tr><th scope="row">模型自己（拼 hunk / 只分析不出 diff）</th><td class="n">2</td><td class="mono">45a4d4b3 · 0e1ba9ca</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="prose">
+      <p>
+        <code>eval/runner.py</code> 本轮<strong>已冻结</strong>（三条臂必须跑同一份代码，中途改就等于三份分数不可比），所以走<strong>离线重算</strong>：报告里存了每个任务的 <code>raw_output</code>，<strong>重抠 + 重落 + 重判，LLM 调用 0 次</strong>。
+      </p>
+      <p>
+        四条硬不变式 —— 缺一条，「重算」就退化成「重编故事」：
+      </p>
+    </div>
+
+    <div class="scroll">
+      <table>
+        <thead>
+          <tr><th scope="col">不变式</th><th scope="col">内容</th></tr>
+        </thead>
+        <tbody>
+          <tr><th scope="row">① 零 LLM 调用</th><td style="text-align:left">只消费已落盘的 <code>raw_output</code>。模型当时的输出是既成事实，变的只有解析侧。</td></tr>
+          <tr><th scope="row">② 先自校验再出数</th><td style="text-align:left">第 0 阶段用<strong>现行</strong>解析器重算，必须逐字段复现留档聚合 <span class="mono">21 / 14 / 11 / 7 / 0</span> 才继续。</td></tr>
+          <tr><th scope="row">③ 不覆盖留档</th><td style="text-align:left">修正写另一个文件，<code>data/eval/report-*.json</code> 一个字节都不动。</td></tr>
+          <tr><th scope="row">④ 修复代码只有一份</th><td style="text-align:left"><code>diff_extract_fixed.py</code> 是唯一真相源 —— 两份副本 = 迟早漂移，而这个 bug 的教训正是「解析器会悄悄决定分数」。</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="kicker">
+      <strong>原 52.4% 系评测系统解析器缺陷（5 个假阴性）导致，经离线重算修正后真实完成率为 84.2%（16/19）。</strong>
+      两个数字都留着：只报修正值 = 抹掉自己犯过的错，只报原值 = 拿自己的 bug 当模型的能力。
+    </div>
+  </section>
+
+  <section>
+    <h2><span class="num">05</span> 引用纪律</h2>
+    <p class="note"><span>说错任何一条，前面所有数字的信誉一起赔进去。</span></p>
+    <div class="rules">
+      <div class="rule-item">
+        <span class="mark">✕</span>
+        <div class="body">
+          <b>绝不把「并集 90.5%」说成 agent 的成绩。</b>
+          <span><code>agent ∪ single-shot</code> = 19/21 是「两条通路合起来覆盖多少」，<strong>不是任何单臂的数字</strong>。</span>
+        </div>
+      </div>
+      <div class="rule-item">
+        <span class="mark">✕</span>
+        <div class="body">
+          <b>分母不同的百分比不相减。</b>
+          <span><span class="mono">84.2%</span> 的分母是 19，<span class="mono">66.7%</span> 的分母是 21。</span>
+        </div>
+      </div>
+      <div class="rule-item">
+        <span class="mark">✕</span>
+        <div class="body">
+          <b>修正值是反事实，不是实测。</b>
+          <span>它回答「如果解析器没这个 bug 会被判成什么」，<strong>不是</strong>「模型能打多少分」；而且那个 bug <strong>仍在 <code>runner.py</code> 里</strong>（本轮只冻结不改），修正只存在于 <code>evalverify/</code>。</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2><span class="num">06</span> 这一轮不证明什么</h2>
+    <ul class="caveats">
+      <li><span class="idx">01</span><span><b>样本量。</b>21 个任务全部来自 tinydb 一个仓库、一个语言、一个测试风格。完成率<strong>不能外推</strong>到别的语言 / 仓库。</span></li>
+      <li><span class="idx">02</span><span><b>网络寻源未阻断。</b>eval 工具集里有 <code>web_fetch</code> / <code>web_search</code>，而 task_text 带着 commit subject（含 <code>(#618)</code> 这类 issue 号）。隔离验证只证明了<strong>本地</strong>那条路是断的；报告不含工具调用记录，做不到逐任务查证。</span></li>
+      <li><span class="idx">03</span><span><b><code>env_timeout</code> 取证不到。</b>报告只落了从 <code>terminated_reason</code> 派生的布尔，没落 <code>terminated_reason</code> 本身 —— 「环境把他掐死了」与「真没修对」在数据上完全同形。<strong>这一格空着，不拿猜测填。</strong></span></li>
+      <li><span class="idx">04</span><span><b>判定器有已知绕过</b>（<code>conftest.py</code> 注入，188 字节 PoC 已验证）。三臂统一关闭守卫以保可比，代价是 <code>judge_tampering</code> 一律 <code>null</code> —— 那是「<strong>没检查</strong>」不是「查过且干净」。经事后审计，本轮 21 个任务中未发现任何利用此漏洞的行为。</span></li>
+      <li><span class="idx">05</span><span><b>成本是按快照单价估算</b>，不是账单；<code>deepseek-chat</code> 已不在官方定价页列示，实际计费单价未经核实。</span></li>
+    </ul>
+  </section>
+
+  <section>
+    <h2><span class="num">07</span> 汇报话术</h2>
+    <div class="script">
+      <blockquote>
+        <span class="who">第一段 · 架构能力</span>
+        <p>「我构建了三条臂来定位 Agent 的能力边界。<code>agent</code> 与 <code>one-step</code> 同工具、同提示、同流程，只差 <code>max_steps</code> 一个数 —— 我证明了多轮循环带来了<strong>从 0 到 66.7% 的质变</strong>。」</p>
+      </blockquote>
+      <blockquote>
+        <span class="who">第二段 · 数据真实性</span>
+        <p>「同时，我做了一次极致的评测审计，发现<strong>评测框架本身的解析器 Bug 会制造 5 个假阴性</strong>。我用<strong>零成本的离线重算</strong>把 <code>single-shot</code> 的真实能力还原到了 <strong>84.2%</strong>，从而避免了对模型能力的误判。而且我知道这条结论的边界 —— 剥掉非能力因素后，单臂之间的真实差异<strong>只有 3 个任务，统计上不显著</strong>，所以我不会拿它去吹『多轮完爆单发』。」</p>
+      </blockquote>
+    </div>
+    <div class="kicker">
+      这两段合起来说明的事：我不只知道分数是多少，我<strong>知道分数是被谁决定的</strong> —— 一个解析器可以悄悄改掉头号指标，而它当时一条测试都不会变红。
+    </div>
+  </section>
+
+  <footer>
+    <span>CodeAgent · 评估层 · 2026-09-12</span>
+    <span>完整口径见 README「评估（eval）」章节与 TASKS.md 的 M5-5 一节</span>
+  </footer>
+
+</div>

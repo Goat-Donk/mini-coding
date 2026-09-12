@@ -37,6 +37,20 @@ class Usage:
             return None
         return self.prompt_cache_hit_tokens / total
 
+    @property
+    def billable_miss_tokens(self) -> int:
+        """**计费口径**的未命中输入 token。
+
+        端点没返回 `prompt_cache_miss_tokens` 时，按 `prompt_tokens - hit` 兜底。
+        不兜底会出一个自相矛盾的报告：`total_tokens` 把这些输入照旧算进去了，
+        而成本公式里它们按 ¥0 计 —— 于是"token 很多、成本几乎为 0"，
+        而两行数字看起来都像真的。命中是 0、未命中是 0、输入却有 N 个 token 时，
+        唯一的诚实解释就是"这 N 个全是未命中"（缓存字段没返回 ≠ 缓存命中了）。
+        """
+        if self.prompt_cache_miss_tokens:
+            return self.prompt_cache_miss_tokens
+        return max(0, self.prompt_tokens - self.prompt_cache_hit_tokens)
+
     def __iadd__(self, other: "Usage") -> "Usage":
         self.prompt_tokens += other.prompt_tokens
         self.completion_tokens += other.completion_tokens

@@ -845,7 +845,7 @@ BURST_STOP_REASONS = {"await_user", REASON_GOAL_CHECK_INVALID, REASON_GOAL_DONE,
 
 ### 4e.12 测试与真实验证
 
-- `tests/test_goal.py` **38 例** + `tests/test_repl.py` / `tests/test_session.py` 补契约；全量 **597 全绿**（M9-6 当时的数字；M9-7 之后为 623、M9-8 之后为 **707**）。
+- `tests/test_goal.py` **38 例** + `tests/test_repl.py` / `tests/test_session.py` 补契约；全量 **597 全绿**（M9-6 当时的数字；M9-7 之后为 623、M9-8 之后为 707、M5-5 之后为 **769**）。
   重点用例：创建时 `objective`/`check_command` **逐字落库**、`pause` 存原因 / `resume` **必须清
   `pause_reason`**、`clear` → `None`（杀"实现成置 done"）、已有活跃目标时拒绝第二个、检查跑的是
   `check_command` 原文、exit≠0 **保持 active 且本轮继续**、失败判定以 `user` 消息回喂、**门禁拦下 →
@@ -1918,50 +1918,250 @@ class SettleReport:           # killed / unclaimed / still_running / usage
 TINYDB_REPO = "https://github.com/msiemens/tinydb.git"
 DEFAULT_REPO = Path("eval/repos/tinydb")
 FIX_KEYWORDS = ("fix","fixes","fixed","bug","error","crash","issue","regression","broken","incorrect")
+_NON_SOURCE_NAMES = ("setup.py", "conftest.py")                # 不算"被测源码"
 
 def git(repo_dir: Path, *args) -> str                          # 包装 subprocess git
+def _force_rmtree(task_path: Path) -> None                     # rmtree + 清只读位（3.12 onexc / 3.11 onerror）
 def ensure_repo(repo_dir=DEFAULT_REPO, *, clone_url=TINYDB_REPO) -> Path  # clone（3 次重试）
 def discover_fix_commits(repo_dir, *, limit=20, keywords=FIX_KEYWORDS) -> list[dict]
 def render_task_text(commit: dict) -> str                      # 真实 bug 报告（subject+body，不造假）
-@dataclass GoldenTask: id, base_sha, title, task_text, changed_sources, hidden_tests
+@dataclass GoldenTask: id, base_sha, fix_sha, title, task_text, changed_sources, hidden_tests
 def build_task(repo_dir, commit) -> GoldenTask                 # base_sha = commit^
-def materialize(task, target_dir, repo_dir) -> Path            # git worktree add --detach
-def remove_worktree(repo_dir, target_dir)
+def _archive_to(sha, repo_dir, target) -> None                 # git archive → tar → 解包（见下）
+def materialize(task, target_dir, repo_dir) -> Path            # 物理剥离（不是 worktree）
+def remove_workspace(target_dir) -> None
+def leak_probe(task, workspace) -> bool                        # cat-file -e fix_sha == 0 → 泄漏了
 @dataclass JudgeResult: passed, returncode, summary
+def _run_pytest(workspace, test_files) -> JudgeResult          # judge 与闸门共用；sys.executable
+def _write_hidden_tests(workspace, hidden_tests) -> None
 def judge(task, workspace) -> JudgeResult                      # hidden tests 覆盖写回 → pytest
+@dataclass TaskValidity: valid, reason, base_rc, fix_rc, base_collect_error
+def _stage_and_run(sha, repo_dir, hidden_tests, test_files) -> JudgeResult
+def validate_task(task, repo_dir) -> TaskValidity              # 有效性闸门（两侧都查）
+def validate(task, repo_dir) -> TaskValidity                   # 单任务，含兜底
+def validate_tasks(tasks, repo_dir) -> list[tuple[GoldenTask, TaskValidity]]
 ```
 
 - **任务构造**：从 tinydb git history 找 subject 含 fix 关键字的提交，且**同时改源码与 tests/**。
   `base_sha = fix 提交的父提交`（= bug 存在状态）；`task_text` = 该提交的 subject+body
   （真实 bug 报告，绝不编造）；`hidden_tests` = fix 提交里 tests/ 的新内容——agent 全程看不到，
-  判定用。避免 SWE-bench 两个陷阱：测试泄漏（隐藏测试只在 judge 时覆盖写回）与任务描述失真。
-- **物化**：`git worktree add --detach base_sha` 出干净工作区（不污染主仓库）；
-  完成后 `remove_worktree`。judge：hidden_tests 写回 `tests/` → `subprocess pytest` 判定。
-- 测试：tests/test_golden_tasks.py（5 个）+ conftest `fixture_repo`（本地迷你仓库离线造
+  判定用。**关键字只负责缩小候选集，筛掉谁由闸门用事实说了算**（`chore: fix a lot of typos`
+  这类会走进来，然后在闸门处被拒）。`setup.py`/`conftest.py` **不算源码**——它们是打包配置与测试夹具，
+  算成源码会让"改了源码 + 改了测试"这个筛选条件失真（实测命中 `40398b96`）。
+- **物化 = 物理剥离（不是 worktree）**：`git archive base_sha` 导出 tree，解到隔离区后
+  `git init -q -b master` + `git add .` + `git commit -m "Base commit for evaluation"`。
+  **为什么不能用 `git worktree`**：worktree 与主仓库**共享对象库与 refs**，而 fix 提交就在主仓库
+  历史里 —— agent 一条 `git show <fix_sha>:tests/test_xxx.py` 就能拿到隐藏测试全文，
+  `git show <fix_sha>:tinydb/table.py` 就是金标准补丁，而 bash 工具只校验 cwd、不校验命令文本。
+  物理剥离后 agent 仍有 git 可用（能 `git diff` 自己的改动），但**没有未来**：工作区的 git 历史是
+  评测生成的，不含任何原仓库历史。每次跑都过一遍 `leak_probe`（`git cat-file -e <fix_sha>`
+  必须非零退出 —— 不是"不可达"，是对象**根本不在**）把这条断言测成一个量。
+  - ⚠️ **归档不能落进工作区**：git 的 tar 流以 `pax_global_header` 开头，里面写着 `comment=<base_sha>`，
+    先存文件再解包就等于在工作区里留一个含 sha 的明文二进制 → 整条流读进 `io.BytesIO` 再解包。
+  - ⚠️ **必须 `mode="r:"`（可 seek），不能用流模式 `r|`**：归档里有 `120000` symlink 条目时，
+    tarfile 要回到归档开头重读才能解析它，流模式直接 `StreamError: seeking backwards is not allowed`
+    （实测把 7 个候选记成"闸门自身异常"，一个都没验成）。
+  - ⚠️ **Windows 上 linkname 不是路径的 symlink 建不出来**（tinydb 的 `CONTRIBUTING.rst` 就是一条，
+    linkname 是一整篇文档文本），**所有 filter 下都一样丢**，tarfile 只当非致命错误静默跳过 →
+    物化后拿 `tf.getmembers()` 与 `os.path.lexists(target / m.name)` 比对，跳过就**打印出来**
+    （用 `lexists` 不跟随链接，免得把悬空 symlink 误报成丢失）。
+  - 目标已存在 → **自愈**（先删再建并打一行，不静默删）；`_force_rmtree` 必须清只读位，
+    否则 agent 跑一次 `git gc` 产生只读 pack 后下一轮清理就 `PermissionError`。
+- **有效性闸门（SWE-bench FAIL_TO_PASS 式，进入 LLM 之前，零 token 成本）**：隐藏测试必须在
+  **base 失败、在 fix 通过**。base 侧 `rc==0` → 拒（**白送分**：这任务不测任何东西）；
+  `rc==1` → 过（跑了且失败，最强信号）；`rc==2` → **接受并打标 `base_collect_error`**
+  （收集错误是 2，写成"必须 rc==1"会误杀 fix 提交新增了 base 没有符号的合法任务；
+  敢接受是因为 fix 侧已经在守）；`rc∈{3,4,5}` → 拒。fix 侧必须 `rc==0`，否则拒
+  「金标准补丁在本机跑不过：这个任务谁都拿不到分」——**fix 侧同时就是 oracle 基线（= 100%）**，
+  没有它，"0% 完成率"和"judge 坏了"在报告上长得一模一样。`task.test_files` 为空**短路拒绝**
+  （否则 judge 跑的是整个套件 → base 侧 rc=0 → 白送分）。用 `tempfile.mkdtemp()` 物料，
+  **绝不复用 `ws_root/task.id`**（judge 会把隐藏测试写进传入目录，复用就等于闸门自己制造泄漏）。
+- **判定口径**：`judged = error is None and not patch_failed`（进分母）；
+  `effective_pass = judged and passed and invalid_reason is None`（进分子）；
+  `patch_failed` 单独计数、**绝不混进完成率**。`steps == 0` 或工作区**零变更**时即使测试通过也标
+  `invalid`（理由如实写「agent 没改工作区任何文件，测试却通过」）——闸门管不住 agent
+  改工作区之外的东西（往 site-packages 塞 conftest、装包）让测试变绿。
+  - ⚠️ **顺序是硬要求**：`run_single` 必须 `物化 → leak_probe → 快照(before) → 跑臂 → 快照(after)
+    → 判零变更 → 最后才 judge`。`judge` 会把隐藏测试**写回工作区**，快照一旦排在它后面，
+    零变更检测永远非零，等于没做。
+  - ⚠️ **白送分防御的顺序也是硬的**：`steps == 0` → `zero_change` → `judge_tampering`，
+    每条都置 `invalid_reason` 并强制 `passed = False`。
+  - ⚠️ **失败分类的桶序是硬的**：`error → patch_failed → not_scored → passed → tests_failed`。
+    反过来会把"判定器崩了"记成"模型没修好"。
+  - ⚠️ **D1 是 D 的子集，不是并列的第五类**：D1 = 撞 `max_steps` 且未通过 ⊆ D = `tests_failed`。
+    D1 + D 相加 = 重复计数。D1 的意义是把"没预算"从"没修对"里拆出来——`one-step` 这类
+    天然预算受限的臂，不拆就会被读成能力差。
+- 测试：tests/test_golden_tasks.py（25 个）+ conftest `fixture_repo`（本地迷你仓库离线造
   buggy → fix → 非 fix 提交，不联网）。
 
 ### 9.6b eval/runner.py（M5-2 已实现：回归报告）
 
 ```python
-PRICE_INPUT_HIT_CNY = 0.5;  PRICE_INPUT_MISS_CNY = 2.0;  PRICE_OUTPUT_CNY = 8.0  # DeepSeek 元/M
+DEFAULT_MODEL_FOR_PRICING = agent.pricing.DEFAULT_MODEL   # 单价查 agent/pricing.py 快照表
 DEFAULT_WS_ROOT = Path("data/eval/ws")
+ARMS = ("agent", "one-step", "single-shot")
 
-@dataclass TaskResult: task, passed, run, error, duration_s, cost_cny
-def estimate_cost_cny(prompt_hit, prompt_miss, completion) -> float
-def _build_llm(mock) -> BaseLLM        # mock → MockLLM.text（无 key 冒烟验证管线）
-def run_single(task, repo_dir, *, ws_root, mock) -> TaskResult
-def run_eval(repo_dir=DEFAULT_REPO, *, ws_root, limit=5, mock=False) -> dict
-def main()                              # CLI: --repo / --ws-root / --limit / --mock / --keep
+@dataclass TaskResult: task, passed, run, error, duration_s, cost_cny,
+                       judge_summary, invalid_reason, zero_change, leak_reachable,
+                       setup_s, patch_failed, budget_exhausted, judge_tampering,
+                       patch_error, raw_output, prompt
+                       @property judged        # error is None and not patch_failed → 进分母
+                       @property effective_pass # judged and passed and invalid_reason is None → 进分子
+@dataclass ArmOutcome: run, patch_failed, patch_error, raw_output, prompt
+def estimate_cost_cny(prompt_hit, prompt_miss, completion) -> float   # miss 缺省 = prompt - hit
+def _snapshot_tree(root) -> dict[str, str]     # 工作区文件哈希快照（judge 之前测零变更）
+def _build_llm(mock) -> BaseLLM                # mock → MockLLM.text（无 key 冒烟验证管线）
+def _collect_sources(ws) -> dict[str, str]     # single-shot 的输入：全部非 tests/ 的 .py
+def single_shot_prompt(task, ws) -> str        # prompt 原样进报告（可审计）
+def _extract_diff(text) -> str                 # 抠 unified diff；抠不出返回 ""（不当补丁猜）
+def _apply_patch(ws, diff) -> tuple[bool, str]
+def _run_arm(arm, llm, task, ws) -> ArmOutcome # max_steps=1 if arm=="one-step" else 25
+def run_single(task, repo_dir, *, ws_root, mock, arm, validate) -> TaskResult
+def _aggregate(results) -> dict
+def run_eval(repo_dir=DEFAULT_REPO, *, ws_root, limit=5, mock=False, arm="agent") -> dict
+def main()   # CLI: --repo / --ws-root / --limit / --mock / --keep / --no-validate / --arm
 ```
 
-- **流程**：物化 → QueryEngine 跑 task_text 修 bug → judge 隐藏测试 → remove_worktree。
-  agent 异常 / judge 异常**如实记入 `error` 字段**（不假装成功），工作区 always 清理。
-- **成本**：按 DeepSeek 公开定价估算，用量取 provider 实测
-  `prompt_cache_hit / prompt_cache_miss / completion` tokens（provider-usage-first）。
-- **报告**：ts / mode(mock|deepseek) / tasks / passed / completion_rate / total_tokens /
-  total_cost_cny / avg_cache_hit_ratio / per_task[]（id/title/passed/error/duration_s/steps/
-  tokens/cost_cny），落 `data/eval/report-*.json`。
-- 测试：tests/test_eval_runner.py（3 个：定价函数 / mock 冒烟整管线 / 报告字段可 JSON 落盘）。
+- **流程**：闸门（拒掉的不进 LLM）→ 物化（物理剥离）→ 按 arm 跑 task_text 修 bug →
+  零变更快照比对 → judge 隐藏测试 → `remove_workspace`。
+  agent 异常 / judge 异常**如实记入 `error` 字段**（不假装成功）；物化也在 `try` 之内，
+  单任务失败记成 `error` 而非整批中断。
+- **三条臂**：`agent`（多轮循环，max_steps=25）/ `one-step`（**一切相同，只把 max_steps 25→1**，
+  零风险真受控）/ `single-shot`（无工具、一次调用、要求输出 unified diff 由我们 `git apply`）。
+  ⚠️ `single-shot` 喂的是**全部非 `tests/` 的 `.py` 源码**，不送任何定位提示——原设计只喂
+  `changed_sources`，那等于把"定位"这个最难的部分直接送给模型。补丁解析/应用失败单独计数
+  `patch_failed`、**绝不混进完成率**，且把模型原始输出 `raw_output` 存进报告
+  （万一是我解析器的锅，人看得出来）。
+- **成本**：按 **`agent/pricing.py` 的定价快照**估算（单价 + `verified_on` + `status`），
+  用量取 provider 实测 `prompt_cache_hit / prompt_cache_miss / completion` tokens
+  （provider-usage-first；端点不返回缓存字段时 `miss = prompt_tokens - hit` 兜底，
+  否则全部输入按 ¥0 计、而同报告的 `total_tokens` 照旧计入 → 报告自相矛盾）。
+- **报告**（字段名逐一对应实际落盘 JSON）：ts / mode(mock|deepseek) / repo / **model / base_url /
+  repo_head** / arm / **gate{candidates, valid, rejected, oracle_baseline, enabled}** /
+  candidates / pricing_snapshot_id / pricing_note / pricing_warning / judge_guard / judge_note /
+  tasks / **judged**（完成率分母）/ invalid / not_scored / **passed** / patch_failed /
+  completion_rate / total_tokens / total_cost_cny / total_setup_s / avg_cache_hit_ratio /
+  leak_reachable / leaked_tasks / budget_exhausted /
+  per_task[]（id / title / **fix_sha** / passed / **passed_effective** / error / duration_s /
+  setup_s / steps / tokens / cost_cny / **patch_failed / patch_error / raw_output** /
+  invalid_reason / zero_change / leak_reachable / budget_exhausted / judge_summary /
+  judge_tampering / single_shot_prompt），落 `data/eval/report-*.json`。
+  **自证字段**（`arm` / `model` / `base_url` / `repo_head` / `pricing_snapshot_id` / `gate` /
+  `candidates`）不是装饰：没有它们，两份报告是否同一批任务、同一把尺子就无法判定。
+  `raw_output` 的意义同理——补丁没落地时把模型原始输出存进报告，**能不能翻案有据可查**
+  （本轮 5 个假阴性正是这样翻过来的，见 9.6d）。
+- 测试：tests/test_eval_runner.py（37 个：定价快照成本 / mock 冒烟整管线 / 报告字段可 JSON 落盘 /
+  `passed∧¬error` 口径 / 零变更判 invalid / 三臂 / `--keep` / `patch_failed` 不计入分母 /
+  闸门崩掉只拒那一个任务）。
+
+### 9.6c agent/pricing.py（M5-5 新建：定价快照）
+
+**为什么需要它**：`eval/runner.py` 与 `app/ui_streamlit.py` 原来各自硬编码一份单价常量。
+官方页面一改，两份常量同时变成假话，而**历史报告里的成本数字不会跟着变** —— 于是同一份报告里，
+"token 数"是真的、"成本"是拿今天的价乘当天的量算出来的，**两者不同源**。更糟的是查不到价时
+没有诚实的表达方式：返回 `None` / 抛异常都会让报告生成炸掉。
+
+```python
+@dataclass(frozen=True) PriceSnapshot:
+    id: str                # 稳定标识，写进报告，如 "deepseek-chat@2025"
+    model: str
+    verified_on: str | None  # 对着官方定价页核实的日期；None = 从未核实过
+    status: str            # "active"（现行）| "archived"（已不在定价页列示，价格锁死）
+    note: str              # 口径说明（来源、时效性、已知的不确定性）
+    input_hit: float; input_miss: float; output: float    # 元 / 百万 token
+    def cost_cny(prompt_hit, prompt_miss, completion) -> float
+SNAPSHOTS: tuple[PriceSnapshot, ...]
+DEFAULT_MODEL = "deepseek-chat"          # agent/llm.py 实际跑的模型
+FALLBACK_SNAPSHOT_ID = "deepseek-chat@2025"
+def resolve(model) -> tuple[PriceSnapshot, str | None]   # 绝不返回 None、绝不抛异常
+def snapshot_for(model) -> PriceSnapshot
+def pricing_note(model) -> str           # 可直接写进报告的成本口径说明
+```
+
+- 叶子模块：**不 import 任何 agent 内部东西**（同 `agent/workspace.py` 的约定）。
+- **查不到时不返回 `None`、不抛异常**（调用方在生成报告），回落到最近一条 `archived` 快照
+  **并如实标注**"这个成本是按别的模型估的"。回落到 archived 而不是现行模型：回落到一条现行模型的
+  价去算一个不同模型的账，只会给出一个看着更可信的错数。
+- 同一模型有高峰/空闲两档时取**高峰档**：估成本要的是上界，用空闲档会给出偏小、且看起来同样可信的数。
+- `deepseek-chat@2025`（0.5 / 2.0 / 8.0，`status="archived"`，`verified_on=None`）：
+  **`verified_on` 刻意留 `None`** —— 那组价是项目从 2025 年沿用的常量注释，**从未对着官方定价页核实过**；
+  编一个日期填进去比"未核实"更糟，因为它看起来像核实过。`note` 里的措辞是**「已不在定价页列示」**：
+  2026-09-12 中英文页各复核一次全页零命中 `deepseek-chat`，而页脚注只点名 `deepseek-v4-flash` 等别名
+  "仍可调用、对应模型已下线"，**`deepseek-chat` 不在那份名单里** —— 所以能确定的只是"不在定价页列示"，
+  **不是"已下线"**（2026-09-11 实测仍能调用）。
+- 同时收录现行 `deepseek-flash` / `deepseek-v4-pro` 的高峰/空闲四档（来源：官方定价页 2026-09-12），
+  这样"换模型"不必重新发明价格表。
+- 测试：tests/test_pricing.py（9 个：`snapshot_for` 默认模型 / archived 快照被标注而非被藏起来 /
+  现行模型无告警 / 高峰档优先于空闲档 / 未知模型回落而不抛异常 / 成本算术 /
+  **每条快照都必须声明 status 与来源** / `pricing_note` 含快照 id 与时效性 / 快照 id 不重复）。
+
+### 9.6d evalverify/（M5-6：评测器分离与离线重算机制）
+
+**为什么需要它**：跑三臂对照时 `eval/runner.py` 必须**冻结**（三条臂要跑同一份代码，中途改一版
+就等于三份分数不可比）。但冻结带来一个死角：**如果尺子本身有 bug，冻结会让错误数字变成"留档事实"**。
+本轮就撞上了这个死角——`_FENCE_RE` 的围栏配对错位制造了 5 个假阴性，而它在报告上表现为
+「模型没修对」，**一条测试都不会变红**。
+
+于是把**验证器具**与**被测代码**彻底分开：`evalverify/` 里所有脚本只做两件事——**读已落盘的
+`raw_output` 重算**、**把对照关系打印出来**。它是这套评测框架的一个架构特性，不是一次性排错脚本。
+
+```
+evalverify/
+├── diff_extract_fixed.py        # ★ 修复逻辑的【唯一真相源】（含 bug 机制的完整 ASCII 说明）
+├── rescore_single_shot.py       # 离线重算：重抠 + 重落 + 重判，**LLM 调用 0 次**
+├── reanalyse_patch_failed.py    # 逐任务取证：7 个 patch_failed 里，几个该由我负责
+├── drive_three_arms.py          # 三臂大对照：可比性校验 → 同分母 → 配对四格 → 解耦归因
+├── drive_arm_compare.py         # 单臂 × 历史基线的逐任务对照
+├── drive_isolation_report.py    # 泄漏隔离取证（21/21 成立、0 泄漏）
+├── drive_judge_gaming.py        # 判定器绕过 PoC（188 字节，已验证）
+├── drive_gate_repro.py / drive_gate_summary.py / drive_cost_estimate.py
+└── mutate_m5_5.py               # 变异测试（牙齿检查）
+```
+
+**四条硬不变式**（缺一条，"重算"就退化成"重编故事"）：
+
+1. **零 LLM 调用。** 重算只消费报告里已存的 `raw_output`。模型当时的输出是**既成事实**，
+   变的只有解析侧——所以重算回答的是「**如果解析器没这个 bug 会被判成什么**」，
+   **不是**「模型能打多少分」。这个措辞在文档里必须原样保留。
+2. **先自校验，再出修正值。** `rescore_single_shot.py` 的第 0 阶段用**现行**解析器重算一遍，
+   必须**逐字段复现**留档聚合（21 / 14 / 11 / 7 / 0）才继续；对不上就说明重算流程本身有问题，
+   此时任何"修正值"都不可信。
+3. **不覆盖留档。** 修正结果写**另一个文件**（`evalverify/report_single_shot_rescored.json`），
+   `data/eval/report-*.json` 一个字节都不动；输出 JSON 里带 `rescored` 溯源块。
+   报告里逐字段搬运的只有**非解析相关**的字段（`tokens` / `cost_cny` 照搬——那次调用**真的发生过**）。
+4. **修复代码只有一份。** `diff_extract_fixed.py` 是唯一真相源，`reanalyse_patch_failed.py` 与
+   `rescore_single_shot.py` 都 import 它。**两份副本 = 迟早漂移**，而这个 bug 的教训正是
+   「解析器会悄悄决定分数」。
+
+**被修的那个 bug**（`eval/runner.py:279`，本轮**仍在**——冻结不改）：
+
+```python
+_FENCE_RE = re.compile(r"```(?:diff|patch)?[ \t]*\n(.*?)```", re.DOTALL)   # 开围栏只认三种 info string
+```
+
+模型回复里 diff 块**前面**常有一个 ` ```python ` 代码块。它当不了开围栏 ⇒ **围栏配对整个错位一格**：
+` ```diff ` 行被上一个散文块当成**闭围栏**吃掉，真正的 diff 从此没有开围栏 ⇒ `findall` 抠不到 ⇒
+落到兜底分支 `text[idx:]`「从 `diff --git` 切到**全文结尾**」⇒ 把模型后面的说明文字整段喂给
+`git apply` ⇒ `corrupt patch` / `repository lacks the necessary blob`。
+
+修法是两处（B/C 两档在全部 7 个任务上结果相同 ⇒ 真正起作用的是**围栏配对**，兜底截断只是保险）：
+
+```python
+_FENCE_ANY = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)      # B: 开围栏接受任意 info string
+_BARE_FENCE = re.compile(r"^[ \t]*```[ \t]*$", re.MULTILINE)    # C: 兜底切到第一个裸围栏就停
+```
+
+**三档对照是设计的一部分，不是调试残留**：A（现行）/ B（只修围栏）/ C（B + 兜底截断）逐档独立
+落盘判分。A 必须复现 0/7（**证明复现忠实**），B/C 救回 5/7 —— 差额的来源因此是**可归因**的，
+而不是"改了几个地方就好了"。
+
+- ⚠️ **`evalverify/` 被 gitignore**（同 `m9verify/` 的三段式惯例）。接受的代价与补偿：
+  这些脚本不进版本库，但它们产出的**结论**（修正值、归因、口径边界）**全部写进了**
+  README / TECH_SPEC / TASKS.md，且每条都能追溯到 `data/eval/` 里那份**已落档且有字段自证**的报告。
+- ⚠️ **修正值是反事实口径**，引用时必须与留档值**并列**：只报修正值 = 抹掉自己犯过的错；
+  只报原值 = 拿自己的 bug 当模型的能力。差额（5 个任务）全部归解析器，与模型无关。
+- 测试：**这些脚本本身没有 pytest**（验证器具，不是产品代码）；它们的正确性由不变式 2
+  的自校验承担——自校验失败就拒绝出数。
 
 ### 9.7 app/replay.py（M5-3 已实现：控制台检查点回放视图）
 
@@ -2407,7 +2607,7 @@ M9-8 之前它无条件说是真的，现在带着 `--rewind` 时它会变成假
 分叉"的答案：不会，`drop_snapshots` 的活跃集按**所有**清单算，分叉的清单算在内。
 分叉点之后的清单**不搬**是对的：那是源会话在分叉点之后的历史，搬过去就是**说谎的记录**。
 
-- 测试：`tests/test_workspace.py` **49 例** + 接线契约 22 例（cli 8 / repl 6 / session 8）；全量 **707 全绿**。变异测试
+- 测试：`tests/test_workspace.py` **49 例** + 接线契约 22 例（cli 8 / repl 6 / session 8）；全量 **707 全绿**（M9-8 当时的数字；M5-5 之后为 **769**）。变异测试
   **35/35 零 SKIP 零 MISS**（`m9verify/mutate_m9_8.py`），其中五处是**证明后不设**的候选。
   边界测试逐条点名见 `docs/design/m9-8_rewind.md` §7。
 - **真实动线 A~F 全部有日志**（`m9verify/drive_m9_8.py`，真工作区 `m9verify/ws_m98/`）：
@@ -2428,8 +2628,10 @@ python -m pytest tests/                       # 全部测试
 python -m app.cli --mock "读 README 并总结项目结构"   # 无 key 演示（M1 末可用）
 python -m app.cli "给 README 加一行说明并验证"     # 真实 DeepSeek（需 .env 配 key）
 python -m eval.golden_tasks --clone --limit 10   # M5-1：拉 tinydb 并列出真实 fix 提交
-python -m eval.runner --limit 3                  # M5-2：真实跑 3 个黄金任务出回归报告
-python -m eval.runner --limit 2 --mock           # M5-2 无 key 冒烟（judge 会如实失败）
+python -m eval.runner --limit 39 --mock          # M5-5：闸门逐条流式判定 + 报告（零成本）
+python -m eval.runner --limit 39 --arm agent     # M5-5 三臂：完整循环（max_steps=25）
+python -m eval.runner --limit 39 --arm one-step  # M5-5 三臂：只跑一步（其余全同）
+python -m eval.runner --limit 39 --arm single-shot  # M5-5 三臂：无工具、一次调用出 diff
 python -m app.cli --mcp .codeagent/mcp.json "任务"  # M6-3/M9-4 加载 MCP server（stdio 或 HTTP）后执行任务
 python -m app.cli --sessions                    # M9-3 会话清单：名字 / 步数 / 分叉来源（无 key）
 python -m app.cli --rename "基线方案"             # M9-3 起名（只动元数据，无 key）

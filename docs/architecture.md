@@ -182,7 +182,7 @@ flowchart LR
 `BaseLLM` 两个实现，**接口完全一致**，所以循环、子代理、评估层共用一套代码：
 
 - `DeepSeekClient`：走 openai SDK（DeepSeek 兼容 OpenAI 协议），`chat()` 返回 `LLMResult(content, tool_calls, usage)`，`complete()` 给 compact 摘要用。
-- `MockLLM`：`script(*responses)` 脚本化响应序列 / `text("...")` 固定响应 / `tool_then_text(...)`。**测试与无 key 演示都靠它**——707 个测试全部离线，不打网络。
+- `MockLLM`：`script(*responses)` 脚本化响应序列 / `text("...")` 固定响应 / `tool_then_text(...)`。**测试与无 key 演示都靠它**——769 个测试全部离线，不打网络。
 
 `Usage` 里单独保留 `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`——这是 DeepSeek 磁盘缓存的**实测**字段，整个缓存命中率指标和成本估算都建立在它之上（不是估算出来的）。
 
@@ -243,7 +243,7 @@ miss token（8.8 倍）**，该步命中率 100% → 28%（一次性，重发即
 P7-d。**去留已拍板（2026-09-11）：保持现状** —— 不选"优先截最靠后的合格消息"是因为它
 缓存账更好看但会**先丢掉最老的上下文**，而"最近的最相关"是比缓存算术更硬的约束。
 
-**cache-aware 布局**（本项目独有，参考项目没有缓存概念）：`_PREFIX_LEN = 2`——**system + 首条 user 任务恒定在前两位**，compact 只动中段，绝不触碰前缀。DeepSeek 的磁盘缓存按前缀匹配，前缀稳定 → 命中率随会话推进持续上升，直接省钱。控制台把这条曲线画出来，并按公开定价（命中 ¥0.5/M vs 未命中 ¥2/M）实时估算省了多少钱。
+**cache-aware 布局**（本项目独有，参考项目没有缓存概念）：`_PREFIX_LEN = 2`——**system + 首条 user 任务恒定在前两位**，compact 只动中段，绝不触碰前缀。DeepSeek 的磁盘缓存按前缀匹配，前缀稳定 → 命中率随会话推进持续上升，直接省钱。控制台把这条曲线画出来，并按**定价快照**（`agent/pricing.py`：命中 ¥0.5/M vs 未命中 ¥2/M，快照 `deepseek-chat@2025`，`status=archived`）实时估算省了多少钱 —— 单价只此一份，控制台与评估报告查的是同一张表。
 
 这条布局在 M8 之后还多了**约束**的作用：移植任何机制前先问「它会不会改动 `_PREFIX_LEN`
 之后的消息」。`update_plan` 就被它挡下过一次 —— 只取参考实现的**落盘**，不取它那种
@@ -840,19 +840,28 @@ flowchart LR
     B --> C["task_text = 该提交的 subject + body<br/>（真实 bug 报告）"]
     B --> D["base_sha = 父提交<br/>（bug 存在状态）"]
     B --> E["hidden_tests = 该提交的 tests/<br/>（agent 全程看不到）"]
-    D --> F["materialize<br/>git worktree add --detach<br/>隔离工作区"]
+    D --> F["materialize<br/>git archive 导出 + git init<br/>物理剥离工作区"]
     F --> G["QueryEngine 跑 task_text"]
     G --> H["judge：hidden_tests 覆盖写回<br/>→ pytest 判定"]
     H --> I["报告：完成率 / token / 耗时 / 成本 / 缓存命中率"]
-    I --> J["remove_worktree 清理"]
+    I --> J["remove_workspace 清理"]
 ```
 
 这个设计绕开了 SWE-bench 类任务的两个经典陷阱：
 
-1. **测试泄漏** —— 判定用的测试如果 agent 能读到，就等于开卷考试。这里隐藏测试只在 judge 阶段写回，agent 跑的 base 工作区里没有它。
+1. **答案就摆在房间里** —— 判定用的测试如果 agent 能读到，就等于开卷考试。这里隐藏测试只在 judge 阶段写回。
+   ⚠️ 但**光有"晚写回"不够**：早期用 `git worktree add --detach` 做隔离，而 worktree 与主仓库**共享对象库与 refs**，
+   fix 提交就在主仓库历史里 —— agent 一条 `git show <fix_sha>:tests/test_xxx.py` 就能拿到隐藏测试全文，
+   `git show <fix_sha>:tinydb/table.py` 就是金标准补丁，而 bash 工具只校验 cwd、不校验命令文本。
+   现在改成**物理剥离**：`git archive base_sha` 导出 tree 解到隔离区，在里面 `git init` + 一个初始提交，
+   agent 仍有 git 可用（能 `git diff` 自己的改动）但**没有未来** —— 工作区的 git 历史是评测生成的，
+   不含任何原仓库历史。每次跑都有一条泄漏探针把这条断言测成量（`git cat-file -e <fix_sha>` 必须非零退出）。
 2. **任务描述失真** —— 把 fix 提交改写成谜语式任务描述，会让任务变得不可解。这里直接用提交的 subject + body，是**真实的、当时开发者自己写的** bug 报告。
 
-`git worktree add --detach` 让每个任务有独立工作区且不污染主仓库；成本按 DeepSeek 公开定价用**实测 usage** 估算；agent 异常或 judge 异常**如实写进报告的 `error` 字段**——一个坏掉的 run 绝不会显示成 pass。
+物化把每个任务的 base 树导出成一个独立工作区，不污染主仓库；进入 LLM 之前先过**有效性闸门**
+（隐藏测试必须在 base 失败、在 fix 通过）—— 白送分的任务与"金标准在本机都跑不过"的任务在这里被拒，
+**一分钱 token 都不花**；成本按**定价快照**（单价 + 核实日期 + 状态）用**实测 usage** 估算；
+agent 异常或 judge 异常**如实写进报告的 `error` 字段**——一个坏掉的 run 绝不会显示成 pass。
 
 ## 7. 落盘产物地图
 
@@ -865,7 +874,8 @@ flowchart LR
 | `data/checkpoints/{sid}/ws/step-N.json` | `workspace.capture` | 每步**全量**清单（受管路径 → sha / missing / base） | `plan()`、`--rewind`、fork 搬 K 之前的清单 |
 | `data/tests_pass.marker` | `mark_tests_pass()` | 测试通过标记 | block-at-submit hook |
 | `.codeagent/rules/learned.md` | `save_learned` | 任务中提炼的约定 | 下次会话的 `discover` |
-| `data/eval/report-*.json` | `eval.runner` | 回归报告 | 人 / CI |
+| `data/eval/report-*.json` | `eval.runner` | 回归报告（**跑分依据**：带 `arm` / `gate` / `pricing_snapshot_id` / `repo_head`） | 人 / CI |
+| `data/eval/ws/{task_id}/` | `golden_tasks.materialize` | 物理剥离出来的评测工作区（**自带一个 `git init` 出来的仓库，无原仓库历史**） | 只有本次 run；默认跑完即删，`--keep` 保留 |
 
 `data/` 与 `workspace/` 全部 gitignore——**产物是运行出来的，不进仓库**。
 

@@ -29,6 +29,32 @@ def test_usage_ratio_zero_denominator():
     assert usage.cache_hit_ratio is None
 
 
+def test_billable_miss_falls_back_when_endpoint_omits_cache_fields():
+    """端点不返回缓存字段时，未命中输入要按 `prompt_tokens - hit` 兜底。
+
+    不兜底会出一个**自相矛盾的报告**：`total_tokens` 把这些输入算进去了，成本公式里
+    它们却按 ¥0 计 —— "token 很多、成本几乎为 0"，两行数字看起来都像真的。
+    """
+    # 完全没返回缓存字段 → 全部输入都是未命中（"没返回" ≠ "命中了"）
+    usage = Usage(prompt_tokens=1000, completion_tokens=10)
+    assert usage.prompt_cache_miss_tokens == 0
+    assert usage.billable_miss_tokens == 1000
+
+    # 只返回了命中字段 → 剩下的都是未命中
+    partial = Usage(prompt_tokens=1000, prompt_cache_hit_tokens=800)
+    assert partial.billable_miss_tokens == 200
+
+    # 真·100% 命中：miss 字段是 0，兜底也必须是 0（不能凭空造出未命中）
+    full = Usage(prompt_tokens=1000, prompt_cache_hit_tokens=1000)
+    assert full.billable_miss_tokens == 0
+
+    # 端点正常返回 → 以端点为准，不做二次推算
+    normal = Usage(
+        prompt_tokens=1000, prompt_cache_hit_tokens=800, prompt_cache_miss_tokens=200
+    )
+    assert normal.billable_miss_tokens == 200
+
+
 def test_usage_iadd_accumulates():
     a = Usage(prompt_tokens=10, completion_tokens=5, prompt_cache_hit_tokens=8, prompt_cache_miss_tokens=2)
     b = Usage(prompt_tokens=20, completion_tokens=10, prompt_cache_hit_tokens=10, prompt_cache_miss_tokens=10)

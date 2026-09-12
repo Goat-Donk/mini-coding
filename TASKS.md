@@ -44,6 +44,59 @@
 - [x] M5-3 控制台检查点回放视图
 - [x] M5-4 更新 TECH_SPEC + commit + push
 
+## M5-5 评估层加固 + 三臂真跑（2026-09-12）★「尺子先可信，再量」
+
+**起点**：M5 那两条跑分（`--limit 2`）**不能作为依据**——侦察后发现的问题不是"样本只有 2 个"这么轻，而是**尺子本身不可信**，且 README 里有一句明确的假话（"绕开了 SWE-bench 的测试泄漏陷阱"，实测不成立）。所以这一轮的目标定为：**先让尺子可信，再量**。
+
+- [x] **M5-5a 物化改「物理剥离」**：放弃 `git worktree add --detach`（它与主仓库**共享对象库与 refs**，fix 提交就在主仓库历史里，agent 一条 `git show <fix_sha>:tests/...` 就能拿到隐藏测试全文与金标准补丁，而 bash 工具只校验 cwd、不校验命令文本）。改为 `git archive base_sha` 流式导出 → 解到隔离区 → `git init -q -b master` + `git add .` + `git commit -m "Base commit for evaluation"`，给 agent「一个没有未来的单一初始提交」。硬判据：`git cat-file -e <fix_sha>` 从 exit 0 → **exit 1**（不是"不可达"，是对象**根本不在**）、`git rev-list --all --count` 748 → **1**、`in-pack: 3812` → `count: 78`、`git remote -v` 空。**每次跑都过一遍 `leak_probe`**，把"不泄漏"从一句声称变成一条**每次跑都测**的量（21/21 成立、0 泄漏）。
+  - 顺带修：归档 tar 流的 `pax_global_header` 里写着 `comment=<base_sha>` → 必须整条流读进内存再解包，**绝不落进工作区**；`mode="r:"`（可 seek）而非流模式 `r|`（遇 symlink 条目会 `StreamError: seeking backwards is not allowed`，实测把 7 个候选记成"闸门自身异常"）；Windows 上 linkname 不是路径的 symlink 建不出来 → 物化后逐条比对并**打印出来**；目标目录已存在 → **自愈**（先删再建并打一行）；`_force_rmtree` 必须清只读位（否则 agent 跑一次 `git gc` 后下一轮清理 `PermissionError`）。
+- [x] **M5-5b 有效性闸门**（SWE-bench FAIL_TO_PASS 式，**进 LLM 之前**跑，零 token 成本）：隐藏测试必须在 **base 失败、在 fix 通过**。base 侧 `rc==0` → 拒（**白送分**）；`rc==1` → 过；`rc==2` → **接受并打标 `base_collect_error`**（收集错误是 2，写成"必须 rc==1"会误杀合法任务）；`rc∈{3,4,5}` → 拒。fix 侧必须 `rc==0`，否则拒「金标准补丁在本机跑不过：这个任务谁都拿不到分」。**fix 侧同时就是 oracle 基线（= 100%）**——没有它，"0% 完成率"和"judge 坏了"在报告上长得一模一样。用 `tempfile.mkdtemp()` 物料，**绝不复用 `ws_root/task.id`**（judge 会把隐藏测试写进传入目录，复用 = 闸门自己制造泄漏）。
+  - **39 个候选 → 21 个有效，拒 18 个**。被拒的头一个就是 README 曾经宣传的那个分子的来源：`e70f9b1d fix: correct Table.update transform type hints` 的源码 diff 逐行核对**只有 1 行 import + 2 行类型注解 + 1 行 docstring，零可执行语句变化**——agent 一个字不改，judge 也给 `109 passed`。
+- [x] **M5-5c 指标诚实性**：`judged = error is None and not patch_failed`（进分母）；`effective_pass = judged and passed and invalid_reason is None`（进分子）。修掉两个漏洞：① `passed` 原先**没按 `error` 过滤**，一个任务可同时 `passed=True` 且 `error!=None`，**进分子不进分母**（极端算例：n=2 → 打印「完成率 100%（1/1）」）；② `steps == 0` 或工作区**零变更**时即使测试通过也标 `invalid`——闸门管不住 agent 改工作区之外的东西（往 site-packages 塞 conftest、装包）让测试变绿。**顺序是硬要求**：快照必须在 `judge` **之前**（judge 会把隐藏测试写回工作区，之后算 diff 永远非零）。
+  - 报告补齐自证字段（`arm` / `model` / `base_url` / `repo_head` / `pricing_snapshot_id` / `gate` / `candidates`）+ 判定字段（`passed_effective` / `patch_error` / `raw_output` / `budget_exhausted` / `judge_tampering`）。**没有自证字段，两份报告是否同一批任务、同一把尺子就无法判定。**
+- [x] **M5-5d `agent/pricing.py` 定价快照**：单价从散在两处的硬编码常量变成带 `id` / `verified_on` / `status` / `note` 的记录，报告里写 `pricing_snapshot_id` + `pricing_note`。查不到价时**不返回 `None`、不抛异常**，回落最近一条 `archived` 快照并如实标注。`deepseek-chat@2025` 的 `verified_on` **刻意留 `None`**——那组价是从 2025 年沿用的常量注释，**从未对着官方定价页核实过**；编一个日期填进去比"未核实"更糟，因为它看起来像核实过。
+- [x] **M5-5e 三臂真跑**（`--arm agent|one-step|single-shot`）：`agent`（多轮循环，`max_steps=25`）/ `one-step`（**一切相同，只把 `max_steps` 25→1**，零风险真受控）/ `single-shot`（无工具、一次调用、要求输出 unified diff 由我们 `git apply`）。跑之前做**六项交叉验证**（模型 / 仓库 HEAD / 定价快照 / 闸门有效数 / 有效任务集 / 候选集），**逐字段一致才出数**。
+- [x] **M5-5f 评测器审计 —— 修 `_FENCE_RE` 围栏配对错位，并做零成本离线重算**（详见下）
+
+### 「评测器审计」这一项值得单独记：5 个假阴性
+
+**bug 本体**（`eval/runner.py:279`）：`_FENCE_RE = re.compile(r"```(?:diff|patch)?[ \t]*\n(.*?)```", re.DOTALL)`——**开围栏只认 ` ``` ` / ` ```diff ` / ` ```patch `**。而模型回复里 diff 块**前面**常有一个 ` ```python ` 代码块，它当不了开围栏 → **围栏配对整个错位一格**：` ```diff ` 行被上一个散文块当成**闭围栏**吃掉，真正的 diff 从此没有开围栏 → `findall` 抠不到 → 落到兜底分支 `text[idx:]`「从 `diff --git` 切到**全文结尾**」→ 把模型后面的说明文字整段喂给 `git apply` → `corrupt patch`。**它一条测试都不会变红，却直接改掉头号指标。**
+
+- **诊断**：`dcf0a013` 上逐字节取证——匹配跨行 27→38、382 字节、闭围栏是 `'复\n\n```'`。写离线脚本做 A/B/C 三档对照：**A（现行解析器）在 7 个任务上复现 0/7 通过**（证明复现忠实），**B（只修围栏 info string）/ C（B + 兜底截断）救回 5/7**，且 **B 与 C 结果完全相同** → 真正起作用的是**围栏配对**，兜底截断只是保险。
+- **归因（7 个全覆盖）**：**5 个是我的解析器**（`dcf0a013` `6a84ca9c` `1e865a86` `f959c8cf` `08305a1e`，修好后都是真通过）；**2 个是模型自己的**（`45a4d4b3` 把相隔十几行的两段拼成一个 hunk，那段上下文根本不存在；`0e1ba9ca` 18,867 字节全在分析、一个 `diff` 都没输出）。
+- **为什么走离线重算而不是改 runner**：`eval/runner.py` 本轮**已冻结**（三条臂必须跑同一份代码，中途改就等于三份分数不可比）。报告里存了每个任务的 `raw_output` → **重抠 + 重落 + 重判，LLM 调用 0 次**。
+- **四条硬不变式**（缺一条，"重算"就退化成"重编故事"）：
+  1. **零 LLM 调用**。它回答的是「**如果解析器没这个 bug 会被判成什么**」，**不是**「模型能打多少分」。
+  2. **先自校验，再出修正值**。第 0 阶段用**现行**解析器重算一遍，必须**逐字段复现**留档聚合（21 / 14 / 11 / 7 / 0）才继续；对不上就说明重算流程本身有问题，此时任何"修正值"都不可信。
+  3. **不覆盖留档**。修正结果写另一个文件（`evalverify/report_single_shot_rescored.json`），`data/eval/report-*.json` 一个字节都不动；输出 JSON 带 `rescored` 溯源块。
+  4. **修复代码只有一份**。`evalverify/diff_extract_fixed.py` 是唯一真相源，两个消费脚本都 import 它——**两份副本 = 迟早漂移**，而这个 bug 的教训正是「解析器会悄悄决定分数」。
+- **结果**：`single-shot` 补丁未应用 7 → 2、通过 11 → 16、分母 14 → 19、**完成率 52.4% → 84.2%**。**两个数都留着**：只报修正值 = 抹掉自己犯过的错，只报原值 = 拿自己的 bug 当模型的能力；差额 5 个任务**全部归解析器**，与模型无关。
+- **顺带确认的一条边界**：`git apply --recount` 能修 hunk 行数，**修不了错的上下文**——`45a4d4b3` 那种拼出来的 hunk，上下文行在文件里根本不存在，`--recount` 救不回来。这条写进了 README 的已知边界。
+
+### 三臂最终数字（同一批 21 个有效任务，同一把尺子）
+
+| | `agent` | `one-step` | `single-shot`（留档） | `single-shot`＊（离线重算） |
+|---|---|---|---|---|
+| 计分（完成率分母） | 21 | 21 | 14 | 19 |
+| 通过 | 14 | 0 | 11 | **16** |
+| 能力完成率（passed / judged） | **66.7%** | 0.0% | 78.6% | **84.2%** |
+| 补丁未应用 | 0 | 0 | 7 | 2 |
+| 撞 `max_steps` | 3（**推定**） | 21（精确） | 0 | 0 |
+| token / 成本 | 2,892,745 / ¥2.0754 | 42,073 / ¥0.0408 | 341,337 / ¥0.8423 | 同留档 |
+| 每次成功修复的边际成本 | ¥0.1482 | — | ¥0.0766 | ¥0.0526 |
+
+- **`agent` ∪ `single-shot`＊ = 19/21 = 90.5%** —— 这是**并集**（两条通路合起来覆盖多少），**不是任何单臂的成绩**。README 里已明确禁止把它写成「agent 的成绩」。
+- **配对四格**（agent vs single-shot＊）：都修好 11 · 只有 agent 3（`0e1ba9ca` `45a4d4b3` `9eaf5626`）· 只有 single-shot 5（`06d64f46` `1e865a86` `5bb3a9e5` `9f55011e` `f3b18d2a`）· 都没修好 2（`03f8df75` `770486ff`）。
+- **解耦归因**：agent 独有 3 = 纯能力 1 · 输出合规 2；single-shot＊ 独有 5 = 纯能力 2 · **预算 3**（那 3 个恰好就是 agent 那 3 个撞 `max_steps` 的任务）。⇒ **剥掉评测器偏差、输出合规、预算之后，真正的能力差异只剩 3 个任务——不足以支撑任何架构结论。**
+- **所以"多轮循环值多少"不能用 `agent` vs `single-shot` 回答**（那个差里混着三样非能力因素）。要测循环本身，看**受控对** `agent` vs `one-step`：**66.7% vs 0%**，两条臂同工具、同提示、同流程，**只差 `max_steps` 一个数**。
+  - ⚠️ 但 `one-step` 的 0/21 **不能读成「循环让模型变聪明了」**：它 21/21 撞满 `max_steps=1`、21/21 工作区**零变更**——它**没有机会**产出改动。这一对量的是「给不给得起第二次机会」，不是「循环的智能」。
+
+### 遗留（已列入下一轮，本轮**不做**）
+
+- **`_FENCE_RE` 的 bug 仍在 `eval/runner.py` 里**：本轮的修复只存在于 `evalverify/`，**没有回写**（三臂代码必须一致）。修正列因此是**反事实口径**，引用时必须与留档列并列。
+- **`conftest.py` 判定器注入绕过**：188 字节 PoC 已验证。为保三臂可比，本轮**统一关闭守卫**，代价是 `judge_tampering` 一律为 `null` —— 那是「**没检查**」不是「查过且干净」。**经事后审计，本轮 21 个任务中未发现任何利用此漏洞的行为。**
+- **`env_timeout` 取证不到**：报告只落了从 `terminated_reason` 派生的一个布尔，没落 `terminated_reason` 本身、也没落工具调用记录 —— "环境把他掐死了"和"真没修对"在数据上**完全同形**。**这一格空着，不拿猜测填。** 要让它可测：`per_task` 里落 `terminated_reason` + 工具调用记录。
+
 ## M6 文档 + 打磨（Day 19–21）
 
 - [x] M6-1 README 完善（mermaid 架构图）+ docs/architecture.md（逐层对应 CC 源码）
@@ -346,7 +399,7 @@ step 5  完成
   - **符号命令表 `_COMMANDS` 是 `/help` 正文的唯一来源**：命令与帮助写在两个地方，迟早出现"帮助里有、实际没有"（或者反过来）。有一条测试断言 `/help` 列出的名字**恰好等于** `_COMMANDS` 的键集合。
   - **退出语必须给出可执行的续跑命令**（M7 教训：一条走不通的指引比没有更糟）。这条让 `_wrap_up` 多做一件事：退出时**无论走了几步都强制落一次检查点** —— 检查点是**按节拍**写的（默认 5 步）且**只在有工具调用的步上 tick**，所以纯聊天、或者只走两三步工具就退出，都写不出检查点，而那行承诺的命令跑起来会直接报"读不到检查点"。**这条是单测与真跑一起挖出来的**（见下）。
   - **每回合报的是增量，不是会话累计**：`RunResult.steps` / `usage` 五个返回点给的都是 `state.step` / `state.usage`。REPL 用回合前后的快照相减 —— 而不是让 loop 再维护第二套"本回合用量"的记账，那就是「两处各写一遍 → 漂移」。**`Usage` 是可变 dataclass，`state.usage += ...` 是原地累加**，所以快照必须 `dataclasses.replace()` 复制；不复制的话相减恒为 0 **且不报错**，只是"每次都说这回合没花钱"。
-  - **测试**：`tests/test_repl.py` **34 例**（本仓第一条 `CliRunner(input=...)` stdin 端到端也在这里，7 例）+ `tests/test_loop.py` 8 例（多回合契约 + `ensure_tool_pairing` 纯函数）+ `tests/test_permissions.py` 2 例。全量 **559 全绿**（原 515；**这是 M9-5 当时的数字**，M9-8 之后为 707）。
+  - **测试**：`tests/test_repl.py` **34 例**（本仓第一条 `CliRunner(input=...)` stdin 端到端也在这里，7 例）+ `tests/test_loop.py` 8 例（多回合契约 + `ensure_tool_pairing` 纯函数）+ `tests/test_permissions.py` 2 例。全量 **559 全绿**（原 515；**这是 M9-5 当时的数字**，M9-8 之后为 707、M5-5 之后为 **769**）。
   - **变异测试 19/19 被抓住**（`m9verify/mutate_m9_5.py`）。八类失效模式各覆盖：每轮预算的起点、回合边界上的复位（`terminated_reason` / `new_turn` 的调用点 / `new_turn` 是否真清 `_turn` / 是否误清 `_always`）、入口重放的去重守卫、中断残局（不补配对 / 补了不记事件）、两条硬不变量（未知命令当任务发 / 半切换）、命令解析（大小写 / `raw` vs `strip` 后的行 / 空行）、增量记账（快照不复制 / `Usage.__sub__` 字段写错）、退出承诺（不强制落检查点 / `/new` 用秒级 id）。**三类需要说明**：
     - **一个证明过的等价变异体**（未设，不留在列表里骗计数）：`loop.py:214` 的 `_run_loop(..., budget_start=state.step)`。改成省略该实参**在任何输入下都不可观测** —— `_run_loop` 的兜底正是 `if budget_start is None: budget_start = state.step`，而两次读 `state.step` 之间没有任何东西改它（`ensure_tool_pairing` 只可能追加 tool 结果消息，`state.task = text` 与 `messages.append` 都不碰 step）。两处是**恒等**的，不是"碰巧一样"。保留显式传参是因为它把"本轮预算从这一步起"写在调用点上（`run_from` 那条路靠兜底，语义不同），不是为了测出什么。
     - **一个依赖时序、如实标注的**：`/new` 用 `unique_session_id` 而不是 `new_session_id`（后者粒度是**秒**）。变异回去之后，`/new` 与起始会话撞 id 需要**两次调用落在同一秒内**才算命中 —— 测试里是几毫秒的事，理论上跨秒就会 MISS。这条防的是**真实缺陷**（两个"不同"的会话静默共用同一个检查点目录，后者覆盖前者、全程不报错），它值得留着，只是不假装它是确定性的。
@@ -378,7 +431,7 @@ step 5  完成
   - **`_FIELD_DECODERS` 那一行是载荷性细节**：`load_state` 走 `AgentState(**raw)`，而 dataclass **不做类型检查** —— 漏了 `"goal"` 这一行，`state.goal` 会是个 `dict`，直到有人读 `.status` 才抛错，而那个炸点被 `_run_loop` 的 `except Exception` 吞成 `terminated_reason="error"`，**看起来像引擎出错**。一条测试 + 一条变异体专门钉它，并把这条纪律写进 `session.py` 的注释。
   - **`/goal` 的解析规则只有两条且必须确定**：带 `--check` 一定是设定；不带 `--check` 且首词是已知子命令（`status`/`pause`/`resume`/`clear`）→ 子命令；两者都不是 → 用法错（**只在命令内失败，不带走 REPL**，有测试钉着）。**已知边界如实记**：目标文本里出现字面 ` --check ` 会被切开 —— **不做引号解析**，加一层"半个 shell"只会造出第二个有歧义的解析器。`/goal X` 在已有未结束目标时**拒绝**（防旧目标的检查命令无声消失，而它是"完成与否"的唯一判据）；`/goal clear` 置 `None` 而**不是**置 `done`（后者会在轨迹里留下一句没发生过的成功）；`/goal resume` 在 `done` 时**拒绝**（完成是终态，能反复"完成"一次的目标等于没有检查）。
   - **`_STOP_REASONS` 每个原因都要有话说**：暂停是自动推进的唯一出口，理由说不清的话人只会看到「它自己停了」。而 `BURST_STOP_REASONS` 里 **`"completed"` 刻意不在**：一个回合"正常跑完"（模型给了文字、不再调工具）恰恰是自动推进要继续的情形 —— 目标的完成与否由人给的检查命令说了算，不由模型停不停下来说了算。
-  - **测试**：`tests/test_goal.py` **38 例**（创建/暂停恢复/清除、三态判定、门禁拦下→invalid、批前复位、截断 40 行、schema 扁平无 `$defs`、REPL 一拍多回合与人工暂停、`dump_state`→`load_state` 回来是 `Goal` 实例、暂停跨进程往返仍门住一拍、`--goal` 不碰 LLM、`/help` 键集合等于 `_COMMANDS`）+ `tests/test_repl.py` / `tests/test_session.py` 补契约。全量 **597 全绿**（原 559；**这是 M9-6 当时的数字**，M9-7 之后为 623、M9-8 之后为 **707**）。
+  - **测试**：`tests/test_goal.py` **38 例**（创建/暂停恢复/清除、三态判定、门禁拦下→invalid、批前复位、截断 40 行、schema 扁平无 `$defs`、REPL 一拍多回合与人工暂停、`dump_state`→`load_state` 回来是 `Goal` 实例、暂停跨进程往返仍门住一拍、`--goal` 不碰 LLM、`/help` 键集合等于 `_COMMANDS`）+ `tests/test_repl.py` / `tests/test_session.py` 补契约。全量 **597 全绿**（原 559；**这是 M9-6 当时的数字**，M9-7 之后为 623、M9-8 之后为 707、M5-5 之后为 **769**）。
   - **变异测试 20/20 被抓住**（`m9verify/mutate_m9_6.py`）：声明直接当完成 / 检查不走门禁链 / 无效→失败 / 无效→通过 / 失败也结束回合 / 通过不结束回合 / 判定不回喂 / 批前不复位 / 跑目标文本而非命令 / 无超时上限 / 漏解码器 / 输出不截断 / 暂停照样推进 / `clear` 实现成 done / 声明能自造目标 / 人工回合不暂停 / 到期不停止 / 恢复时每回合重投。
     - **一个如实标注的 MISS（不是缺陷，是不变式的推论）**：「人工回合不暂停」这个变异体实证 **MISS**，而原因是**结构性的** —— `loop()` 在进提示符前一定先跑一拍，而 `_run_goal_burst` 结尾一定 `_pause_goal(stop)`，所以**人拿到提示符时目标绝不可能是 active**，那句 `_pause_goal` 命中的永远是"已经暂停/已完成"的拒绝分支。这是「一拍 = 一次授权」不变式的直接推论，与动线 ④ 在纯 stdin 流程里不可观测**同源**（见下）。
   - **真实 LLM 端到端五条动线全跑**（DeepSeek 官方通路，真工作区 `m9verify/ws_m96_a|b|c|d|e/`，真 pytest 真跑；日志 `goal_a|b|b2|c|d|e.log` + 驱动脚本 `drive_m9_6.py` 的三个 case）：
@@ -446,7 +499,7 @@ step 5  完成
   - **`--rewind` 默认预览 + 二次确认**（`--force` 跳过）。预览是纯读的：B 动线对**两个目标**（命中快照的第 5 步、走 `base` 分支的第 1 步）各拒绝两次（答 `n` 与答**空**），盘面**逐字节未变**；确认框每次都真的问了。
   - **全局共享对象库 + 跨会话回收**（用户拍板）。`data/snapshots/objects/{sha[:2]}/{sha}.bin`，`fork` **只复制清单、一个对象都不复制**；回收靠**从所有剩余清单现算** live set（`_live_shas`），**不存引用计数**。跨会话边界测试 6 条：`test_objects_are_shared_across_sessions`、`test_two_sessions_really_share_the_base_object`、`test_drop_keeps_objects_another_session_still_references`、`test_drop_reclaims_objects_nobody_references`、`test_corrupted_object_affects_both_sessions_the_same_way`、`test_concurrent_put_object_keeps_one_intact_copy`。
   - **`--fork --step K --rewind`**（用户拍板 P1）：回滚落在"只分叉不续跑"那个 `Exit` **之前**，两件事一起做。真 CLI 子进程验证：退出码 0、分叉警告跟着 `--rewind` 改了口径、文件真的回到第 5 步、收尾给出 `--resume --step 5` 的出口。
-  - **测试**：`tests/test_workspace.py` **785 行 / 49 例**（新建；数字按 `pytest --collect-only` 数），加 `test_cli.py` / `test_repl.py` / `test_session.py` 的接线契约 22 例，全量 **707 passed in 81.36s**。
+  - **测试**：`tests/test_workspace.py` **785 行 / 49 例**（新建；数字按 `pytest --collect-only` 数），加 `test_cli.py` / `test_repl.py` / `test_session.py` 的接线契约 22 例，全量 **707 passed in 81.36s**（M5-5 之后全量为 **769**）。
   - **变异测试**：`m9verify/mutate_m9_8.py`（506 行）**35 条，35/35 全被抓、零 SKIP、零 MISS**（`m9verify/mutate_m9_8.log`）。四个 MISS 全部修掉，其中**三个是测试本身没牙齿**（断言分辨不出差别 / 边界数据缺失 / 用户参数掩盖了被测行为），一个是**脚本自身的锚点缺陷**（`str.replace(..., 1)` 换到了逐字相同的另一个函数上，症状与"MISS"完全同形）。
   - **真实 LLM 动线 A~F**（`m9verify/drive_m9_8.py`，639 行，六份日志）：A 真改动 → 真快照（8 步 / 53676 token / 缓存命中 96% / 11.4s）；B 预览纯读；C 真回滚两条分支（走清单的第 5 步 + 走 `base` 的第 1 步）；D `--fork --step 5 --rewind` 走真 CLI；E 磁盘口径 + 并发探针；F `--snapshots` / `--drop-snapshots`。
   - **实测数字（E 动线，本机 Windows 10 + NTFS，**不许与 README 的 token 数字混着比**）**：
@@ -480,12 +533,14 @@ step 5  完成
 
 ## 进度快照
 
-- 当前里程碑：**M9 全部完成 —— 12 项核心能力清单落地 + M9-8 工作区 rewind 快照（2026-09-12 完成）**。第三批 M9-5 常驻交互模式 REPL、M9-6 ④ Goal；压轴 M9-7 ② sub-agent 并发（2026-09-11，变异 29/29、四条动线真跑）；**M9-8 工作区 rewind 快照 —— 2026-09-12 完成，变异 35/35、六条动线 A~F 真跑、707 测试全绿**。**里程碑清单已清空，无未开工项。**
+- 当前里程碑：**M5-5 评估层加固 + 三臂真跑（2026-09-12 完成）** —— 物理剥离物化 + 泄漏探针、有效性闸门（39 候选 → 21 有效）、指标诚实性、定价快照、三臂真跑、**评测器审计（`_FENCE_RE` 围栏配对错位 → 5 个假阴性 → 零成本离线重算）**。详见上方 M5-5 一节。
+- 上一里程碑：**M9 全部完成 —— 12 项核心能力清单落地 + M9-8 工作区 rewind 快照（2026-09-12 完成）**。第三批 M9-5 常驻交互模式 REPL、M9-6 ④ Goal；压轴 M9-7 ② sub-agent 并发（2026-09-11，变异 29/29、四条动线真跑）；**M9-8 工作区 rewind 快照 —— 2026-09-12 完成，变异 35/35、六条动线 A~F 真跑**。里程碑清单已清空，无未开工项。
 - 上一里程碑：**M8 完成**（P1–P7 全部完成；四项真实验证已跑，见上节）
 - 上一里程碑：**M7 完成**（M7-1~M7-6 + Part C 全部完成；四条真实 LLM 端到端验证 V1–V4 已全跑，工作区 `m7verify/`、`m7verify-nolock/` 已 gitignore）
-- 代码状态：**12,568 行源码 / 30 模块 / 707 测试全绿**（`python -m pytest tests/ -o addopts="" -q` → `707 passed`，无 skip；M9-8 完成时那一次 **81.36s**、2026-09-12 文档同步后又跑一次 **88.47s** —— **用例数稳定，墙钟随机器负载浮动**）
-  - 口径：源码 = `agent/` + `app/` + `eval/` 下的非空 `.py`（不含 `eval/repos/` 克隆仓），模块数 = 其中非空的 `.py` 文件数。**按文件系统数，不按 git 跟踪数** —— 新文件在提交前也该算进去（M9-5 时 `app/repl.py`(503) 与 `tests/test_repl.py`(785) 尚未提交，按 git 数会各少一份，这正是上一条从 8,310 跳到 9,139 里的一部分；M9-6 的 `agent/goal.py`(232) / `agent/tools/goal.py`(118) / `tests/test_goal.py`(927)、M9-7 的 `agent/subagents.py`(540) / `tests/fake_llm.py`、M9-8 的 `agent/workspace.py`(814) / `tests/test_workspace.py`(785) 同理，目前也尚未提交）。
-  - `tests/` 合计 **13,385 行 / 27 个非空 `.py`**（28 个文件，含一个空的 `__init__.py`；上一版 11,809 行；M9-8 的 `tests/test_workspace.py` 785 行 / 49 例是新增的）。
+- 代码状态：**13,636 行源码 / 31 模块 / 769 测试全绿**（`python -m pytest tests/ -o addopts="" -q` → `769 passed`，无 skip；M9-8 完成时那一次 **81.36s**、2026-09-12 文档同步后 **88.47s**、M5-5 完成时 **295.86s** —— **用例数稳定，墙钟随机器负载浮动**；M5-5 那次机器上并发跑过别的东西，不要拿它当基线）
+  - 口径：源码 = `agent/` + `app/` + `eval/` 下的非空 `.py`（不含 `eval/repos/` 克隆仓），模块数 = 其中非空的 `.py` 文件数。**按文件系统数，不按 git 跟踪数** —— 新文件在提交前也该算进去（M9-5 时 `app/repl.py`(880) 与 `tests/test_repl.py` 尚未提交，按 git 数会各少一份，这正是上一条从 8,310 跳到 9,139 里的一部分；M9-6 的 `agent/goal.py`(232) / `agent/tools/goal.py`(118) / `tests/test_goal.py`(927)、M9-7 的 `agent/subagents.py`(540) / `tests/fake_llm.py`、M9-8 的 `agent/workspace.py`(814) / `tests/test_workspace.py`(785)、**M5-5 的 `agent/pricing.py`(181) / `tests/test_pricing.py`** 同理，目前也尚未提交）。
+  - `tests/` 合计 **14,551 行 / 28 个非空 `.py`**（29 个文件，含一个空的 `__init__.py`；上一版 13,385 行 / 27 个；M5-5 新增 `tests/test_pricing.py`，并给 `test_golden_tasks.py`（24→25 例）与 `test_eval_runner.py`（28→37 例）补了闸门 / 指标口径 / 三臂 / 快照成本的用例）。
+  - M5-5 的验证脚本在 `evalverify/`（**gitignore**，同 `m9verify/` 惯例）：`diff_extract_fixed.py`（修复逻辑唯一真相源）/ `rescore_single_shot.py`（离线重算，零 LLM）/ `reanalyse_patch_failed.py`（逐任务取证）/ `drive_three_arms.py`（三臂大对照）/ `drive_isolation_report.py` / `drive_judge_gaming.py` / `mutate_m5_5.py` + 各步日志与修正版报告 JSON。
   - 验证脚本：`m9verify/mutate_m9_8.py`(506 行) / `m9verify/drive_m9_8.py`(639 行) + 六份动线日志。
 - **M8 期间发现并修复的真 bug（真跑挖出来的，不是单测挖的）**：
   1. **`update_plan` 的引导缺失（elicitation gap）**：工具实现了、测试全绿、计划也能落盘 —— 但 system prompt 里**一个字都没提它**，模型 6 步跑完一次都没调。修法：prompt 里写明"任务复杂时先调 `update_plan` 排一份 3~6 步的简短计划"。修前 0 次 / 修后 2 次（同 P7-c 表）
@@ -523,6 +578,7 @@ step 5  完成
      - **门禁链（最关键）**：三组对照证明确实**不是绕过治理的后门** —— A 组（无权限无 hook）**放行**；B 组（`{"tools": {"get_current_time": "deny"}}`）被**权限拒绝**；C 组（PreToolUse hook 阻断）被 **hook 拦下**。附带收获：B/C 两组里模型如实回答"没能拿到时间，也不会凭空编"，没有编造时间
 - 已知待改进（未修）：
   - ~~**真实跑分用的是临时通路，待换官方口径重跑**~~ ✅ **已完成（2026-09-10）**：用 DeepSeek 官方 `deepseek-chat` 重跑 `python -m eval.runner --limit 2` → 完成率 50%（1/2）、62,812 token、¥0.0625、缓存命中 83%；README 的跑分与缓存曲线已全部换成官方口径（曲线为真·冷启动：step1 0% → 累计 77%）。历史 DashScope 数字只作为口径说明里的对照保留，并注明不可直接比。
+    - ⚠️ **数字漂移已修（M5-5）**：上面那组 `62,812 / ¥0.0625 / 83%` 是 **2026-09-10 那一次**的事实，不是"当前数字"。M9-2 之后同一条命令重跑为 **82,495 / ¥0.0769 / 82%**（`default()` 多了两个工具的 schema），而 M5-5 之后 `--limit 2` 这组**已经不再是可引用的跑分**——那两个任务里有一个（`e70f9b1d`）被有效性闸门判定为**白送分**（隐藏测试在 base 就通过）。**同一条命令在三处写了两组"最新"数字这件事本身就是缺陷**，所以从此统一口径：**只有 `data/eval/report-*.json` 里带 `pricing_snapshot_id` 的那份报告是跑分依据**，本文档只做历史记录。
   - **M6-7 的真实模型验证已补跑**（2026-09-10，DeepSeek 官方 `deepseek-chat`）：修 bug 任务 **5 步**修好（10,112 token / 缓存命中 73%）；kill → `--resume` 恢复后**第 4 步直接 `edit(path=calc.py)`**，无重新探路、无磁盘遍历，续跑至 11 步完成（缓存命中 90%）。轨迹扫描「瞎猜路径」4 类模式（`/workspace`、`C:\Users\<字母>`、`dir C:\Users`、全盘搜索）**无命中**
   - CLI 流式输出这条**已真实可见**（事件随步实时打印）；system prompt 注入工作目录这条的收益**见上条第 3 点的更正口径**
   - ~~Streamlit 控制台没在浏览器里真开过~~ ✅ **已完成（2026-09-10）**：用真实 Chrome（CDP 驱动）打开 `http://localhost:8600`，**并操作控件跑通了一个 mock 任务**——勾 mock、输入任务、点"开始任务"，页面出现"事件日志（3 条）"[步1] glob → [步2] 0 工具调用、缓存命中率曲线、会话 `s20260910-194424`、检查点回放、"✅ 最终结论"与"终止原因 completed · 步骤 2"。**控制台在真实浏览器里可用，不只是 AppTest 能过**

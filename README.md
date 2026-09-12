@@ -4,8 +4,8 @@
 **核心循环手写**（不套 LangGraph / Agent SDK），支撑层用成熟库（openai SDK / pydantic v2 / streamlit / typer / pytest）。
 
 > **一句话**：把 Claude Code 的架构用 Python 重写一遍——不是移植代码，是移植设计。
-> 12,568 行源码 / 30 个模块 / 707 个测试。真实跑分见[评估章节](#评估eval)。
-📄 文档：[技术方案 `docs/TECH_SPEC.md`](docs/TECH_SPEC.md) · [架构详解 `docs/architecture.md`](docs/architecture.md) · [任务清单 `TASKS.md`](TASKS.md) · [参考笔记 `docs/reference/`](docs/reference/)
+> 13,636 行源码 / 31 个模块 / 769 个测试。真实跑分见[评估章节](#评估eval)。
+📄 文档：[技术方案 `docs/TECH_SPEC.md`](docs/TECH_SPEC.md) · [架构详解 `docs/architecture.md`](docs/architecture.md) · [任务清单 `TASKS.md`](TASKS.md) · [**评估三臂结论汇总（一页纸）**](docs/eval_three_arms_summary.md)（[HTML 版，双击即开](docs/eval_three_arms_summary.html)） · [参考笔记 `docs/reference/`](docs/reference/)
 
 ---
 
@@ -361,15 +361,19 @@ server 声明的 `resources` / `prompts` 能力会额外注册 `read_resource` /
 **跑评估**（真实仓库 + 隐藏测试判定）：
 
 ```bash
-python -m eval.golden_tasks --clone --limit 10   # 拉 tinydb，列出真实 fix 提交
-python -m eval.runner --limit 3                  # 跑 3 个黄金任务，出回归报告
-python -m eval.runner --limit 2 --mock           # 无 key 冒烟：只验证管线连通
+python -m eval.golden_tasks --clone --limit 10       # 拉 tinydb，列出真实 fix 提交
+python -m eval.runner --limit 39 --mock              # 无 key：闸门逐条流式判定 + 报告（零成本）
+python -m eval.runner --limit 39 --arm agent         # 三臂对照：完整循环（需要 .env key）
+python -m eval.runner --limit 39 --arm one-step      # 三臂对照：只跑一步（其余全同）
+python -m eval.runner --limit 39 --arm single-shot   # 三臂对照：无工具、一次调用出 diff
 ```
+
+> ⚠️ `--limit` 是传给**发现阶段**的（`discover_fix_commits(repo, limit=...)`），不是"跑几个任务"。闸门过后 39 个候选里只有 21 个有效，所以**想跑满有效任务必须给 `--limit 39`** —— 给 21 会漏掉一半。
 
 **测试**：
 
 ```bash
-python -m pytest tests/                  # 707 passed（不传第二个 -q，否则那行汇总不打印）
+python -m pytest tests/                  # 769 passed（不传第二个 -q，否则那行汇总不打印）
 ```
 
 ---
@@ -379,10 +383,16 @@ python -m pytest tests/                  # 707 passed（不传第二个 -q，否
 评估集**不是编的**：`eval/golden_tasks.py` 直接读 tinydb 的 git history，筛出「subject 含 fix 关键字 **且**同时改了源码与 tests」的提交，然后：
 
 - `task_text` = 该提交的 subject + body（**真实 bug 报告**，不重写）
-- `base_sha` = 该提交的**父提交**（bug 存在状态，`git worktree add --detach` 物化成干净工作区）
+- `base_sha` = 该提交的**父提交**（bug 存在状态；`materialize` 用 `git archive` 导出 tree + 在隔离区 `git init` 做**物理剥离**，见下）
 - `hidden_tests` = 该提交里 `tests/` 的新内容——**agent 全程看不到**，只在 judge 阶段覆盖写回跑 pytest
 
-这样绕开了 SWE-bench 类任务的两个经典陷阱：**测试泄漏**（判定测试被 agent 读到）和**任务描述失真**（把真实 bug 改写成谜语）。
+**进入 LLM 之前先过有效性闸门**（SWE-bench FAIL_TO_PASS 式，零 token 成本）：隐藏测试必须在 `base_sha` **失败**、在 `fix_sha` **通过**。白送分的任务（base 就通过）与「金标准补丁在本机跑不过」的任务在这里被拒，**一分钱都不花**。`fix_sha` 同时就是 **oracle 基线（= 100%）**——没有它，「完成率 0%」和「judge 坏了」在报告上长得一模一样。
+
+### 为什么不是 `git worktree`
+
+早期版本用 `git worktree add --detach` 隔离工作区，而**它根本不隔离**：worktree 与主仓库**共享对象库与 refs**，fix 提交就在主仓库历史里。agent 在自己工作区里一条 `git show <fix_sha>:tests/test_xxx.py` 就能拿到隐藏测试全文、`git show <fix_sha>:tinydb/table.py` 就是金标准补丁 —— 而 bash 工具只校验 cwd、不校验命令文本。**「隐藏测试只在 judge 时才写回」挡不住这条路：答案早就在房间里了。**
+
+现在改成**物理剥离**：`git archive base_sha` 导出 tree 解到隔离区，在里面 `git init` + 一个 `Base commit for evaluation` 提交，给 agent「一个没有未来的单一初始提交」。agent 仍然有 git 可用（能 `git diff` 看自己的改动），但工作区的 **git 历史是评测生成的，不包含任何原仓库历史**。每次跑都有一条**泄漏探针**把这条断言测成一个量：`git cat-file -e <fix_sha>` 必须非零退出（不是"不可达"，是对象**根本不在这个仓库里**）。
 
 `python -m eval.golden_tasks --clone --limit 10` 在本机真实发现的提交（前 6 条）：
 
@@ -392,43 +402,135 @@ e70f9b1d  fix: correct Table.update transform type hints (#621)
 76d21d26  fix: skip missing doc_ids in Table.update and Table.remove (#616)
 dcf0a013  fix: correctly handle falsy values in LRUCache
 781fb6ca  fix: LRUCache.set update cache value when key exists
-1fa99fb3  fix: make query callables work again
+3d74d724  chore: fix a lot of typos
 ```
+
+> ⚠️ 关键字（`fix`/`bug`/…）**只负责缩小候选集，不负责判定谁是"真 bug 修复"**——那由闸门用事实说了算。所以第 6 条 `chore: fix a lot of typos` 会走进来，然后在闸门处被拒。这样「一个 typo 提交该不该算任务」不再是一个人的口味判断，而是可复核的事实。
 
 > ⚠️ **关于 mock 冒烟**：`--mock` 只验证管线连通。MockLLM 不修 bug，所以完成率必然是 0 —— 那是**正确**的判定结果（测试真的跑了并且真的失败），不是 bug。
 
 ### 实测结果（真实跑分，非预置）
 
-下面这组数字是**本机真实跑出来的**（DeepSeek 官方 API `https://api.deepseek.com` + `deepseek-chat`），不是写死在仓库里的：
+下面这组数字是**本机真实跑出来的**（DeepSeek 官方 API `https://api.deepseek.com` + `deepseek-chat`），不是写死在仓库里的。三条臂跑的是**同一批 21 个通过闸门的有效任务**：
 
 ```
-$ python -m eval.runner --limit 2
-完成率 50%（1/2 个有效任务） · token 82,495 · 估算成本 ¥0.0769 · 平均缓存命中率 82%
-
-  ✗ 770486ff  fix: freeze unhashable args in Query.test…    8步 45961t ¥0.041  21.2s
-  ✓ e70f9b1d  fix: correct Table.update transform type hints 8步 36534t ¥0.036  18.3s
-报告已存: data/eval/report-20260911-112304.json
+$ python -m eval.runner --limit 39 --arm agent        # 21 个有效任务
+$ python -m eval.runner --limit 39 --arm one-step
+$ python -m eval.runner --limit 39 --arm single-shot
 ```
 
-判定依据（judge 跑隐藏测试的真实输出，已落进报告）：
+跑之前先做**六项交叉验证**（模型 / 仓库 HEAD / 定价快照 / 闸门有效数 / 有效任务集 / 候选集），**逐字段一致才出数**；任何一项对不上就在打印数字**之前**终止输出。三条臂跑的必须是同一把尺子。
 
-| 任务 | judge 输出 | 结论 |
+| | `agent`（多轮循环） | `one-step`（只差 `max_steps=1`） | `single-shot`（无工具、一次调用） |
+|---|---|---|---|
+| 有效任务 | 21 | 21 | 21 |
+| 计分（= 完成率分母） | 21 | 21 | 19 |
+| **通过** | **14** | **0** | **16** |
+| **完成率（passed / 计分）** | **66.7%** | **0.0%** | **84.2%** |
+| 完成率（passed / 有效任务） | 66.7% | 0.0% | 76.2% |
+| 撞 `max_steps` | 3（**推定**） | 21（精确） | 0 |
+| token | 2,892,745 | 42,073 | 341,337 |
+| 估算成本 | ¥2.0754 | ¥0.0408 | ¥0.8423 |
+| 每次成功修复的边际成本 | ¥0.1482 | — | ¥0.0526 |
+| oracle 基线（金标准补丁） | 100% | 100% | 100% |
+
+> **历史记录（与上表同时引用）**：`single-shot` 的**留档值是 11/21 = 52.4%**（7 个补丁未落地）。经逐条复查，其中 **5 个是本项目评测器的解析器缺陷造成的假阴性**（`_FENCE_RE` 围栏配对错位，机制见下节），与模型无关；经**零成本离线重算**修正为 **16/19 = 84.2%**。上表用的是修正后的数字。
+
+> 两个完成率**含义不同**：分母 `judged` 已经把「补丁未落地」和「判定器没跑成」摘掉了（那两类是**我这边**的锅，不该算模型没修好）。分母不同的百分比**不能相减**。
+
+**核心结论**：
+
+- **多轮循环的价值是被证明的。** `agent` 对 `one-step` 是 **66.7% vs 0%** —— 压倒性优势。这两条臂同工具、同提示、同流程，**只差 `max_steps` 一个数**，是全套里唯一的受控对。`one-step` 21/21 撞满一步预算、21/21 工作区零变更：**没有循环就产出不了改动**。
+- **单臂之间的能力差距在样本内不显著。** `agent`(14) 与 `single-shot`(16) 落到同一批任务上，把解析器偏差、输出合规、步数预算三样非能力因素剥掉之后，**真正的能力差异只有 3 个任务**。21 个样本里的 3 个差异**不足以支撑「谁更强」的结论**。
+
+> ⚠️ **不要把「并集 90.5%」写成 `agent` 的成绩。** 那是 `agent ∪ single-shot`「两条通路合起来覆盖多少」，**不是任何单臂的数字**。单臂就是单臂，两回事。
+
+**失败分类（每个任务恰好归一类，不是"一个百分比"；`single-shot` 列为修正后）**：
+
+| 分类 | `agent` | `one-step` | `single-shot` |
+|---|---|---|---|
+| 通过 | 14 | 0 | 16 |
+| 真没修对（判定器跑通、补丁落地、测试就是不过） | 7 | 21 | 3 |
+| 补丁未应用（**我这边**的锅） | 0 | 0 | 2 |
+| 判定器故障 | 0 | 0 | 0 |
+| 不计分（白送分 / 零变更） | 0 | 0 | 0 |
+
+> 留档那份 `single-shot` 的这一行是「补丁未应用 7、通过 11」。
+
+> `env_timeout`（agent 在自己工作区里跑 pytest、撞上 bash 工具的 120s 超时）**取证不到**：报告只落了从 `terminated_reason` 派生的一个布尔，没落 `terminated_reason` 本身、也没落工具调用记录 —— "环境把他掐死了"和"真没修对"在数据上完全同形。**这一格空着，不拿猜测填。**
+
+#### 一次评测器自查：5 个假阴性是怎么找出来的
+
+`single-shot` 交补丁这件事要过我自己写的 diff 抠取器。那个抠取器有个 bug：`_FENCE_RE` 的开围栏只认 ` ``` ` / ` ```diff ` / ` ```patch `，而模型回复里 diff 块**前面**常有一个 ` ```python ` 代码块 —— 那个围栏当不了开围栏，于是**围栏配对整个错位一格**，` ```diff ` 被上一个散文块当成**闭围栏**吃掉，真正的 diff 从此没有开围栏。抠不到就落到兜底分支「从 `diff --git` 一路切到全文结尾」，把模型后面的说明文字整段喂给 `git apply` → `corrupt patch`。
+
+**7 个「补丁未应用」里 5 个是这一个机制造成的。** 另 2 个确实是模型自己的问题：`45a4d4b3` 把文件里相隔十几行的两段拼成一个 hunk（那段上下文根本不存在），`0e1ba9ca` 18,867 字节全在分析、一个 `diff` 都没输出。
+
+`eval/runner.py` 在本轮**已冻结**（三条臂必须跑同一份代码，中途改就等于三份分数不可比），所以走**离线重算**：报告里存了每个任务的 `raw_output`，用修好的抠取器**重抠 + 重落 + 重判**，**不调用任何 LLM**。重算前先做自校验 —— 用**现行**解析器重算一遍，必须逐字段复现留档数字（21 / 14 / 11 / 7 / 0）才继续，否则说明重算流程本身有问题。
+
+| `single-shot` | 通过 | 计分分母 | 补丁未应用 | 完成率（/有效任务） | 完成率（/计分） |
+|---|---|---|---|---|---|
+| 留档（当时的解析器） | 11 | 14 | 7 | 52.4% | 78.6% |
+| **修正（修好的解析器）** | **16** | **19** | **2** | **76.2%** | **84.2%** |
+
+> **原 52.4% 系评测系统解析器缺陷（5 个假阴性）导致，经离线重算修正后真实完成率为 84.2%（16/19）。**
+>
+> **为什么两个数字都留着**：只报修正值 = 抹掉自己犯过的错；只报原值 = 拿自己的 bug 当模型的能力。差额 5 个任务**全部归解析器**，与模型无关。
+>
+> 口径边界（必须一起引用）：修正是**离线重算**，不是重跑 —— 模型当时的输出是既成事实，变的只有解析侧。它回答「如果解析器没这个 bug 会被判成什么」，**不是**「模型能打多少分」。而且那个 bug **仍在 `runner.py` 里**（本轮只冻结不改），修正只存在于 `evalverify/`，属反事实口径。
+
+#### 配对比较：聚合百分比会骗人
+
+两条臂的分母不同（19 vs 21），直接相减毫无意义。落到**同一批任务**上逐个看：
+
+| `agent` vs `single-shot` | 个数 | 任务 |
 |---|---|---|
-| `770486ff` | `1 failed, 32 passed` — `TypeError: unhashable type: 'dict'` 仍在 | 没修好 |
-| `e70f9b1d` | `109 passed` | 真修好了 |
+| 都修好 | 11 | — |
+| 只有 `agent` 修好 | 3 | `0e1ba9ca` `45a4d4b3` `9eaf5626` |
+| 只有 `single-shot` 修好 | 5 | `06d64f46` `1e865a86` `5bb3a9e5` `9f55011e` `f3b18d2a` |
+| 都没修好 | 2 | `03f8df75` `770486ff` |
+| **并集（任一臂修好）** | **19/21 = 90.5%** | — |
+
+> 并集是「两条通路合起来覆盖多少」，**不是任何单臂的成绩** —— 它常被误记成「agent 的成绩」。
+> 与上表同理，这个并集也有两个数：**留档 18/21 = 85.7% → 修正后 19/21 = 90.5%**（多出来的那一个是 `1e865a86`：`agent` 修不好、`single-shot` 因解析器 bug 被误判为没修好）。
+
+把这 8 个独占任务**按原因归类**，才能把「循环的收益」和「评测器偏差」拆开：
+
+| 独占方 | 原因 | 个数 |
+|---|---|---|
+| 只有 `agent` | 输出合规（`single-shot` 没输出 diff / 上下文对不上） | 2 |
+| 只有 `agent` | **纯能力** | 1 |
+| 只有 `single-shot` | 预算（`agent` 撞满 25 步） | 3 |
+| 只有 `single-shot` | **纯能力** | 2 |
+
+⇒ **剥掉评测器偏差、输出合规、预算之后，真正的能力差异只剩 3 个任务** —— 样本这么小，**不足以支撑任何架构结论**。所以「多轮循环值多少」这个问题本轮**不能用 `agent` vs `single-shot` 回答**（那个差里混着三样非能力因素）；要测循环本身，只有 `agent` vs `one-step` 这一对是干净的（同工具、同提示、同流程，**只差 `max_steps` 一个数**）。
+
+> ⚠️ 而 `one-step` 的 0/21 也**不能读成「循环让模型变聪明了」**：它 21/21 撞满 `max_steps=1`、21/21 工作区零变更 —— 它**没有机会**产出改动。这一对量的是「给不给得起第二次机会」，不是「循环的智能」。
+
+#### 本轮数据的已知局限（只引数字不引这一节 = 误引）
+
+1. **网络寻源未阻断**：eval 用的工具集里有 `web_fetch` / `web_search`，而 `task_text` 带着 commit subject（常含 `(#618)` 这类 issue 号）—— agent 可以去 GitHub 把提交连同修复一起搜出来。隔离验证只证明了**本地**那条路是断的（21/21 隔离成立、0 泄漏）；报告的 `per_task` **不含工具调用记录**，所以做不到逐任务查证。逐任务表里的 `*` 是**一律标注**，不是查证结果。
+2. **`env_timeout` 取证不到**（见上）。
+3. **判定器有已知绕过**（`conftest.py` 注入，188 字节 PoC 已验证）。为保三条臂可比，本轮统一沿用该口径 —— 代价是 `judge_tampering` 一律为 `null`，那是「**没检查**」不是「查过且干净」。**经事后审计，本轮 21 个任务中未发现任何利用此漏洞的行为**，该漏洞已列入下一轮评估的修复计划。
+4. **样本量**：21 个有效任务**全部来自 tinydb 一个仓库、一个语言、一个测试风格**。完成率**不能外推**到别的语言/仓库；它证明的是「这套流程在本仓库上跑得通」。
+5. **成本是按快照单价估算的值，不是账单** —— `deepseek-chat` 已不在官方定价页列示（见下）。
+6. **`budget_exhausted` 对 `agent` 臂是推定的**（那份报告跑在字段落地之前，只能按 `steps == max_steps` 猜）。引用时必须写明「推定」。
+
+> 上面这组三臂数字**取代**了早先 `--limit 2` 的那组（完成率 50%，1/2）。旧数字里的分子 `e70f9b1d`（只改类型注解、零可执行语句变化）**已被闸门判为白送分并拒掉** —— 所以那个「50%」的真身是：一个真 bug 未修 + 一个不需修就能过。这正是闸门的价值：它砍掉的第一个数字就是我们自己曾经宣传过的那个。
 
 > **口径说明（必读）**：
 > - 本组数字来自**项目选定通路**（DeepSeek 官方，代码默认值即此），缓存命中率是官方 `usage.prompt_cache_hit_tokens` / `(hit+miss)` 的**原生口径**。
-> - **这组数字在 M9-2 之后重跑过，与之前的 62,812 / ¥0.0625 / 83% 不可直接比**：M9-2 把 `web_fetch` / `web_search` 注册进了 `ToolRegistry.default()`，而 eval 用的就是这个 `default()` —— 于是两个工具的 schema 进了每次请求的 tools 段，token 从 62.8k 升到 82.5k（+31%）。**判定结论一字未变**（两个任务的 judge 输出完全相同：`1 failed, 32 passed` / `109 passed`）。这是「给 agent 加能力」的诚实代价：能力不是免费的，多两个工具的 schema 就要多付 token。
-> - 早期曾用 DashScope（阿里百炼）的 OpenAI 兼容端点 + `deepseek-v4-flash` 做过一次临时验证（同一批任务：1/2 完成、269,767 token、命中率 89%）。那是**临时手段、已弃用**，两组的命中率口径不同、数值不可直接比。同样的任务在官方 `deepseek-chat` 上步数与 token 都显著更低（12/25 步 → 8/8 步，269.8k → 62.8k token，M9-2 后为 82.5k），但**样本只有 2 个任务，不足以支撑"某模型更强"的结论**，仅作记录。
-> - 本机 agentrouter 的 key 走不通（它只放行 Claude Code 客户端，自写程序一律 `401 unauthorized client detected`，实测 6 种认证头组合 × 2 个端点全部 401）。要接自己的程序，用官方 API key。
-> - **换自己的 key 重跑即可复现**：`python -m eval.runner --limit 2`。
+> - 三臂的 token 总量**不可横向比出"谁更省"**：`agent` 跑满 25 步的循环、`single-shot` 一次调用但要把整包源码塞进 prompt，两者的 token 花在完全不同的地方。比成本请看「每次成功修复的边际成本」那一行。
+> - **与更早的 `--limit 2` 那组（62,812 / ¥0.0625 / 83%，重跑后 82,495 / ¥0.0769 / 82%）不可直接比**：那一组只有 2 个任务、没开闸门、且分子里有一个后来被判定为白送分的任务。M9-2 把 `web_fetch` / `web_search` 注册进 `ToolRegistry.default()` 后，两个工具的 schema 进了每次请求的 tools 段，token 从 62.8k 升到 82.5k（+31%）—— 这是「给 agent 加能力」的诚实代价：能力不是免费的。
+> - 早期曾用 DashScope（阿里百炼）的 OpenAI 兼容端点 + `deepseek-v4-flash` 做过一次临时验证。那是**临时手段、已弃用**，两组命中率口径不同、数值不可直接比。本机 agentrouter 的 key 走不通（只放行 Claude Code 客户端，自写程序一律 `401 unauthorized client detected`，实测 6 种认证头组合 × 2 个端点全部 401）—— 要接自己的程序，用官方 API key。
+> - **换自己的 key 重跑即可复现**：`python -m eval.runner --limit 39`（默认 `agent` 臂；换臂加 `--arm one-step` / `--arm single-shot`）。
 
 **一个真实踩过的坑（已修 + 已加回归测试）**：tinydb 的 `pytest.ini` 写死了 `--cov-append --cov-report term --cov tinydb`，本机没装 pytest-cov 时 pytest 会以 **usage error（退出码 4）直接退出**——测试一次都没跑。而 judge 原本只看 `returncode == 0`，于是把它算成"agent 没修好"，完成率被压成假的 **0%**。修法：judge 用 `-o addopts=` 清掉仓库自带 addopts，并把退出码 2/3/4/5（压根没跑成）识别为**无效判定**计入 `error`，不再污染完成率。同一个 bug 修前修后：`0/2` → `1/2`。
 
 **一条方法论上的自我更正**：M6-7 里我把「往 system prompt 注入工作目录」的 commit message 写成了「修 `--resume` 迷路的真根因」。后来用**同一任务、同一仓库、只换 system prompt** 做了 A/B，**步数收益没复现**（6 步 vs 6 步，两边都修好、都无瞎猜路径；`--resume` 续跑场景同样无差别）。因此如实改口径为**防御性健壮性改进**，并单独记录探针挖到的真差异：本机 `pwd` 被 Git for Windows 的 `pwd.exe` 抢占，返回 `/d/...` 这种 **POSIX 路径**（在 Windows 上不是合法路径），`cd` 才是对的——已写进平台提示。详见 [TASKS.md](TASKS.md) 与 [docs/interview_guide.md](docs/interview_guide.md) §10。
 
-报告字段：完成率（分母只算有效判定）/ 逐任务 steps / token / 耗时 / 成本（按 DeepSeek 公开定价 ¥0.5·¥2·¥8 每 M tokens 估算）/ 缓存命中率 / **judge 的 pytest 摘要**；agent 或 judge 抛异常会**如实记入 `error` 字段**，不会伪装成通过。
+报告字段：**自证字段**（`arm` / `model` / `base_url` / `repo_head` / `pricing_snapshot_id` / `gate`（候选数、有效数、逐条拒绝理由）/ `candidates`）—— 没有这些，两份报告是否同一批任务、同一把尺子就无法判定；**判定字段**：完成率（分母只算有效判定）/ 逐任务 steps / token / 耗时 / 成本 / 缓存命中率 / **judge 的 pytest 摘要** / `passed` 与 `passed_effective`（分子必须同时 `¬error`、`¬invalid`）/ `patch_failed` + `patch_error` + `raw_output`（补丁没落地时，模型的原始输出存进报告，**能不能翻案有据可查**）/ `invalid_reason` / `zero_change` / `leak_reachable` / `budget_exhausted` / `judge_tampering`（`null` = 本轮没查，**不是**"查过且干净"）；agent 或 judge 抛异常会**如实记入 `error` 字段**，不会伪装成通过。
+
+**成本按「定价快照」估算**（`agent/pricing.py`）：单价不再是散在两处的硬编码常量，而是一条带 `id` / `verified_on` / `status` 的记录，报告里同时写入 `pricing_snapshot_id` 与 `pricing_note`。这样历史报告里的成本永远按**它当时**的价算，官方页面改价不会把旧报告变成假话。当前项目跑的 `deepseek-chat` 对应快照 `deepseek-chat@2025`，其 `status` 是 **`archived`**、`verified_on` 是 **`None`** —— 那组价是项目从 2025 年沿用的常量注释，**从未对着官方定价页核实过**（不编一个日期填进去：编出来的日期比"未核实"更糟，因为它看起来像核实过）。口径是**「已不在定价页列示」**：2026-09-12 中英文页各复核一次全页零命中 `deepseek-chat`，而页脚注只点名 `deepseek-v4-flash` 等别名"仍可调用、对应模型已下线"，`deepseek-chat` **不在那份名单里** —— 所以能确定的只是"不在定价页列示"，**不是"已下线"**（2026-09-11 实测仍能正常调用）。查不到价时 `resolve()` **不返回 `None`、不抛异常**，回落到最近一条 `archived` 快照并如实标注。
 
 ---
 
@@ -436,7 +538,7 @@ $ python -m eval.runner --limit 2
 
 | 层 | 文件 | 行数 |
 |---|---|---|
-| 核心循环 | `agent/loop.py` `llm.py` `state.py` `context.py` `tool_result.py` `session.py` | 2,835 |
+| 核心循环 | `agent/loop.py` `llm.py` `state.py` `context.py` `tool_result.py` `session.py` | 2,849 |
 | 目标 | `agent/goal.py` | 232 |
 | 子代理 | `agent/subagents.py` | 540 |
 | 工作区快照 | `agent/workspace.py` | 814 |
@@ -444,13 +546,14 @@ $ python -m eval.runner --limit 2
 | 技能 | `agent/skills.py` | 281 |
 | 工具 | `agent/tools/base.py` `bash.py` `files.py` `web.py` `subagent.py` `ask.py` `plan.py` `goal.py` `skills.py` | 2,321 |
 | MCP | `agent/mcp.py` | 961 |
-| 入口 | `app/cli.py` `repl.py` `ui_streamlit.py` `replay.py` | 2,575 |
-| 评估 | `eval/golden_tasks.py` `runner.py` | 490 |
-| **源码合计** | **30 个模块** | **12,568** |
-| 测试 | `tests/` | 13,385（707 个用例） |
+| 定价快照 | `agent/pricing.py` | 181 |
+| 入口 | `app/cli.py` `repl.py` `ui_streamlit.py` `replay.py` | 2,579 |
+| 评估 | `eval/golden_tasks.py` `runner.py` | 1,359 |
+| **源码合计** | **31 个模块** | **13,636** |
+| 测试 | `tests/` | 14,551（769 个用例） |
 
 > 口径：源码 = `agent/` + `app/` + `eval/` 下**非空** `.py` 文件的**全部行数**（含空行；不含 `eval/repos/` 下的克隆仓，它被 gitignore）；模块数 = 其中**非空**的 `.py` 文件数（4 个空 `__init__.py` 不计）。
-> **按文件系统数，不按 git 跟踪数** —— 新文件在提交前也该算进去（M9-5 的 `app/repl.py`(503) 与 `tests/test_repl.py`(785)、M9-6 的 `agent/goal.py`(232)、M9-7 的 `agent/subagents.py`(540)、M9-8 的 `agent/workspace.py`(814) 与 `tests/test_workspace.py`(785) 当时都尚未提交）。
+> **按文件系统数，不按 git 跟踪数** —— 新文件在提交前也该算进去（M9-5 的 `app/repl.py`(880) 与 `tests/test_repl.py`、M9-6 的 `agent/goal.py`(232)、M9-7 的 `agent/subagents.py`(540)、M9-8 的 `agent/workspace.py`(814)、M5-5 的 `agent/pricing.py`(181) 当时都尚未提交）。
 
 ---
 
@@ -459,15 +562,16 @@ $ python -m eval.runner --limit 2
 ```
 coding_agent/
 ├── CLAUDE.md              # 精炼约定 + 索引（新会话自动加载）
-├── TASKS.md               # 勾选式任务清单（M1~M9，进度快照）
+├── TASKS.md               # 勾选式任务清单（M1~M9 + M5-5 评估层加固，进度快照）
 ├── docs/
 │   ├── TECH_SPEC.md       # 详细技术方案：签名 / 数据结构 / 边界 / 测试用例
 │   ├── architecture.md    # 架构详解（逐层对应 CC 源码）
 │   ├── interview_guide.md # 面试讲解稿
+│   ├── eval_three_arms_summary.md # 评估三臂结论汇总（一页纸）
 │   └── reference/         # CC 源码 / MiniCode / offer-Master 调研笔记
-├── agent/                 # 核心循环 + 治理 + 工具
+├── agent/                 # 核心循环 + 治理 + 工具 + 定价快照（pricing.py）
 ├── app/                   # CLI + Streamlit 控制台 + 检查点回放
-├── eval/                  # 黄金任务集 + 回归 runner
+├── eval/                  # 黄金任务集（物理剥离 + 有效性闸门）+ 回归 runner（三臂对照）
 ├── tests/                 # pytest（每模块一个文件）
 ├── workspace/             # 演示工作区（.gitignore）
 └── data/                  # 轨迹 / 检查点 / 会话元数据 / 快照对象库 / 报告（.gitignore）
@@ -567,7 +671,24 @@ coding_agent/
 | S31 | **孤儿对象不自动回收** | 写盘顺序（对象 → 清单 → 检查点）保证被杀只留**孤儿**、不留**说谎的引用**；代价是孤儿会**攒着**，只有人显式 `--drop-snapshots` 才清。对象库全局共享，所以**不能整目录删** —— 回收要把**所有**会话的清单扫一遍现算活跃集 |
 | S32 | **它不回滚对话** | `--rewind` 只动文件；对话由 `--fork --step K`（或 `/fork`）搬。而且模型侧**不是真的"记忆回滚"**：历史里那句"我改了 a.txt"还在，靠 `_reinject_rewind` 补投一句"工作区曾被回滚到第 K 步、你历史里那些改动已经不在盘上了"来纠正 —— 那是**告知**，不是抹掉 |
 
-**这份清单会过时**：它不是「设计上不允许」，是「截至 `53ec291`（S17–S20 截至 M9-6，S21–S26 截至 M9-7，S27–S32 截至 M9-8）还没做」—— 锚点就是 M9-8 那次提交本身，此后**逐条修掉其中任何一条，都应该同时改这张表**（尤其是改动让某一条不再成立时：留一条已经不成立的边界，与漏写一条一样糟）。
+### 三之五、评估层（M5-5）
+
+评估用的那把尺子本身也有边界。这一节写的是**尺子量不到什么**，不是「评估做得怎么样」：
+
+| # | 边界 | 说明 |
+|---|---|---|
+| S33 | **闸门是环境相关的，不是"任务质量"判决** | 全量 39 个候选里被拒 18 个：**12 个「金标准补丁在本机跑不过」**（tinydb 那些老提交在本机 Python 3.12 + 现代 pytest 下，连官方修复都拿不到分——是环境，不是"它们不是真 bug"），**6 个「白送分」**（隐藏测试在 base 就通过）。**换台机器/换个 Python 版本，这 18 条会变。** 逐条理由在 `TASKS.md` |
+| S34 | **闸门口径比 SWE-bench 更严** | `_run_pytest` 跑的是**整个测试文件**，不是只跑 FAIL_TO_PASS 用例。所以老提交里任何一个**不相关**用例在本机失败，都会让 fix 侧变红、任务被拒。严有严的代价：会拒掉一些本来可判定的任务 |
+| S35 | **评测工作区里没有原仓库历史** | 物理剥离后 agent 的 `git log` 只有一条 `Base commit for evaluation`。它**看不到**项目的演化史、`git blame`、历史 issue 线索 —— 真人在这种仓库上干活不是这样。这是为了不让金标准补丁和隐藏测试被 `git show` 到而付的代价（见「为什么不是 `git worktree`」） |
+| S36 | **工作区 `git diff` 看不到被 `.gitignore` 忽略的新建文件** | tinydb 的 `.gitignore` 有未锚定的 `lib`/`bin`/`build`/`dist` 等条目。agent 把修复写进这类目录时，它自己 `git diff` 会看到空 —— **这是目标仓库自身的语义**，不是我们的 bug；判定用的是文件内容哈希，不受影响（所以零变更检测不会因此失灵） |
+| S37 | **`single-shot` 臂的输入范围是人定的** | 喂的是**全部非 `tests/` 的 `.py` 源码**、不送任何定位提示（送 `changed_sources` 等于把最难的一环直接给模型）。但真实 tinydb 包比这大得多的时候会放不进上下文 —— 这条臂的结论只在"整包塞得下"的规模上成立。prompt 原样进报告，可自行审计 |
+| S38 | **Windows 上 linkname 不是路径的 symlink 会被跳过** | tinydb 的 `CONTRIBUTING.rst` 是一条 `120000` 条目，而它的 `linkname` 是**一整篇文档文本**、不是路径 —— Windows 建不出这种链接，**所有 filter 下都一样丢**，tarfile 只当非致命错误静默跳过。现在物化会把它**打印出来**（用 `os.path.lexists` 免得把悬空 symlink 误报成丢失），但它确实少了这一个文件 |
+| S39 | **`single-shot` 的 diff 抠取器有已知缺陷，本轮只冻结不改** | `eval/runner.py` 的 `_FENCE_RE` 开围栏只认 ` ``` ` / ` ```diff ` / ` ```patch `，模型回复里 diff 块前面有个 ` ```python ` 时**围栏配对整个错位一格**，真正的 diff 抠不出来 → 兜底把后面的散文整段喂给 `git apply` → `corrupt patch`。本轮三臂必须跑同一份冻结代码，所以**修正只存在于 `evalverify/`，没有回写**。⇒ 修正后的 84.2% 是**反事实口径**：它回答「如果解析器没这个 bug 会被判成什么」，**不是**「模型能打多少分」。**修复已列入下一轮。** |
+| S40 | **`git apply --recount` 修不了错的上下文** | `--recount` 只重算 hunk 头里的行数，**不能**让一段文件里根本不存在的上下文变成存在。`45a4d4b3` 那种把相隔十几行的两段拼成一个 hunk 的补丁，`--recount` 一样应用不上 —— 它被记成 `patch_failed` 是**正确**的，不是解析器的锅 |
+| S41 | **`env_timeout` 这一类故障在报告里取证不到** | 报告只落了从 `terminated_reason` 派生的一个布尔（`budget_exhausted`），没落 `terminated_reason` 本身、也没落工具调用记录。于是「agent 在自己工作区里跑 pytest 撞上 bash 工具 120s 超时」与「真没修对」在数据上**完全同形**，区分不开。**这一格空着，不拿 `duration_s` 之类的东西猜一个填上。** 要让它可测：`per_task` 里落 `terminated_reason` + 工具调用记录 |
+| S42 | **`judge_tampering` 本轮一律为 `null`，那是「没检查」不是「查过且干净」** | 判定器有已知的 `conftest.py` 注入绕过（188 字节 PoC 已验证）。为保三条臂数据绝对可比，本轮**统一关闭守卫**。经事后审计，本轮 21 个任务中**未发现任何利用此漏洞的行为**，但「审计没发现」不等于「结构上不可能」—— 该漏洞已列入下一轮修复计划 |
+
+**这份清单会过时**：它不是「设计上不允许」，是「截至 `53ec291`（S17–S20 截至 M9-6，S21–S26 截至 M9-7，S27–S32 截至 M9-8，S33–S42 截至 M5-5）还没做」—— 锚点就是 M9-8 那次提交本身，此后**逐条修掉其中任何一条，都应该同时改这张表**（尤其是改动让某一条不再成立时：留一条已经不成立的边界，与漏写一条一样糟）。
 
 ### 四、这些是**真跑过真实 LLM** 验出来的（不是单测）
 
