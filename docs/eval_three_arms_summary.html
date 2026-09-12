@@ -581,7 +581,7 @@
           <tr>
             <th scope="row">完成率（通过 / 计分）</th>
             <td class="n win">66.7%</td><td class="n bad">0.0%</td>
-            <td class="n"><span class="n old">78.6%</span> → <span class="n fix">84.2%</span></td>
+            <td class="n"><span class="n old">78.6%</span> → <span class="n fix">84.2%</span> <span class="tag">反事实</span> → <span class="n fix">89.5%</span> <span class="tag">实测</span></td>
           </tr>
           <tr>
             <th scope="row">补丁未应用</th>
@@ -615,7 +615,7 @@
       </table>
     </div>
     <p class="note">
-      <span><code>single-shot</code> 的<strong>留档值是 52.4%（11/21）</strong>，其中 5 个假阴性是<strong>我自己的解析器缺陷</strong>造成的，经零成本离线重算修正为 <strong>84.2%（16/19）</strong>。归因见第 04 节。</span>
+      <span><code>single-shot</code> 的<strong>留档值是 52.4%（11/21）</strong>，其中 5 个假阴性是<strong>我自己的解析器缺陷</strong>造成的，经零成本离线重算修正为 <strong>84.2%（16/19，反事实）</strong>。解析器修好后在同一批任务上重跑的<strong>实测是 89.5%（17/19）</strong> —— 两个数并列、不可混讲，见第 04b 节。</span>
     </p>
     <p class="note">
       <span>分母 <code>judged</code> 已摘掉「补丁未落地」与「判定器没跑成」—— 那两类是<strong>评测方</strong>的锅，不该算模型没修好。所以 <span class="mono">84.2%</span>（分母 19）与 <span class="mono">66.7%</span>（分母 21）<strong>不能相减</strong>。</span>
@@ -693,7 +693,7 @@
 
     <div class="prose">
       <p>
-        <code>eval/runner.py</code> 本轮<strong>已冻结</strong>（三条臂必须跑同一份代码，中途改就等于三份分数不可比），所以走<strong>离线重算</strong>：报告里存了每个任务的 <code>raw_output</code>，<strong>重抠 + 重落 + 重判，LLM 调用 0 次</strong>。
+        <code>eval/runner.py</code> 在<strong>留档那一轮已冻结</strong>（三条臂必须跑同一份代码，中途改就等于三份分数不可比），所以当时走<strong>离线重算</strong>：报告里存了每个任务的 <code>raw_output</code>，<strong>重抠 + 重落 + 重判，LLM 调用 0 次</strong>。
       </p>
       <p>
         四条硬不变式 —— 缺一条，「重算」就退化成「重编故事」：
@@ -709,14 +709,74 @@
           <tr><th scope="row">① 零 LLM 调用</th><td style="text-align:left">只消费已落盘的 <code>raw_output</code>。模型当时的输出是既成事实，变的只有解析侧。</td></tr>
           <tr><th scope="row">② 先自校验再出数</th><td style="text-align:left">第 0 阶段用<strong>现行</strong>解析器重算，必须逐字段复现留档聚合 <span class="mono">21 / 14 / 11 / 7 / 0</span> 才继续。</td></tr>
           <tr><th scope="row">③ 不覆盖留档</th><td style="text-align:left">修正写另一个文件，<code>data/eval/report-*.json</code> 一个字节都不动。</td></tr>
-          <tr><th scope="row">④ 修复代码只有一份</th><td style="text-align:left"><code>diff_extract_fixed.py</code> 是唯一真相源 —— 两份副本 = 迟早漂移，而这个 bug 的教训正是「解析器会悄悄决定分数」。</td></tr>
+          <tr><th scope="row">④ 修复代码只有一份，且它在版本库里</th><td style="text-align:left">唯一真相源是 <code>eval/runner.py</code>（<code>JUDGE_VERSION = 4</code>）；<code>evalverify/diff_extract_fixed.py</code> 只剩第 0 阶段自校验用的<strong>历史 bug 复现</strong>。原先那句「<code>diff_extract_fixed.py</code> 是唯一真相源」指向一个<strong>被 gitignore 的目录</strong>，等于说真相源不在仓库里 —— 已纠正。</td></tr>
         </tbody>
       </table>
     </div>
 
     <div class="kicker">
       <strong>原 52.4% 系评测系统解析器缺陷（5 个假阴性）导致，经离线重算修正后真实完成率为 84.2%（16/19）。</strong>
+      解析器修好回写后，同一批任务上重跑的<strong>实测是 89.5%（17/19）</strong> —— 两者是<strong>两个不同的数</strong>，差全部来自采样，见第 04b 节。
       两个数字都留着：只报修正值 = 抹掉自己犯过的错，只报原值 = 拿自己的 bug 当模型的能力。
+    </div>
+  </section>
+
+  <section>
+    <h2><span class="num">04b</span> 解析器修好之后：第二次实测</h2>
+    <p class="note"><span>2026-09-12 21:01 · 报告 <code>data/eval/report-20260912-210149.json</code></span></p>
+    <div class="prose">
+      <p>
+        <code>_FENCE_RE</code> 回写进 <code>eval/runner.py</code> 之后（<code>JUDGE_VERSION</code> 3 → 4、报告带 <code>ruler</code> 指纹），<code>single-shot</code> 臂在<strong>同一批 21 个有效任务</strong>上重跑了一次。
+      </p>
+    </div>
+
+    <div class="scroll">
+      <table>
+        <thead>
+          <tr><th scope="col"></th><th scope="col">留档（当时的解析器）</th><th scope="col">离线重算（修好的解析器，<strong>冻结输出</strong>）</th><th scope="col"><strong>重跑实测（修好的解析器，新采样）</strong></th></tr>
+        </thead>
+        <tbody>
+          <tr><th scope="row">通过</th><td class="n">11</td><td class="n">16</td><td class="n big"><strong>17</strong></td></tr>
+          <tr><th scope="row">计分分母</th><td class="n">14</td><td class="n">19</td><td class="n big"><strong>19</strong></td></tr>
+          <tr><th scope="row">完成率</th><td class="n">78.6%</td><td class="n"><span class="n fix">84.2%</span>（反事实）</td><td class="n big"><span class="n fix">89.5%</span>（实测）</td></tr>
+          <tr><th scope="row">补丁未应用</th><td class="n">7</td><td class="n">2</td><td class="n">2</td></tr>
+          <tr><th scope="row">token</th><td class="mono">341,337</td><td class="mono">341,337（照搬）</td><td class="mono">337,428</td></tr>
+          <tr><th scope="row">估算成本</th><td class="mono">¥0.8423</td><td class="mono">不重算</td><td class="mono">¥0.3453</td></tr>
+          <tr><th scope="row">平均缓存命中率</th><td class="mono">0.0%</td><td class="mono">照搬</td><td class="mono">98.6%</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="prose">
+      <p>
+        <strong>两个数不可混讲。</strong> <span class="mono">84.2%</span> 由<strong>零 LLM 调用</strong>的离线重算支撑（消费归档那一刻已吐出的输出）；<span class="mono">89.5%</span> 是<strong>另一次采样</strong>。新数不等于旧数，而这个差<strong>全部来自采样</strong>。
+      </p>
+      <p>
+        <strong>解析器那部分的效应是被直接量到的</strong>：5 个假阴性（<code>dcf0a013</code> <code>6a84ca9c</code> <code>1e865a86</code> <code>f959c8cf</code> <code>08305a1e</code>）在新采样里<strong>有 4 个真的通过了</strong> —— 它们此前被判「补丁未应用」，纯粹因为围栏配对错位。
+      </p>
+      <p>
+        逐任务对照，21 个里 17 个一致，4 个分岔（全部归因采样）：<code>9eaf5626</code> 不通过→<strong>通过</strong>、<code>03f8df75</code> 不通过→<strong>通过</strong>、<code>08305a1e</code> 通过→<strong>补丁未应用</strong>、<code>0e1ba9ca</code> 补丁未应用→不通过。
+      </p>
+    </div>
+
+    <div class="kicker">
+      <b>一个巧合，别当证据用。</b>
+      <span>两边「补丁未应用」<strong>都正好是 2 个</strong>，但<strong>成员不同</strong>（重算是 <code>45a4d4b3</code> <code>0e1ba9ca</code>，重跑是 <code>45a4d4b3</code> <code>08305a1e</code>）。计数相同 ≠ 同一批任务。</span>
+    </div>
+
+    <div class="kicker">
+      <b>这次重跑沿用 guard=关（<code>--no-guard-judge</code>）。</b>
+      <span>为的是与 84.2% 对比时<strong>只改一个变量</strong>（解析器）。归档那一轮的 guard 口径是关，这里保持关闭，所以 <code>judge_tampering</code> / <code>judge_restored</code> 在这份报告里仍是 <code>null</code>（<strong>没检查</strong>，不是「查过且干净」）。<code>judge_passed_count</code> 照常落盘（那是 P4，与 guard 开关无关）。</span>
+    </div>
+
+    <div class="kicker">
+      <b>一处已知的指纹失配，如实记。</b>
+      <span>这份报告跑完之后，两个评测源文件各收到<strong>一次不改变行为的修正</strong> —— <code>eval/golden_tasks.py</code> 改的是一段注释（<code>-P</code> 那段「要等第二个仓定下来才量得到」改成探针已经量到的事实），<code>eval/runner.py</code> 改的是一句<strong>启动横幅</strong>（<code>任务数 {limit}</code> → <code>候选 {limit}</code>；<code>--limit</code> 限的是候选、真任务数过闸门之前未知，那句错文案正是白跑一次付费评测的原因）。所以盘上这两个文件的 sha256 <strong>不再等于</strong>报告里的 <code>ruler.golden_tasks_sha256</code> / <code>ruler.runner_sha256</code>。<strong>这是指纹字段该有的行为，不是篡改</strong>（判定语义没动，<code>JUDGE_VERSION</code> 仍是 4）。复核请按<strong>报告里记的 sha</strong>，别拿当前盘上的文件比。</span>
+    </div>
+
+    <div class="kicker">
+      <b>成本对不上，如实记下、不解释。</b>
+      <span>同一批任务、几乎相同的 token（341,337 vs 337,428），归档那轮 <strong>0.0% 缓存命中 / ¥0.8423</strong>，这次 <strong>98.6% / ¥0.3453</strong>，差 2.4 倍。<code>Usage.cache_hit_ratio</code> 在 hit+miss == 0 时返回 <code>None</code>，平均 0.0% 意味着 DeepSeek <strong>当时确实返回了 hit=0</strong>（不是没记）。<strong>原因不明，只报事实</strong>；且所有 ¥ 都按 <code>archived</code> 的定价快照估算，<strong>是量级估算，不是账单</strong>。</span>
     </div>
   </section>
 
@@ -741,8 +801,8 @@
       <div class="rule-item">
         <span class="mark">✕</span>
         <div class="body">
-          <b>修正值是反事实，不是实测。</b>
-          <span>它回答「如果解析器没这个 bug 会被判成什么」，<strong>不是</strong>「模型能打多少分」；而且那个 bug <strong>仍在 <code>runner.py</code> 里</strong>（本轮只冻结不改），修正只存在于 <code>evalverify/</code>。</span>
+          <b>84.2% 是反事实，89.5% 才是实测 —— 两个数不许互换、不许平均、不许只报一个。</b>
+          <span><span class="mono">84.2%</span> 回答「如果解析器没这个 bug 会被判成什么」，由<strong>零 LLM 调用</strong>的离线重算支撑（消费归档输出）；<span class="mono">89.5%</span> 是解析器修好后<strong>同一批任务上重跑</strong>的实测。<strong>不能说「修好后重跑得到 84.2%」</strong>，也<strong>不能说「真实能力是 84.2%」</strong> —— 那是把反事实说成实测。</span>
         </div>
       </div>
     </div>
@@ -751,11 +811,11 @@
   <section>
     <h2><span class="num">06</span> 这一轮不证明什么</h2>
     <ul class="caveats">
-      <li><span class="idx">01</span><span><b>样本量。</b>21 个任务全部来自 tinydb 一个仓库、一个语言、一个测试风格。完成率<strong>不能外推</strong>到别的语言 / 仓库。</span></li>
-      <li><span class="idx">02</span><span><b>网络寻源未阻断。</b>eval 工具集里有 <code>web_fetch</code> / <code>web_search</code>，而 task_text 带着 commit subject（含 <code>(#618)</code> 这类 issue 号）。隔离验证只证明了<strong>本地</strong>那条路是断的；报告不含工具调用记录，做不到逐任务查证。</span></li>
-      <li><span class="idx">03</span><span><b><code>env_timeout</code> 取证不到。</b>报告只落了从 <code>terminated_reason</code> 派生的布尔，没落 <code>terminated_reason</code> 本身 —— 「环境把他掐死了」与「真没修对」在数据上完全同形。<strong>这一格空着，不拿猜测填。</strong></span></li>
-      <li><span class="idx">04</span><span><b>判定器有已知绕过</b>（<code>conftest.py</code> 注入，188 字节 PoC 已验证）。三臂统一关闭守卫以保可比，代价是 <code>judge_tampering</code> 一律 <code>null</code> —— 那是「<strong>没检查</strong>」不是「查过且干净」。经事后审计，本轮 21 个任务中未发现任何利用此漏洞的行为。</span></li>
-      <li><span class="idx">05</span><span><b>成本是按快照单价估算</b>，不是账单；<code>deepseek-chat</code> 已不在官方定价页列示，实际计费单价未经核实。</span></li>
+      <li><span class="idx">01</span><span><b>样本量。</b><strong>已计分的</strong> 21 个任务全部来自 tinydb <strong>一个仓库、一个语言、一个测试风格</strong>。完成率<strong>不能外推</strong>。本轮把<strong>多仓参数化</strong>做完了、第二个仓库（<code>sqlparse</code>）的<strong>闸门也跑完了</strong>（143 个候选 → 54 个有效），但<strong>计分侧仍然只有一个仓库</strong> —— 第二仓的付费三臂重跑没跑，这两句话不能合并成一句。</span></li>
+      <li><span class="idx">02</span><span><b>网络寻源未阻断。</b>eval 工具集里有 <code>web_fetch</code> / <code>web_search</code>，而 task_text 带着 commit subject（含 <code>(#618)</code> 这类 issue 号）。隔离验证只证明了<strong>本地</strong>那条路是断的；<strong>留档那三份报告</strong>不含工具调用记录，对那批数据做不到逐任务查证。<strong>本轮的 <code>per_task</code> 已含 <code>tool_calls</code> / <code>gate_blocks</code></strong>，新报告可以查。</span></li>
+      <li><span class="idx">03</span><span><b><code>env_timeout</code> 在留档报告里取证不到。</b>那批报告只落了从 <code>terminated_reason</code> 派生的布尔 —— 「环境把他掐死了」与「真没修对」在<strong>那批数据上</strong>完全同形。<strong>本轮已把 <code>terminated_reason</code> 与工具调用记录落进 <code>per_task</code></strong>；归档那三份改不了，不拿别的字段猜一个填上。</span></li>
+      <li><span class="idx">04</span><span><b>判定器有已知绕过</b>（<code>conftest.py</code> 注入，188 字节 PoC 已验证）。<strong>留档那一轮</strong>为保三臂可比统一关闭守卫，代价是 <code>judge_tampering</code> 一律 <code>null</code> —— 那是「<strong>没检查</strong>」不是「查过且干净」。经事后审计，那 21 个任务中未发现任何利用此漏洞的行为。<strong>代码里的守卫现已默认开</strong>（P4 拒绝零验证通过 + P1 判定前恢复判定相关文件并记录 <code>judge_restored</code>），<code>--no-guard-judge</code> 只用于复现归档口径 —— ⚠️ <strong>上面「解析器修好之后」那份新报告正是这样一份复现口径的报告</strong>（理由见该节），所以<strong>不能说「新报告查过守卫且干净」</strong>。<strong>仍未覆盖</strong>：<code>sitecustomize.py</code>/<code>.pth</code>、工作区<strong>之外</strong>的 site-packages、模块遮蔽（根级 <code>pytest/</code> 或 <code>pytest.py</code>）。</span></li>
+      <li><span class="idx">05</span><span><b>成本是按快照单价估算</b>，不是账单；<code>deepseek-chat</code> 已不在官方定价页列示，实际计费单价未经核实。另外，同一批任务两次采样的成本差了 <strong>2.4 倍</strong>（缓存命中 0.0% vs 98.6%），<strong>原因不明</strong> —— 只报事实，不给解释，见第 04b 节。</span></li>
     </ul>
   </section>
 

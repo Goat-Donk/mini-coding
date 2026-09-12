@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import io
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -37,6 +38,24 @@ from pathlib import Path
 
 TINYDB_REPO = "https://github.com/msiemens/tinydb.git"
 DEFAULT_REPO = Path("eval/repos/tinydb")
+
+#: 能当评测目标仓的仓库登记表（简称 → clone URL）。
+#:
+#: 存在的理由：`single-shot` 臂喂的是**整个包的全部源码**，S37 记的
+#: "结论只在整包塞得下（≈35k tokens）的规模上成立"是一条**规模约束** ——
+#: 一个仓的有效任务数不够（tinydb 上游实测：39 个候选 → 闸门后 21 个）时，
+#: 补样本的唯一办法就是加仓，而加仓就得有个地方记"加的是哪个、有多大"。
+#: 每个仓的体积/候选数是**实测**的，见 `evalverify/survey_repos.py`。
+REPOS: dict[str, str] = {
+    # 基准：10 个源文件 · 71,659 字符 · 估算 17.9k tokens（字符/4） · 39 个候选
+    "tinydb": TINYDB_REPO,
+    # 下面这些只登记"量过"，不代表都已入库当目标仓（体积/候选数的取舍见 README）。
+    "flake8": "https://github.com/PyCQA/flake8.git",
+    "tomlkit": "https://github.com/python-poetry/tomlkit.git",
+    "pip-tools": "https://github.com/jazzband/pip-tools.git",
+    "attrs": "https://github.com/python-attrs/attrs.git",
+    "requests": "https://github.com/psf/requests.git",
+}
 
 FIX_KEYWORDS = (
     "fix", "fixes", "fixed", "bug", "error", "crash", "issue",
@@ -90,9 +109,23 @@ def _force_rmtree(path: Path) -> None:
 
 # ---------- 克隆 ----------
 
-def ensure_repo(repo_dir: Path = DEFAULT_REPO, *, clone_url: str = TINYDB_REPO) -> Path:
-    """克隆 tinydb（幂等 + 网络重试）。返回 repo 根。"""
+def ensure_repo(repo_dir: Path | str = DEFAULT_REPO, *, clone_url: str | None = None) -> Path:
+    """克隆目标仓（幂等 + 网络重试）。返回 repo 根。
+
+    `clone_url` 不给时按 `repo_dir` 的**目录名**去 `REPOS` 里查 —— 这样
+    `--repo eval/repos/flake8 --clone` 就能work，不用再多记一个 URL 参数。
+    查不到就报错并列出已知的仓，**不猜**：猜错 URL 会安静地克隆出一个不相干的仓，
+    而闸门照样能跑出"有效任务"来，那是把整个第二轮评估建在错仓库上。
+    """
     repo_dir = Path(repo_dir)
+    if clone_url is None:
+        name = repo_dir.name
+        if name not in REPOS:
+            raise ValueError(
+                f"{repo_dir} 不在 REPOS 登记表里（已知：{sorted(REPOS)}）。"
+                "克隆别的仓要么先登记，要么显式传 clone_url。"
+            )
+        clone_url = REPOS[name]
     if (repo_dir / ".git").exists():
         return repo_dir
     repo_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -107,7 +140,7 @@ def ensure_repo(repo_dir: Path = DEFAULT_REPO, *, clone_url: str = TINYDB_REPO) 
         # 半成品清理后重试（网络抖动常见）
         shutil.rmtree(repo_dir, ignore_errors=True)
         time.sleep(3)
-    raise RuntimeError(f"clone tinydb 失败: {(proc.stderr if proc else '')[:300]}")
+    raise RuntimeError(f"clone {clone_url} 失败: {(proc.stderr if proc else '')[:300]}")
 
 
 # ---------- 发现 fix commits ----------
@@ -349,6 +382,9 @@ class JudgeResult:
     passed: bool
     returncode: int
     summary: str                      # pytest 输出摘要（诚实展示，不造假）
+    #: pytest 自报的通过用例数。**三态**：`None` = 没数出来（不是 0），
+    #: `0` = 数出来了、确实一个都没通过。把前者读成后者会把一次真实通过翻成失败。
+    passed_count: int | None = None
 
     @property
     def executed(self) -> bool:
@@ -363,6 +399,116 @@ class JudgeResult:
         return f"judge 未能执行测试（pytest 退出码 {self.returncode}）: {self.summary}"
 
 
+#: pytest 最后那行统计行：`5 passed in 0.12s` / `1 failed, 2 passed in 0.5s` /
+#: 非 -q 模式下的 `======== 3 passed in 0.2s ========` /
+#: 以及**跑够 60 秒之后**的 `1 passed in 65.32s (0:01:05)`。
+#:
+#: 判据钉在**行尾**（`in <秒>s` 之后只允许可选的 `(H:MM:SS)`、空白与 `=`）：这样它
+#: 不可能命中 warning traceback 里的 `File "...", line 97, in write` —— 那种行不以时长收尾。
+#: 反过来（"从后往前找第一个 `N passed`"）会更糟：`-q` 下每个失败用例也打
+#: `FAILED tests/x.py::t - ...`，用例自己的输出里更可能整行出现 "3 passed" 这种字样。
+#:
+#: ⚠️ `(?:\(\d+:\d{2}:\d{2}\))?` 那一档**不是修饰，是实测来的**：pytest 8.4.1 的
+#: `_pytest/terminal.py:format_session_duration()` 在 `seconds >= 60` 时返回
+#: `f"{seconds:.2f}s ({dt})"`，也就是 `65.32s (0:01:05)` —— 时长后面**还有一串**。
+#: 少了这一档，任何跑满一分钟的判定都会数不出通过数（→ `passed_count = None`），
+#: P4 在那种任务上**静默失效**（不制造假阴性，但那道闸门等于没装）。
+_PYTEST_TALLY_RE = re.compile(
+    r"=*\s*in\s+\d+(?:\.\d+)?s(?:\s*\(\d+:\d{2}:\d{2}\))?\s*=*\s*$"
+)
+_PASSED_COUNT_RE = re.compile(r"(\d+)\s+passed\b")
+
+
+def _parse_passed_count(out: str) -> int | None:
+    """从 pytest 完整输出里数"通过了几个用例"。数不出来返回 `None`。
+
+    ⚠️ **必须喂完整 `out`，不能喂 `summary`**：`summary` 只是输出的最后 6 行，
+    而 pytest 的 unraisable / warning 摘要打在统计行**之后** ——
+    留档的 `45a4d4b3`（`report-20260912-144037.json`）就是这一例：它 `passed=True`，
+    但最后 6 行被 `PytestUnraisableExceptionWarning` 的 traceback 占满，
+    统计行一个字都看不到。用 `summary` 当数据源 + 把"数不出"读成 0，
+    会把一次**真实通过**翻成失败 —— 修 bug 的动作本身制造一个新的假阴性。
+    """
+    for line in reversed(out.splitlines()):
+        if not _PYTEST_TALLY_RE.search(line):
+            continue
+        m = _PASSED_COUNT_RE.search(line)
+        return int(m.group(1)) if m else 0
+    return None
+
+
+def _judged_passed(returncode: int, passed_count: int | None) -> bool:
+    """P4 的判据本身：**退出码 0，且至少有一个用例真的通过**。
+
+    抽成独立函数是为了能被单测**直接**钉住 —— 其中最关键的一格
+    （`returncode == 0` 而 `passed_count is None`）在真实磁盘上很难造出来，
+    埋在 `_run_pytest` 里就只能靠一个假造的运行去碰，或者干脆没人测它。
+
+    `None`（没数出来）**必须**保持通过：留档的 `45a4d4b3` 正是这一格
+    —— 它的统计行落在 6 行摘要之外。把 `None` 读成 0 会把一次真实通过翻成失败，
+    即"修 bug 的动作本身制造一个新的假阴性"。
+    """
+    return returncode == 0 and (passed_count is None or passed_count > 0)
+
+
+def _pytest_argv(workspace: Path, test_files: list[str]) -> list[str]:
+    """判定时跑 pytest 用的完整 argv。抽出来是为了能被单测**直接**钉住。
+
+    ⚠️ `--rootdir` / `--confcutdir` 钉在**工作区**上，这是实测换来的，不是修饰：
+
+    目标仓自带 inifile（tinydb 就有 `pytest.ini`）时 rootdir 本来就落在工作区，
+    这两个参数等于没写。但**换一个不自带 inifile 的仓**，rootdir 会一路向上爬 ——
+    工作区建在本仓的 `data/eval/ws/<任务>/` 下，所以祖先链里就是有本仓的
+    `pyproject.toml`（带 `[tool.pytest.ini_options]`）。`evalverify/probe_pytest_flags.py`
+    把那个场景造出来量过，后果有两条，都不是小事：
+
+    1. **评测器自己的 `conftest.py` 被当插件加载**（实测：不带参数时加载了 2 个 conftest，
+       带参数时只剩工作区自己那 1 个）—— 判定期悄悄跑起我们的夹具；
+    2. **本仓根目录进了 `sys.path`**（实测：不带参数时 `sys.path` 里有 `coding_agent`），
+       于是隐藏测试可以 `import eval.*` / `import agent.*`。
+
+    对 tinydb 的判定结论**零改动**（实测同批测试文件 `rc` 与通过数都不变）。
+
+    ⚠️ `-P`（`PYTHONSAFEPATH`）**实测后不采纳**。探针在 tinydb 上量到两边结论一致（rc 都是 0），
+    但 tinydb 恰好是 `tests/__init__.py` 存在、pytest 会把工作区自己插进 `sys.path` 的那种仓 ——
+    对 `-P` **最有利**的一格。探针于是**合成**了一格不利的（flat 包 + 没有 `tests/__init__.py`，
+    sqlparse 就是这种布局）：**不带 `-P` 退出码 0，带 `-P` 退出码 2** —— 收集期就报错，
+    会把一次**诚实的修复**判成「没修好」。`-P` 砍掉的正是 `python -m pytest` 提供的 cwd 插入。
+    这一格是零成本的（合成迷你仓，不依赖任何候选仓），所以不必等第二个仓定下来。
+
+    `-o addopts=` 清掉目标仓 inifile 自带的 addopts：tinydb 写死了
+    `--cov-append --cov-report --cov tinydb`，本机没装 pytest-cov 时 pytest 会
+    以 usage error（退出码 4）直接退出 —— 测试一次都没跑，却会被误判成「没修好」。
+    """
+    workspace = Path(workspace).resolve()
+    return [
+        sys.executable, "-m", "pytest", *_pytest_targets(test_files),
+        "-q", "--no-header", "-o", "addopts=",
+        f"--rootdir={workspace}", f"--confcutdir={workspace}",
+    ]
+
+
+def _pytest_targets(test_files: list[str]) -> list[str]:
+    """从 `test_files` 里挑出**能交给 pytest 当节点**的那些（就是 `.py`）。
+
+    ⚠️ 这一层过滤是实测换来的，不是修饰。`test_files` 是"fix 提交改动过的
+    `tests/**` 文件"，而**改动过的测试数据文件也算**：sqlparse 的 143 个候选里有 5 个
+    带着 `tests/files/*.sql`（fix 提交新增了一个 SQL 夹具当测试用例的输入）。
+    把这些路径当节点交给 pytest，它会直接报
+
+        ERROR: not found: .../tests/files/multiple_case_in_begin.sql
+        (no match in any of [<Dir files>])
+
+    然后以**退出码 4（usage error）**收场 —— 一次用例都没跑，而闸门会把它记成
+    "base 侧测试压根没跑成 → 判定无效"，于是一个**本来有效**的任务被丢掉。
+    失效模式是安静型的：报告里那一行自洽，只是任务凭空少了。
+
+    tinydb 的 `tests/` 全是 `.py`，所以这个形状在第一个仓上**一次都没出现过**
+    （实测：tinydb 39 个候选里 0 个带非 `.py` 测试文件 → 对已留档的报告零改动）。
+    """
+    return [f for f in test_files if f.endswith(".py")]
+
+
 def _run_pytest(workspace: Path, test_files: list[str]) -> JudgeResult:
     """在 workspace 里跑这几个测试文件，返回判定结果。
 
@@ -373,28 +519,92 @@ def _run_pytest(workspace: Path, test_files: list[str]) -> JudgeResult:
 
     ⚠️ `test_files` 为空时**不跑**：无路径参数的 pytest 会收集整个测试套件，
     通常全绿 → `passed=True`，那是一条零验证的自由通过路径。
+
+    ⚠️ `passed` 的判据是 `(rc == 0) and (passed_count is None or passed_count > 0)`。
+    单看 `rc == 0` 有一个洞：**全 skip 时 pytest 的退出码也是 0**（`drive_judge_gaming`
+    那条 conftest 注入路径正是这么翻盘的）。而按名单盯着"谁改了文件"永远追不上
+    （`sitecustomize.py` / `.pth` / 根级 `pytest/` 模块遮蔽 / 往 site-packages 塞 conftest，
+    全是名单外的写法）—— 所以这里改盯**"这次判定到底跑没跑测试"**，
+    那是名单绕不过去的一层。
     """
-    if not test_files:
+    targets = _pytest_targets(test_files)
+    if not targets:
         return JudgeResult(
-            passed=False, returncode=_NO_TESTS_RC,
-            summary="hidden_tests 为空：没有测试文件可判定（拒绝零验证通过）",
+            passed=False, returncode=_NO_TESTS_RC, passed_count=0,
+            summary="hidden_tests 为空或全是非 .py 的测试数据文件："
+                    "没有能交给 pytest 的节点（拒绝零验证通过）",
         )
 
     workspace = Path(workspace).resolve()
     proc = subprocess.run(
-        # -o addopts= 清掉目标仓库 pytest.ini 自带的 addopts：tinydb 写死了
-        # `--cov-append --cov-report --cov tinydb`，本机没装 pytest-cov 时 pytest 会
-        # 以 usage error（退出码 4）直接退出——测试一次都没跑，却会被误判成「没修好」。
-        [
-            sys.executable, "-m", "pytest", *test_files,
-            "-q", "--no-header", "-o", "addopts=",
-        ],
+        _pytest_argv(workspace, targets),
         cwd=workspace, capture_output=True, text=True,
     )
     out = (proc.stdout or "") + (proc.stderr or "")
     lines = [ln for ln in out.splitlines() if ln.strip()]
     summary = "\n".join(lines[-6:])
-    return JudgeResult(passed=proc.returncode == 0, returncode=proc.returncode, summary=summary)
+    passed_count = _parse_passed_count(out)
+    return JudgeResult(
+        passed=_judged_passed(proc.returncode, passed_count),
+        returncode=proc.returncode,
+        summary=summary,
+        passed_count=passed_count,
+    )
+
+
+# ---------- 判定相关文件 ----------
+#
+# **判定层（runner 的 guard）与闸门（validate_task 的前置断言）共用这一份判据。**
+# 两处各写一份名单迟早漂移 —— 而漂移的后果是"闸门放行的任务、判定层会把它恢复回去"，
+# 直接制造假阴性（本项目头号缺陷类）。
+#
+# 实测的翻盘路径（`evalverify/drive_judge_gaming.py`，188 字节 PoC 已验证）：
+# `judge` 是"把修复版隐藏测试覆盖写回工作区 → 在工作区里 `pytest <test_files>`"。
+# 隐藏测试被覆盖这一步是稳的，**但工作区根目录的 `conftest.py` 不会被冲掉** ——
+# pytest 把它当插件自动加载，于是一个 `pytest_collection_modifyitems` 钩子把用例
+# 全标成 skip，而**全 skip 时 pytest 退出码是 0** → 判"修好了"。
+#
+# 这条路径三层防守都拦不住：`zero_change` 拦不住（新文件，工作区确实变了）；
+# 闸门拦不住（它跑的是 base/fix 原始树，没有这个文件）；报告事后也查不出
+# （此前只存 `zero_change` 布尔，不存改了哪几个文件）。
+#
+# 名单**只加这两类，不继续加名字**：这是一场追不上的打地鼠（同 `_irreversible_kind`
+# 当年放弃枚举读动词的教训）。剩下的靠 `_run_pytest` 的计数判据（"这次判定到底
+# 跑没跑测试"）从机制上收口，越出名单的那一类如实记进 README 的边界表。
+_JUDGE_SENSITIVE = frozenset({
+    "conftest.py", "pytest.ini", ".pytest.ini", "pyproject.toml",
+    "setup.cfg", "tox.ini",
+})
+
+#: 按**相对路径**匹配的那一批。存在的唯一理由是 `tests/__init__.py`：
+#:
+#: 它按名字匹配的名字是 `__init__.py` —— 而**绝不能**把 `"__init__.py"` 加进名字集合，
+#: 那会让 `tinydb/__init__.py` 这类**合法源码**变成"判定相关文件"，于是 P1 的恢复
+#: 会把 agent 的真实修复**还原回去**，直接制造假阴性。`tests/__init__.py` 在 tinydb 里
+#: 存在且为空，一行 `os._exit(0)` 就能让整个 tests 包静默不执行 —— 严重度最高的一格，
+#: 必须覆盖，所以用相对路径单独钉。
+_JUDGE_SENSITIVE_PATHS = frozenset({"tests/__init__.py"})
+
+
+def _is_judge_sensitive(rel: str) -> bool:
+    """这个工作区相对路径是不是"改了就能翻盘判定"的文件。"""
+    p = Path(rel)
+    return p.name in _JUDGE_SENSITIVE or p.as_posix() in _JUDGE_SENSITIVE_PATHS
+
+
+def judge_sensitive_blind_spots(task: GoldenTask) -> list[str]:
+    """金标准自己改过的判定相关文件里，**不在隐藏测试里**的那些。
+
+    这是 P1（判定前恢复判定相关文件）唯一的真风险面：`judge` 会把 `hidden_tests`
+    覆盖写回，所以那些文件被恢复也不影响判定；但一个**只改了根 `conftest.py`
+    而没动 tests/** 的金标准提交，会被恢复得连自己都跑不过 —— 诚实的通过变成不通过。
+
+    零成本、纯元数据，所以放在闸门里当**前置断言**：这种任务直接拒，不进 LLM。
+    """
+    touched = set(task.changed_sources) | set(task.hidden_tests)
+    return sorted(
+        p for p in touched if _is_judge_sensitive(p) and p not in task.hidden_tests
+    )
 
 
 def _write_hidden_tests(workspace: Path, hidden_tests: dict[str, str]) -> None:
@@ -460,6 +670,17 @@ def validate_task(task: GoldenTask, repo_dir: Path) -> TaskValidity:
     if not task.test_files:
         return TaskValidity(
             False, "fix 提交的测试文件在 fix 提交里已不存在 → 无可判定内容"
+        )
+
+    # P1 的前置断言（零成本，纯元数据）：金标准自己改过判定相关文件、而那个文件
+    # **不在**隐藏测试里 → 判定前的恢复会把它还原回去，金标准连自己都跑不过。
+    # 拒掉它，而不是让它以"agent 修不好"的面目进报告。
+    blind = judge_sensitive_blind_spots(task)
+    if blind:
+        return TaskValidity(
+            False,
+            f"金标准改了判定相关文件 {blind}，而它不在隐藏测试里 → 判定前的恢复"
+            "会把这个改动还原，诚实的通过会被误判成失败（恢复机制的风险面）",
         )
 
     base_dir = Path(tempfile.mkdtemp(prefix=f"evalval-base-{task.id}-"))
@@ -551,10 +772,14 @@ def validate_tasks(
 def main() -> None:
     import argparse
 
-    ap = argparse.ArgumentParser(description="发现 tinydb 黄金修 bug 任务")
-    ap.add_argument("--repo", type=Path, default=DEFAULT_REPO, help="tinydb 仓库路径")
+    ap = argparse.ArgumentParser(description="发现并验证黄金修 bug 任务")
+    ap.add_argument("--repo", type=Path, default=DEFAULT_REPO, help="目标仓库路径")
     ap.add_argument("--limit", type=int, default=20, help="最多返回几个 fix commit")
-    ap.add_argument("--clone", action="store_true", help="先克隆 tinydb（需要网络）")
+    ap.add_argument(
+        "--clone", action="store_true",
+        help="先克隆（需要网络）。仓名按 `--repo` 的目录名去 REPOS 登记表里查，"
+             f"已知：{sorted(REPOS)}",
+    )
     ap.add_argument(
         "--validate", action="store_true",
         help="对每个候选跑有效性闸门（零 LLM 成本，只跑 pytest）",

@@ -23,8 +23,9 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 from agent.security import TAINT_HIGH, TAINT_NONE
-from agent.tools.bash import BashTool
+from agent.tools.bash import BashTool, command_path_verdict
 from agent.tools.base import ToolContext
+from agent.tools.files import resolve_in_workspace
 
 # 用户确认返回的粒度 → 记忆类别
 GRANULARITY: dict[str, str] = {
@@ -297,6 +298,25 @@ class PermissionsEngine:
         ) is None:
             return Decision.DENY
 
+        # 1') bash 命令文本里的**相对逃逸**路径 → 硬 deny（S16）。
+        # 与步骤 1 是**同一个不变式**：`cat ../.env` 和 `read ../.env` 必须给同一个答案，
+        # 否则同一条沙箱规则会有两种问法两种结果。
+        #
+        # 位置是硬要求：**必须在 `_always`/`_turn` 记忆之前**。理由与
+        # `_apply_taint_ceiling` 那条对称 —— 用户只要开过一次 `allow_always`，
+        # 任何放在记忆之后的收紧就永久失效，而"记得越久越省事"正是他去开它的原因。
+        #
+        # 只硬拒 **deny 档**（相对逃逸，语义无歧义）；**ask 档**（绝对路径越界 /
+        # 含变量）走规则层，见 `_rule_check` —— 那里可以被记忆记住，因为误杀必须可恢复。
+        if tool_name == "bash":
+            sandbox_deny, _sandbox_ask = command_path_verdict(
+                str(arguments.get("command", "")),
+                cwd=ctx.cwd,
+                workspace_root=self.workspace_root,
+            )
+            if sandbox_deny:
+                return Decision.DENY
+
         # 2) 常驻记忆 / 3) 本回合记忆 / 4) 规则判定
         if target in self._always:
             decision = self._always[target]
@@ -311,7 +331,7 @@ class PermissionsEngine:
         # 6) ask → 回调确认（人的决定在最后）
         if decision is Decision.ASK and self.confirm is not None:
             return self._confirm_and_record(
-                tool_name, arguments, kind, target, details=details
+                tool_name, arguments, kind, target, details=details, ctx=ctx
             )
         return decision
 
@@ -326,7 +346,7 @@ class PermissionsEngine:
         """强制人工确认（CLI/控制台在 ASK 且无 confirm 回调时调用）。"""
         kind, target = self._classify(tool_name, arguments)
         return self._confirm_and_record(
-            tool_name, arguments, kind, target, details=details
+            tool_name, arguments, kind, target, details=details, ctx=ctx
         )
 
     def describe(
@@ -335,6 +355,7 @@ class PermissionsEngine:
         arguments: dict,
         *,
         details: str | None = None,
+        ctx: ToolContext | None = None,
     ) -> str:
         """构造确认问题文本（供 confirm 回调/UI 展示）。
 
@@ -364,6 +385,11 @@ class PermissionsEngine:
         )
         if details:
             question += f"\n\n{details}"
+        # 沙箱判据（S16）触发的询问要说清**是哪条路径越界** —— 一个不说理由的
+        # 确认框，训练出的是不看理由的人（同下方污染标记说明的理由）。
+        sandbox_note = self._sandbox_note(tool_name, arguments, ctx)
+        if sandbox_note is not None:
+            question += f"\n[沙箱] {sandbox_note}"
         if self._taint == TAINT_HIGH:
             label = _irreversible_kind(tool_name, arguments)
             if label is not None:
@@ -374,7 +400,13 @@ class PermissionsEngine:
                 )
         return question
 
-    def denial_hint(self, tool_name: str, arguments: dict | None = None) -> str | None:
+    def denial_hint(
+        self,
+        tool_name: str,
+        arguments: dict | None = None,
+        *,
+        ctx: ToolContext | None = None,
+    ) -> str | None:
         """被拒时给用户的**解除指引**（带出处，不是一句"没权限"）。
 
         拒绝而不说怎么解，等于把一个安全机制变成路障：用户既不知道是谁拦的，
@@ -398,6 +430,44 @@ class PermissionsEngine:
                     f"这类动作被收紧。确认那些输出没有在驱使你做这件事之后，"
                     f"用 --clear-taint 复位标记再重试。"
                 )
+        # 沙箱判据（S16）：越界的候选写进指引 —— "带出处"是这一节的明文纪律。
+        # `ctx` 是可选的：拿不到它就给一句不带路径的说明，而不是不给。
+        note = self._sandbox_note(tool_name, arguments or {}, ctx)
+        if note is not None:
+            return note
+        return None
+
+    def _sandbox_note(
+        self, tool_name: str, arguments: dict, ctx: ToolContext | None
+    ) -> str | None:
+        """bash 命令文本里越界候选的**出处与解除方式**，没有则 None。
+
+        重算而不是读 `check()` 留下的字段，理由同 `denial_hint` 的 docstring：
+        `_gate_and_run` 的只读批次用线程池并发跑，任何"上一次判定"式的共享状态
+        都可能把 A 调用的理由安到 B 调用头上。
+        """
+        if tool_name != "bash" or ctx is None:
+            return None
+        deny, ask = command_path_verdict(
+            str(arguments.get("command", "")),
+            cwd=ctx.cwd,
+            workspace_root=self.workspace_root,
+        )
+        if deny:
+            return (
+                f"命令文本里的相对路径越出了 workspace 沙箱: {', '.join(deny)}"
+                f"（仅允许 {self.workspace_root} 内的路径）。"
+                "改用沙箱内的相对路径，或先把需要的文件放进工作区 —— "
+                "这一档与 read/write/edit 的越界硬拒是同一个不变式，"
+                "**不能用 allow_* 绕过**。"
+            )
+        if ask:
+            return (
+                f"命令文本里有疑似越界或取值不确定的路径: {', '.join(ask)}"
+                f"（仅允许 {self.workspace_root} 内的路径）。"
+                "若它其实不是路径（例如 grep 的模式串），在确认框选 allow_once/"
+                "allow_always 即可放行；否则改用沙箱内路径。"
+            )
         return None
 
     # ---------- 污染标记（会话级，粗粒度） ----------
@@ -452,16 +522,12 @@ class PermissionsEngine:
         return "tool", tool_name
 
     def _resolve(self, raw: str, ctx: ToolContext) -> Path | None:
-        """复用 files._resolve 的沙箱语义：越界返回 None。"""
-        path = Path(raw).expanduser()
-        if not path.is_absolute():
-            path = ctx.cwd / path
-        try:
-            path = path.resolve()
-            path.relative_to(self.workspace_root)
-        except (ValueError, OSError):
-            return None
-        return path
+        """复用 files 的沙箱语义：越界返回 None。**不再自己实现一份。**
+
+        传 `self.workspace_root`（构造时已 resolve）而不是 `ctx.workspace_root` ——
+        这个差异是合并前就有的，合并时刻意保留（合并实现不该顺手改行为）。
+        """
+        return resolve_in_workspace(raw, cwd=ctx.cwd, workspace_root=self.workspace_root)
 
     def _rule_check(
         self, tool_name: str, kind: str, arguments: dict, ctx: ToolContext
@@ -520,6 +586,18 @@ class PermissionsEngine:
             arguments.get("command", "")
         ):
             return Decision.ASK
+        # 2') 沙箱判据的 **ask 档**（S16）：绝对路径越界（可能只是模式串，
+        # 如 `grep -rn "/usr/lib" .`）与含变量/命令替换的候选（取值不可确定）。
+        # 放这一层而不是硬 deny 档，是因为这两类都可能误杀，必须**可恢复** ——
+        # 它在规则层，所以能被 `allow_once`/`allow_always` 记住，这正是 ask 该有的性质。
+        if tool_name == "bash":
+            _sandbox_deny, sandbox_ask = command_path_verdict(
+                str(arguments.get("command", "")),
+                cwd=ctx.cwd,
+                workspace_root=self.workspace_root,
+            )
+            if sandbox_ask:
+                return Decision.ASK
         return Decision.ALLOW
 
     @staticmethod
@@ -539,9 +617,12 @@ class PermissionsEngine:
         target: str,
         *,
         details: str | None = None,
+        ctx: ToolContext | None = None,
     ) -> Decision:
         choice = (
-            self.confirm(self.describe(tool_name, arguments, details=details))
+            self.confirm(
+                self.describe(tool_name, arguments, details=details, ctx=ctx)
+            )
             if self.confirm
             else None
         )

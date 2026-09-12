@@ -977,13 +977,13 @@ class QueryEngine:
                     call,
                     "permissions",
                     f"权限拒绝: 未获允许执行 {call.name}"
-                    f"（{self.permissions.describe(call.name, call.arguments, details=details)}）",
+                    f"（{self.permissions.describe(call.name, call.arguments, details=details, ctx=ctx)}）",
                 )
             if decision is Decision.ASK:
                 # 拒绝必须带**出处与解除方式**：只说"没权限"会让 agent 反复重试
                 # 同一个调用、让用户不知道该改哪个文件。
                 hint = (
-                    self.permissions.denial_hint(call.name, call.arguments)
+                    self.permissions.denial_hint(call.name, call.arguments, ctx=ctx)
                     if hasattr(self.permissions, "denial_hint")
                     else None
                 )

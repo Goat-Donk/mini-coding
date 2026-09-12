@@ -52,17 +52,43 @@ def _unified_diff(
 
 
 
-def _resolve(ctx: ToolContext, raw: str, *, default_root: bool = False) -> Path | ToolResult:
-    """解析路径并校验沙箱内。相对路径锚定 ctx.cwd。"""
+def resolve_in_workspace(raw: str, *, cwd: Path, workspace_root: Path) -> Path | None:
+    """把 `raw` 解析成绝对路径，校验它在 `workspace_root` 内。越界返回 None。
+
+    **沙箱语义的唯一实现。** 三处委托它，一处都不许再抄一遍：
+
+    - `files._resolve`（工具层，把 None 包成 `ToolResult` 哨兵）；
+    - `PermissionsEngine._resolve`（引擎层，直接用 None）；
+    - `bash.command_path_verdict`（命令文本里抠出来的路径候选）。
+
+    为什么要把它们并成一份：合并前工具层与引擎层**各有一份逐字相同的拷贝**，
+    而"两份拷贝迟早漂移"是这个项目已经吃过亏的缺陷类。合并时**刻意保持不变**的
+    一处差异：引擎传的是 `self.workspace_root`（构造时已 `resolve`），工具传的是
+    `ctx.workspace_root` —— 谁传什么由调用方决定，本函数不替它决定。
+
+    `~` 用 `expanduser()` 展开，与 shell 的真实行为一致（shell 真的会展开它）。
+    """
     path = Path(raw).expanduser()
     if not path.is_absolute():
-        path = ctx.cwd / path
+        path = cwd / path
     try:
         path = path.resolve()
-        path.relative_to(ctx.workspace_root)
+        path.relative_to(workspace_root)
     except (ValueError, OSError):
-        return ToolResult.fail(f"路径越界沙箱: {raw}")
+        return None
     return path
+
+
+def _resolve(ctx: ToolContext, raw: str) -> Path | ToolResult:
+    """解析路径并校验沙箱内。相对路径锚定 ctx.cwd。越界返回 fail 哨兵。
+
+    薄壳：判定在 `resolve_in_workspace`，这里只负责把 None 翻译成本层的返回类型。
+    调用方靠 `isinstance` 分流，所以这个签名不能变。
+    """
+    resolved = resolve_in_workspace(raw, cwd=ctx.cwd, workspace_root=ctx.workspace_root)
+    if resolved is None:
+        return ToolResult.fail(f"路径越界沙箱: {raw}")
+    return resolved
 
 
 def _read_text(path: Path) -> str:

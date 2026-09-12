@@ -43,7 +43,7 @@ flowchart TB
 
     subgraph TOOLS["工具层 agent/tools/"]
         BASE["base.py · Tool / ToolRegistry"]
-        BASH["bash.py"]
+        BASH["bash.py<br/>+ 命令文本路径判据（M5-6）"]
         FILES["files.py"]
         WEB["web.py<br/>联网 + SSRF 拦截"]
         SUB["subagent.py<br/>5 个工具（M9-7）<br/>唯一构造点 build_subagent_tools"]
@@ -75,6 +75,8 @@ flowchart TB
     FILES -. FileChange（写盘前的原样字节） .-> WS
     BASE --> BASH
     BASE --> FILES
+    BASH -. 与 read/write 共用同一份 resolve_in_workspace（M5-6） .-> FILES
+    PERM -. 路径判据委托同一函数 .-> FILES
     BASE --> WEB
     BASE --> SUB
     BASE --> GTOOL
@@ -182,7 +184,7 @@ flowchart LR
 `BaseLLM` 两个实现，**接口完全一致**，所以循环、子代理、评估层共用一套代码：
 
 - `DeepSeekClient`：走 openai SDK（DeepSeek 兼容 OpenAI 协议），`chat()` 返回 `LLMResult(content, tool_calls, usage)`，`complete()` 给 compact 摘要用。
-- `MockLLM`：`script(*responses)` 脚本化响应序列 / `text("...")` 固定响应 / `tool_then_text(...)`。**测试与无 key 演示都靠它**——769 个测试全部离线，不打网络。
+- `MockLLM`：`script(*responses)` 脚本化响应序列 / `text("...")` 固定响应 / `tool_then_text(...)`。**测试与无 key 演示都靠它**——847 个测试全部离线，不打网络。
 
 `Usage` 里单独保留 `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`——这是 DeepSeek 磁盘缓存的**实测**字段，整个缓存命中率指标和成本估算都建立在它之上（不是估算出来的）。
 
@@ -852,7 +854,9 @@ flowchart LR
 1. **答案就摆在房间里** —— 判定用的测试如果 agent 能读到，就等于开卷考试。这里隐藏测试只在 judge 阶段写回。
    ⚠️ 但**光有"晚写回"不够**：早期用 `git worktree add --detach` 做隔离，而 worktree 与主仓库**共享对象库与 refs**，
    fix 提交就在主仓库历史里 —— agent 一条 `git show <fix_sha>:tests/test_xxx.py` 就能拿到隐藏测试全文，
-   `git show <fix_sha>:tinydb/table.py` 就是金标准补丁，而 bash 工具只校验 cwd、不校验命令文本。
+   `git show <fix_sha>:tinydb/table.py` 就是金标准补丁。
+   （**这条路径现在被两层堵住**：`git archive` 物理剥离把仓库历史整个拿掉；就算历史还在，
+   bash 的 `command` 文本也从 S16 修复起要过路径沙箱 —— 见 §2 的工具表与 README 的 S43–S49。）
    现在改成**物理剥离**：`git archive base_sha` 导出 tree 解到隔离区，在里面 `git init` + 一个初始提交，
    agent 仍有 git 可用（能 `git diff` 自己的改动）但**没有未来** —— 工作区的 git 历史是评测生成的，
    不含任何原仓库历史。每次跑都有一条泄漏探针把这条断言测成量（`git cat-file -e <fix_sha>` 必须非零退出）。

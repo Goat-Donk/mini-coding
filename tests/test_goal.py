@@ -313,7 +313,7 @@ def test_check_blocked_by_gate_is_invalid_not_failed(tmp_path):
         def check(self, name, arguments, ctx, *, details=None):  # noqa: ANN001
             return Decision.DENY if name == "bash" else Decision.ALLOW
 
-        def describe(self, name, arguments, *, details=None):  # noqa: ANN001
+        def describe(self, name, arguments, *, details=None, ctx=None):  # noqa: ANN001
             return "全部拒绝（测试替身）"
 
     state = make_state()

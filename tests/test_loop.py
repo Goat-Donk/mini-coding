@@ -465,7 +465,7 @@ def test_denied_ask_user_does_not_pause(tmp_path):
         def check(self, name, arguments, ctx, *, details=None):  # noqa: ANN001 - 引擎接口
             return Decision.DENY
 
-        def describe(self, name, arguments, *, details=None):  # noqa: ANN001
+        def describe(self, name, arguments, *, details=None, ctx=None):  # noqa: ANN001
             return "全部拒绝（测试替身）"
 
     captured: list[str] = []
@@ -785,7 +785,7 @@ def test_a_denied_write_is_not_registered(tmp_path):
         def check(self, name, arguments, ctx, *, details=None):  # noqa: ANN001 - 引擎接口
             return Decision.DENY
 
-        def describe(self, name, arguments, *, details=None):  # noqa: ANN001
+        def describe(self, name, arguments, *, details=None, ctx=None):  # noqa: ANN001
             return "全部拒绝（测试替身）"
 
     (tmp_path / "a.txt").write_text("v0", encoding="utf-8")

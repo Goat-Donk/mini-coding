@@ -91,11 +91,44 @@
 - **所以"多轮循环值多少"不能用 `agent` vs `single-shot` 回答**（那个差里混着三样非能力因素）。要测循环本身，看**受控对** `agent` vs `one-step`：**66.7% vs 0%**，两条臂同工具、同提示、同流程，**只差 `max_steps` 一个数**。
   - ⚠️ 但 `one-step` 的 0/21 **不能读成「循环让模型变聪明了」**：它 21/21 撞满 `max_steps=1`、21/21 工作区**零变更**——它**没有机会**产出改动。这一对量的是「给不给得起第二次机会」，不是「循环的智能」。
 
-### 遗留（已列入下一轮，本轮**不做**）
+### 遗留（**本轮已全部收口**，见 M5-6）
 
-- **`_FENCE_RE` 的 bug 仍在 `eval/runner.py` 里**：本轮的修复只存在于 `evalverify/`，**没有回写**（三臂代码必须一致）。修正列因此是**反事实口径**，引用时必须与留档列并列。
-- **`conftest.py` 判定器注入绕过**：188 字节 PoC 已验证。为保三臂可比，本轮**统一关闭守卫**，代价是 `judge_tampering` 一律为 `null` —— 那是「**没检查**」不是「查过且干净」。**经事后审计，本轮 21 个任务中未发现任何利用此漏洞的行为。**
-- **`env_timeout` 取证不到**：报告只落了从 `terminated_reason` 派生的一个布尔，没落 `terminated_reason` 本身、也没落工具调用记录 —— "环境把他掐死了"和"真没修对"在数据上**完全同形**。**这一格空着，不拿猜测填。** 要让它可测：`per_task` 里落 `terminated_reason` + 工具调用记录。
+- ~~**`_FENCE_RE` 的 bug 仍在 `eval/runner.py` 里**~~ → **已回写**（唯一真相源现在在 `eval/runner.py`，在版本库里），并给报告加了 `ruler` 指纹。离线重算的 84.2% 仍是**反事实口径**，与重跑得到的实测数并列引用、不可混讲。
+- ~~**`conftest.py` 判定器注入绕过**~~ → **守卫默认已开**：P4（`rc==0` 时要求至少一个用例真的通过，堵住「全 skip 也是退出码 0」）+ P1（判定前把判定相关文件恢复到 agent 动手之前，且**记录**恢复过哪些）。`--no-guard-judge` 保留为复现归档口径的唯一入口。**仍未覆盖**：`sitecustomize.py`/`.pth`/工作区外的 site-packages/模块遮蔽，逐条记在 README S 表。
+- ~~**`env_timeout` 取证不到**~~ → `terminated_reason` 与 `tool_calls`/`gate_blocks` 已落进 `per_task`。**归档那三份报告改不了**（字段是之后才落地的）。
+
+## M5-6 前三个优先级：S16 沙箱 + 评估层三条遗留 + 扩样本的零成本部分（2026-09-12）
+
+**起点**：M5-5 把尺子做成了一件能自证的事，但**它自己留了三个口子**，其中最大的一个不在评估层 —— `bash` 子进程整个绕过了路径沙箱（README S16）。三条加在一起的性质是：**已经留档的数字没法逐条复核**。本轮把它们收口，并把扩样本的零成本部分做完、把花费摆出来。
+
+- [x] **S16 收口：bash 的 `command` 文本受路径沙箱约束**（**分层**：相对逃逸 DENY，其余 ASK）。先把两份沙箱语义合成一份 —— 抽出 `resolve_in_workspace()`，`read`/`write`/`edit` 与 bash **共用同一个函数**（`tests/test_permissions.py` 有一条用例专门钉「两份语义不许漂移」：对一组 raw 路径断言 `engine._resolve(...) is None` ⟺ bash 判 DENY ⟺ `ReadTool` 失败）。判据分两档：**相对逃逸硬 deny**（`../.env` 锚定 cwd 后确实在工作区外，与 `read ../.env` 被拒是同一个不变式）；**绝对路径越界 / 含变量与命令替换 → ask**（`grep -rn "/usr/lib" .` 这种模式串误杀必须可恢复）。**两处执行点**：`BashTool.execute()` 步骤 3（`ctx.permissions is None` 时生效 —— **eval 走的就是这条路**，S16 的实测证据正是在 eval 工作区里跑出来的）与 `PermissionsEngine._decide()` 的步骤 1'（**在记忆之前**，否则用户开过一次 `allow_always` 就永久失效）。
+  - **撤掉一条设计**：`-P`（`PYTHONSAFEPATH`）**不采纳**。合成的 flat 包**不带 `tests/__init__.py`** 时，`-P` 会掐掉 `python -m pytest` 提供的 cwd 插入 → `import <pkg>` 直接 `ModuleNotFoundError`；带 `tests/__init__.py`（tinydb 的情形）才无害。它挡的模块遮蔽换来的代价是**把一个仓直接跑废**，不划算。
+  - **实测**：`cat ../.env` / `type ..\.env` / `git -C ../o status` / `cp ../.env /tmp/x` 全部拒；`python -m pytest tests/ -q` / `git status` / `ls -la` / `pip install requests` / `cd ..` / `echo hi` 全部放行；URL 与 `/dev/null` 放行；引号内的路径抓得到；`cat $HOME/.env` 在**工具档不拒**（钉「无引擎只执行 deny 档」）。新增边界 S43–S49 逐条写进 README。
+- [x] **B1 `_FENCE_RE` 回写 + 报告尺子指纹**：判据按 `evalverify/diff_extract_fixed.py` 的 C 档重写进 `eval/runner.py`。**先写会红的用例再修** —— 回归夹具从留档的 5 个假阴性任务的**真实 `raw_output`** 里裁一段（散文 ` ```python ` 块 + ` ```diff ` 块 + 尾部散文）内联进测试，不依赖归档文件、无密钥。报告新增 `ruler` 块：`judge_version` + 两个源文件的 sha256 + `pytest.__version__` + `sys.version` —— **六项交叉验证里原先没有评测器自己**，而后两个直接决定 judge 结论。
+- [x] **B2 判定守卫默认翻转为开**：三件一起做（默认 `True`、新增 `--no-guard-judge` 保住归档口径的可复现性、同步 `judge_note`），并改掉那条「不传参数就断言 `judge_guard is False`」的用例。
+  - **P4（先做，价值最高）**：`rc==0` 时要求「至少有一个用例真的通过」。根因是**全 skip 时 pytest 退出码也是 0**——原来的守卫盯的是「谁改了文件」，**没盯「这次判定到底跑没跑测试」**。
+    - ⚠️ **`None` 绝不能读成 0，且必须从完整 `out` 解析而不是 6 行 `summary`**：留档 `45a4d4b3` 的 `judge_summary` 完全被 `PytestUnraisableExceptionWarning` 的 traceback 占满、搜不到任何 `N passed`，而它是一次**真实通过**。把「数不出」读成 0 会让**修 bug 的动作本身制造一个新的假阴性**。
+    - 顺带修掉统计行的锚定：pytest 8.4.1 在 `seconds >= 60` 时写成 `1 passed in 65.32s (0:01:05)`，少了 `(H:MM:SS)` 那一档就整条数不出来 → P4 静默失效。
+  - **P1**：判定前把判定相关文件恢复到 agent 动手之前。内容**不用 git HEAD**（agent 可以合法 `git commit`，HEAD 可能已带篡改版），而是在 `before` 快照那一刻额外抓一份 `{相对路径: bytes | None}`。恢复点在 `judge` **之前**，硬顺序 `… → snapshot(after) → zero_change → judge_tampering → restore → judge`。新增 `judge_restored` 字段（三态：`None` = 没做）。
+    - **名单是个正确性陷阱**：`tests/__init__.py` 必须按**相对路径**匹配 —— 把 `"__init__.py"` 加进按名字匹配的集合会让 `tinydb/__init__.py` 这类**合法源码**变成判定相关文件，恢复时把它**还原回去**，直接制造假阴性。所以引入 `_JUDGE_SENSITIVE_PATHS = {"tests/__init__.py"}`，与名字集合取并。
+    - **`--noconftest` 已实测排除**：tinydb 的隐藏测试**真的用** `tests/conftest.py` 的 fixture（抽样 8 个任务，4 个用到），而它永远不被 judge 覆盖、是**基线文件**。用了会把诚实的通过也打掉。
+- [x] **B3 `terminated_reason` + 工具调用记录落进 `per_task`**（**纯序列化，不新增采集**）：`terminated_reason` 原样落盘；`tool_calls` 从 `run.events` 投影（保留 `aborted` 三态 —— 它的语义是「这条调用**没有执行**」，与「跑了但失败」必须分开；只有 web 工具额外带截断到 300 字符的 `arguments`）；`gate_blocks` 让「拒绝」在轨迹里可见。`single-shot` 臂是手工构造的 `RunResult` → `tool_calls: []`（**是 `[]` 不是 `None`**：「没有工具可用」是事实，不是「没检查」）。
+- [x] **变异测试（牙齿检查）· 四套，逐条打断新不变式**：`s16verify/mutate_s16.py` **16/16**、`evalverify/mutate_b1.py` **8/8**、`evalverify/mutate_b2.py` **17/17**、`evalverify/mutate_c.py` **1/1** —— **42/42，零 MISS 零 SKIP**，四个脚本退出码全 0，日志 `evalverify/mutate_m5_6.log`。A 套打断的是：去掉 `relative_to` / 去掉 `expanduser` / 去掉命令位置豁免 / 去掉 URL 剔除 / 去掉引号内重扫 / 去掉「必须含分隔符」门槛 / 去掉 `ctx.permissions is None` 守卫 / 把步骤 1' 挪到记忆之后 / 把 DENY 改成 ASK / 让 `_resolve` 重新自己实现一份；B2 套打断的是：把 `passed = rc == 0` 退回 / 从 `summary` 解析计数 / **把「解析不到」读成 0** / 恢复挪到 `after` 快照之前 / 挪到 `judge` 之后 / 不记 `judge_restored`。跑完核对 `git status`：**22 改 + 1 未跟踪**（`tests/real_fence_desync.py`），**无变异残留**。
+- [x] **零成本探针**：`-P` / `--rootdir` / `--confcutdir` 是否采纳 → `-P` 不采纳（见上），后两个**采纳**并写进 `_pytest_argv`（它们把 rootdir 钉在工作区内；不然换一个**不自带 inifile** 的仓，rootdir 会一路爬到本项目根，评测器自己的 `conftest.py` 会在判定期被加载）。
+- [x] **扩样本：多仓参数化 + 第二仓闸门 + 成本上限**（零 LLM 成本）
+  - **实测硬约束**：tinydb 上同时改源码+tests 的合格提交**恰好 39 个** ⇒ `--limit` 上限就是 39，**再加大一个都不多**。所以 50+ 必须加第二个仓库。
+  - **第二仓选 `sqlparse`**（在 25 个候选里实测筛出）：flat 布局、**原地 `pytest` 收集 rc=0**（不需要装任何东西）、**143 个候选**；代价是它**没有 inifile** —— 正好用来验这一轮 `--rootdir`/`--confcutdir` 的修复（tinydb 有 inifile，对它是个 no-op）。体积 168,862 字符 ≈ 2.00× tinydb（按实测 3.79 字符/token 折算 ≈ 44.6k vs 22.3k）。
+  - **判据纠正**：调研脚本原先报包体积时把**全部 `.py`（含 `tests/`）** 当成了 single-shot 的输入，而真正的尺子是 `eval.runner._collect_sources`（全部非 `tests/` 的 `.py`）。`runner.py` 里「全包 ≈ 138 KB ≈ 35k tokens」那句话正是用错了尺子（138,575 字符是**含 tests** 的数），已改正。
+  - **顺带挖出并修掉一个真缺陷**：`test_files` 取的是「`tests/` 下任何改动文件」，于是非 Python 的测试**数据**文件（`tests/files/*.sql`）也被当节点交给 pytest → `ERROR: not found: ... (no match in any of [<Dir files>])` → **退出码 4（usage error）**，一次用例都没跑，而闸门把它记成「判定无效」，**丢掉一个本来有效的任务**。影响面：sqlparse 143 个候选里 5 个（**现在是 0 个**），tinydb 39 个里 0 个（⇒ **对已留档的报告零改动**）。修法：`_pytest_targets()` 只把 `.py` 交给 pytest；全是非 `.py` 时直接返回「拒绝零验证通过」，**不起子进程**。`JUDGE_VERSION` 3 → 4。
+  - **第二仓闸门实测**：修复前 **143 候选 → 51 有效 / 拒 92**；修复后 **143 → 54 有效 / 拒 89**（正好 +3 个：`791e25de` `d7b1ee37` `990500a1`，**零丢失**，`base_rc=4` 计数归 0）。拒绝画像（逐条数过，89 条对得上）：**64× `base_rc=2 fix_rc=2`**（Python-2 时代的树在本机 3.12 上收集期就过不去，两侧同号）、**22× `base_rc=1 fix_rc=1`**（隐藏测试在 base 就失败 —— 正常；但金标准补丁也没让它变绿 ⇒ 这个任务谁都拿不到分）、**3× `base_rc=0 fix_rc=None`**（base 就通过，白送分）。
+  - **样本合计：tinydb 21 + sqlparse 54 = 75 个有效任务**（闸门侧实测）。**按臂的花费上限**：sqlparse 三臂 ≈ **¥6.28**（agent ¥2.07 + one-step ¥0.15 + single-shot ¥4.05）；两仓新增三臂合计 ≈ **¥7.88**。**这两笔没跑，等点头。**
+- [x] **付费：`single-shot` 重跑**（唯一一笔花钱的，¥0.85 预授权）
+  - **第一次跑错了，如实记**：我按 `--limit 21` 跑，把它当成了「21 个任务」——实际它是**候选提交数**，21 个候选只闸出 **13 个有效任务**，所以那一次**没有**把 84.2% 变成实测（花了 **¥0.2374**）。跑完核对 `run_eval` 的函数体与留档报告的 `candidates = 39` 才发现，`--limit` 的 help 文案这时还写着「跑几个任务」，**是我写错的**，已改成明写「候选数，不是任务数」并带上 39→21 / 21→13 两个实测。
+  - **第二次按 `--limit 39` 重跑**（`report-20260912-210149.json`）：候选 39 → **有效 21**（与归档同一批）、通过 **17/19 = 89.5%**、补丁未应用 2、token 337,428、**估算成本 ¥0.3453**、缓存命中 **98.6%**。
+  - **两个数字并列**：**84.2%（16/19）= 反事实**（对归档冻结输出的离线重算）；**89.5%（17/19）= 实测**（解析器修好后新采样）。**新数不等于旧数，差全部来自采样**；解析器那部分的效应被直接量到 —— 5 个假阴性里**有 4 个在新采样里真的通过了**。逐任务 21 个里 17 个一致，4 个分岔全部归因采样。
+  - **本次沿用 `--no-guard-judge`（guard=关）**：为的是与 84.2% 对比时**只改解析器这一个变量**。所以这份新报告的 `judge_tampering`/`judge_restored` 也是 `null`（**没检查**），引用时不能说「查过且干净」。
+  - **成本对不上，不解释**：同一批任务、几乎相同的 token（341,337 vs 337,428），归档那轮 0.0% 缓存命中 / ¥0.8423，这次 98.6% / ¥0.3453，**差 2.4 倍**。`Usage.cache_hit_ratio` 在 hit+miss == 0 时返回 `None`，平均 0.0% 意味着 DeepSeek **当时确实返回了 hit=0**。**原因不明，只报事实。**
+  - **本轮实际花费 ¥0.2374 + ¥0.3453 = ¥0.5827**（预授权 ¥0.85，未超）。
 
 ## M6 文档 + 打磨（Day 19–21）
 
@@ -533,14 +566,15 @@ step 5  完成
 
 ## 进度快照
 
-- 当前里程碑：**M5-5 评估层加固 + 三臂真跑（2026-09-12 完成）** —— 物理剥离物化 + 泄漏探针、有效性闸门（39 候选 → 21 有效）、指标诚实性、定价快照、三臂真跑、**评测器审计（`_FENCE_RE` 围栏配对错位 → 5 个假阴性 → 零成本离线重算）**。详见上方 M5-5 一节。
+- 当前里程碑：**M5-6 前三个优先级（2026-09-12 完成）** —— S16 bash 命令文本沙箱（分层 deny/ask、两处执行点、与 `read`/`write` 共用 `resolve_in_workspace`）、评估层三条遗留全部收口（`_FENCE_RE` 回写 + `ruler` 指纹 / 判定守卫默认翻转为开 + P4 + P1 / `terminated_reason` 与工具调用记录落进 `per_task`）、扩样本的零成本部分（多仓参数化 + 第二仓 `sqlparse` 闸门 143→54 + 成本上限）、`single-shot` 重跑实测。详见上方 M5-6 一节。
+- 上一里程碑：**M5-5 评估层加固 + 三臂真跑（2026-09-12 完成）** —— 物理剥离物化 + 泄漏探针、有效性闸门（39 候选 → 21 有效）、指标诚实性、定价快照、三臂真跑、**评测器审计（`_FENCE_RE` 围栏配对错位 → 5 个假阴性 → 零成本离线重算）**。详见上方 M5-5 一节。
 - 上一里程碑：**M9 全部完成 —— 12 项核心能力清单落地 + M9-8 工作区 rewind 快照（2026-09-12 完成）**。第三批 M9-5 常驻交互模式 REPL、M9-6 ④ Goal；压轴 M9-7 ② sub-agent 并发（2026-09-11，变异 29/29、四条动线真跑）；**M9-8 工作区 rewind 快照 —— 2026-09-12 完成，变异 35/35、六条动线 A~F 真跑**。里程碑清单已清空，无未开工项。
 - 上一里程碑：**M8 完成**（P1–P7 全部完成；四项真实验证已跑，见上节）
 - 上一里程碑：**M7 完成**（M7-1~M7-6 + Part C 全部完成；四条真实 LLM 端到端验证 V1–V4 已全跑，工作区 `m7verify/`、`m7verify-nolock/` 已 gitignore）
-- 代码状态：**13,636 行源码 / 31 模块 / 769 测试全绿**（`python -m pytest tests/ -o addopts="" -q` → `769 passed`，无 skip；M9-8 完成时那一次 **81.36s**、2026-09-12 文档同步后 **88.47s**、M5-5 完成时 **295.86s** —— **用例数稳定，墙钟随机器负载浮动**；M5-5 那次机器上并发跑过别的东西，不要拿它当基线）
+- 代码状态：**14,425 行源码 / 31 模块 / 847 测试全绿**（`python -m pytest tests/ -o addopts="" -q` → `847 passed`，无 skip；M9-8 完成时那一次 **81.36s**、2026-09-12 文档同步后 **88.47s**、M5-5 完成时 **295.86s**、**M5-6 完成时 459.56s** —— **用例数稳定，墙钟随机器负载浮动**；M5-5 那次机器上并发跑过别的东西、M5-6 那次后台跑且机器同时在忙，都不要拿它们当基线）
   - 口径：源码 = `agent/` + `app/` + `eval/` 下的非空 `.py`（不含 `eval/repos/` 克隆仓），模块数 = 其中非空的 `.py` 文件数。**按文件系统数，不按 git 跟踪数** —— 新文件在提交前也该算进去（M9-5 时 `app/repl.py`(880) 与 `tests/test_repl.py` 尚未提交，按 git 数会各少一份，这正是上一条从 8,310 跳到 9,139 里的一部分；M9-6 的 `agent/goal.py`(232) / `agent/tools/goal.py`(118) / `tests/test_goal.py`(927)、M9-7 的 `agent/subagents.py`(540) / `tests/fake_llm.py`、M9-8 的 `agent/workspace.py`(814) / `tests/test_workspace.py`(785)、**M5-5 的 `agent/pricing.py`(181) / `tests/test_pricing.py`** 同理，目前也尚未提交）。
-  - `tests/` 合计 **14,551 行 / 28 个非空 `.py`**（29 个文件，含一个空的 `__init__.py`；上一版 13,385 行 / 27 个；M5-5 新增 `tests/test_pricing.py`，并给 `test_golden_tasks.py`（24→25 例）与 `test_eval_runner.py`（28→37 例）补了闸门 / 指标口径 / 三臂 / 快照成本的用例）。
-  - M5-5 的验证脚本在 `evalverify/`（**gitignore**，同 `m9verify/` 惯例）：`diff_extract_fixed.py`（修复逻辑唯一真相源）/ `rescore_single_shot.py`（离线重算，零 LLM）/ `reanalyse_patch_failed.py`（逐任务取证）/ `drive_three_arms.py`（三臂大对照）/ `drive_isolation_report.py` / `drive_judge_gaming.py` / `mutate_m5_5.py` + 各步日志与修正版报告 JSON。
+  - `tests/` 合计 **16,363 行 / 29 个非空 `.py`**（30 个文件，含一个空的 `__init__.py`；= **23 个 `test_*.py` + 7 个夹具模块**；上一版 14,551 行 / 28 个；M5-5 新增 `tests/test_pricing.py`，并给 `test_golden_tasks.py`（24→25 例）与 `test_eval_runner.py`（28→37 例）补了闸门 / 指标口径 / 三臂 / 快照成本的用例；**M5-6 又给 `test_golden_tasks.py`（25→39 例）与 `test_eval_runner.py`（37→65 例）补了 P4 计数解析 / P1 捕获-恢复-字段 / `ruler` 指纹 / 围栏错位回归，并新增夹具模块 `tests/real_fence_desync.py`（5 段真实围栏错位 `raw_output` 原文，**不被 pytest 收集**）**）。
+  - M5-5 的验证脚本在 `evalverify/`（**gitignore**，同 `m9verify/` 惯例）：`diff_extract_fixed.py`（**已降级为第 0 阶段自校验用的历史 bug 复现**；修复已回写进版本库里的 `eval/runner.py`，见 §9.6d）/ `rescore_single_shot.py`（离线重算，零 LLM）/ `reanalyse_patch_failed.py`（逐任务取证）/ `drive_three_arms.py`（三臂大对照）/ `drive_isolation_report.py` / `drive_judge_gaming.py` / `mutate_m5_5.py` + 各步日志与修正版报告 JSON。
   - 验证脚本：`m9verify/mutate_m9_8.py`(506 行) / `m9verify/drive_m9_8.py`(639 行) + 六份动线日志。
 - **M8 期间发现并修复的真 bug（真跑挖出来的，不是单测挖的）**：
   1. **`update_plan` 的引导缺失（elicitation gap）**：工具实现了、测试全绿、计划也能落盘 —— 但 system prompt 里**一个字都没提它**，模型 6 步跑完一次都没调。修法：prompt 里写明"任务复杂时先调 `update_plan` 排一份 3~6 步的简短计划"。修前 0 次 / 修后 2 次（同 P7-c 表）

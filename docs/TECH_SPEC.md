@@ -1915,14 +1915,15 @@ class SettleReport:           # killed / unclaimed / still_running / usage
 ### 9.6 eval/golden_tasks.py（M5-1 已实现：SWE-bench 思路的黄金任务集）
 
 ```python
-TINYDB_REPO = "https://github.com/msiemens/tinydb.git"
-DEFAULT_REPO = Path("eval/repos/tinydb")
+REPOS = {"tinydb": "https://github.com/msiemens/tinydb.git",
+         "sqlparse": "https://github.com/andialbrecht/sqlparse.git"}   # 登记表；未登记的名字不猜 URL
+DEFAULT_REPO = Path("eval/repos/tinydb")                       # 从"唯一"降级为"默认之一"
 FIX_KEYWORDS = ("fix","fixes","fixed","bug","error","crash","issue","regression","broken","incorrect")
 _NON_SOURCE_NAMES = ("setup.py", "conftest.py")                # 不算"被测源码"
 
 def git(repo_dir: Path, *args) -> str                          # 包装 subprocess git
 def _force_rmtree(task_path: Path) -> None                     # rmtree + 清只读位（3.12 onexc / 3.11 onerror）
-def ensure_repo(repo_dir=DEFAULT_REPO, *, clone_url=TINYDB_REPO) -> Path  # clone（3 次重试）
+def ensure_repo(repo_dir=DEFAULT_REPO, *, clone_url=None) -> Path   # clone（3 次重试）；没登记的名字抛 ValueError
 def discover_fix_commits(repo_dir, *, limit=20, keywords=FIX_KEYWORDS) -> list[dict]
 def render_task_text(commit: dict) -> str                      # 真实 bug 报告（subject+body，不造假）
 @dataclass GoldenTask: id, base_sha, fix_sha, title, task_text, changed_sources, hidden_tests
@@ -1931,16 +1932,30 @@ def _archive_to(sha, repo_dir, target) -> None                 # git archive →
 def materialize(task, target_dir, repo_dir) -> Path            # 物理剥离（不是 worktree）
 def remove_workspace(target_dir) -> None
 def leak_probe(task, workspace) -> bool                        # cat-file -e fix_sha == 0 → 泄漏了
-@dataclass JudgeResult: passed, returncode, summary
+@dataclass JudgeResult: passed, returncode, summary, passed_count
+def _pytest_targets(test_files) -> list[str]                   # 只留 .py（非 .py 的数据文件不能当节点，见下）
+def _pytest_argv(workspace, test_files) -> list[str]           # -o addopts= / --rootdir / --confcutdir，不含 -P
+def _parse_passed_count(out) -> int | None                     # 从**完整 out** 解析；解析不到返回 None（绝不返回 0）
+def _judged_passed(returncode, passed_count) -> bool           # P4：rc==0 且（数不出 或 >0）
 def _run_pytest(workspace, test_files) -> JudgeResult          # judge 与闸门共用；sys.executable
 def _write_hidden_tests(workspace, hidden_tests) -> None
 def judge(task, workspace) -> JudgeResult                      # hidden tests 覆盖写回 → pytest
+_JUDGE_SENSITIVE = {...}                                       # 按**文件名**匹配的名单（conftest.py / pytest.ini / …）
+_JUDGE_SENSITIVE_PATHS = frozenset({"tests/__init__.py"})      # 按**相对路径**匹配的那一档（见 §9.6 的陷阱）
+def _is_judge_sensitive(rel_path) -> bool                      # 两个集合取并
+def judge_sensitive_blind_spots(task) -> list[str]             # 闸门的前置断言：金标准改了它却没进 hidden_tests
 @dataclass TaskValidity: valid, reason, base_rc, fix_rc, base_collect_error
 def _stage_and_run(sha, repo_dir, hidden_tests, test_files) -> JudgeResult
 def validate_task(task, repo_dir) -> TaskValidity              # 有效性闸门（两侧都查）
 def validate(task, repo_dir) -> TaskValidity                   # 单任务，含兜底
 def validate_tasks(tasks, repo_dir) -> list[tuple[GoldenTask, TaskValidity]]
 ```
+
+- **多仓参数化**：`REPOS` 是登记表，`DEFAULT_REPO` 只是"默认之一"。`ensure_repo` 对**没登记**的名字
+  **抛 `ValueError`、不猜 URL** —— 安静地克隆出一个不相干的仓是最坏的结果。`runner` 的 `--repo`
+  与报告的 `repo`/`repo_head` 字段在这一轮之前就存在，所以多仓跑出来的报告**天然可区分**。
+  ⚠️ `runner --limit` 是**候选提交数**，不是任务数（候选还要过闸门）：tinydb 上实测 39 个候选 → 21 个有效、
+  21 个候选 → 13 个有效。**想复现留档那一批 21 个任务就得给 39**（CLI help 已改成这么写）。
 
 - **任务构造**：从 tinydb git history 找 subject 含 fix 关键字的提交，且**同时改源码与 tests/**。
   `base_sha = fix 提交的父提交`（= bug 存在状态）；`task_text` = 该提交的 subject+body
@@ -1982,8 +1997,10 @@ def validate_tasks(tasks, repo_dir) -> list[tuple[GoldenTask, TaskValidity]]
   `invalid`（理由如实写「agent 没改工作区任何文件，测试却通过」）——闸门管不住 agent
   改工作区之外的东西（往 site-packages 塞 conftest、装包）让测试变绿。
   - ⚠️ **顺序是硬要求**：`run_single` 必须 `物化 → leak_probe → 快照(before) → 跑臂 → 快照(after)
-    → 判零变更 → 最后才 judge`。`judge` 会把隐藏测试**写回工作区**，快照一旦排在它后面，
-    零变更检测永远非零，等于没做。
+    → 判零变更 → 判篡改 → 恢复判定相关文件 → 最后才 judge`。`judge` 会把隐藏测试**写回工作区**，
+    快照一旦排在它后面，零变更检测永远非零，等于没做。恢复也必须在 `judge` **之前**：挪到之后，
+    篡改已经生效，恢复毫无意义；挪到 `after` 快照之前，`zero_change` 会变成 `True`，报告会把
+    「改了裁判」读成「空转」。
   - ⚠️ **白送分防御的顺序也是硬的**：`steps == 0` → `zero_change` → `judge_tampering`，
     每条都置 `invalid_reason` 并强制 `passed = False`。
   - ⚠️ **失败分类的桶序是硬的**：`error → patch_failed → not_scored → passed → tests_failed`。
@@ -1991,12 +2008,53 @@ def validate_tasks(tasks, repo_dir) -> list[tuple[GoldenTask, TaskValidity]]
   - ⚠️ **D1 是 D 的子集，不是并列的第五类**：D1 = 撞 `max_steps` 且未通过 ⊆ D = `tests_failed`。
     D1 + D 相加 = 重复计数。D1 的意义是把"没预算"从"没修对"里拆出来——`one-step` 这类
     天然预算受限的臂，不拆就会被读成能力差。
-- 测试：tests/test_golden_tasks.py（25 个）+ conftest `fixture_repo`（本地迷你仓库离线造
+- **P4：`rc == 0` 不等于"跑了测试"**（全 skip 时 pytest 退出码也是 0）。判据是
+  `returncode == 0 and (passed_count is None or passed_count > 0)`。**两个细节都是承重的**：
+  ① `None`（解析不到）**保持通过** —— 留档 `45a4d4b3` 的 `judge_summary`（末 6 行）被
+  `PytestUnraisableExceptionWarning` 的 traceback 占满、搜不到任何 `N passed`，而它是一次**真实通过**；
+  把"数不出"读成 0，等于**修 bug 的动作本身制造一个新的假阴性**。
+  ② 计数必须从**完整 `out`** 解析而不是 `summary`，同理。
+  统计行判据还要认得 pytest 8.4.1 在 `seconds >= 60` 时写的 `1 passed in 65.32s (0:01:05)`
+  （`_pytest/terminal.py:format_session_duration`）—— 少了 `(H:MM:SS)` 那一档，P4 会**静默失效**。
+- **P1：判定前恢复判定相关文件**。它是唯一能**移除机制**（而不是记录行为）的手段。内容**不用 git HEAD**
+  ——agent 可以合法 `git commit`，HEAD 可能已带篡改版；改在 `before` 快照那一刻额外抓一份
+  `{相对路径: bytes | None}`（`None` = 当时不存在），用**独立函数** `_capture_judge_sensitive`，
+  **不动 `_snapshot_tree` 的契约**（快照的语义是 `zero_change` 的依据，不该被污染）。
+  结果落 `judge_restored: list[str] | None`（三态同 `judge_tampering`，`None` = 没做）——
+  没有它就等于「我们悄悄清干净了」，而没记录就等于没有证据。**单调性**：恢复只会让分数变低或不变。
+  - ⚠️ **名单是个正确性陷阱**：`_JUDGE_SENSITIVE` 按 `Path(p).name` 匹配，而 tinydb 的
+    `tests/__init__.py` **存在且为空**（一行 `os._exit(0)` 就能翻盘，严重度最高），它的 name 是
+    `"__init__.py"`。**绝不能**把 `"__init__.py"` 加进名字集合 —— 那会让 `tinydb/__init__.py`
+    这类**合法源码**变成判定相关文件，而 P1 的恢复会把它**还原回去**，直接制造假阴性。
+    正确做法是引入**相对路径**集合 `_JUDGE_SENSITIVE_PATHS = {"tests/__init__.py"}` 与名字集合取并。
+    **不再往名单里加名字**：那是追不上的打地鼠（与 `_irreversible_kind` 放弃枚举动词同一条教训）。
+  - **闸门加一条前置断言**（零 LLM 可测）：fix 提交改了 `_JUDGE_SENSITIVE` 里的文件、且该文件
+    **不在** `hidden_tests` 里 → 拒/打标。这是 P1 唯一的真风险面。
+  - **已实测排除 `--noconftest`**：tinydb 的隐藏测试**真的用** `tests/conftest.py` 的 `db`/`storage`
+    fixture（抽样 8 个任务，4 个用到），而 `tests/conftest.py` 永远不被 judge 覆盖、是**基线文件**。
+    用它会把**诚实**的通过也打掉，还会把 rc 推成 5 → 记「判定无效」，是拿一个真缺陷换另一个。
+- **判定期的 pytest 钉在工作区内**：`-o addopts=`（tinydb 的 `--cov` 会让 pytest 以退出码 4 直接退出）
+  + `--rootdir=<ws>` + `--confcutdir=<ws>`。**后两个是本轮采纳的零成本探针** —— 原先 rootdir 靠
+  **目标仓自带 `pytest.ini`** 才落在工作区；换一个不自带 inifile 的仓（如 sqlparse），rootdir 会一路
+  爬到本项目根，而那里有 `pyproject.toml` 且带 `[tool.pytest.ini_options]` ⇒ **评测器自己的
+  `conftest.py` 会在判定期被加载**。
+  ⚠️ **`-P`（`PYTHONSAFEPATH`）实测后不采纳**：合成的 flat 包**不带 `tests/__init__.py`** 时，
+  `-P` 会掐掉 `python -m pytest` 提供的 cwd 插入 → `import <pkg>` 直接 `ModuleNotFoundError`；
+  带 `tests/__init__.py`（tinydb 的情形）才无害。它挡的模块遮蔽换来的代价是**把一个仓直接跑废**。
+- **非 `.py` 的测试数据文件不许当 pytest 节点**（本轮修的真缺陷）：`test_files` 取的是「`tests/` 下
+  任何改动文件」，于是 `tests/files/*.sql` 这类夹具也被交给 pytest →
+  `ERROR: not found: ... (no match in any of [<Dir files>])` → **退出码 4（usage error）**，
+  一次用例都没跑，而闸门把它记成「判定无效」，**丢掉一个本来有效的任务**。
+  修法：`_pytest_targets()` 只把 `.py` 交出去；**全是非 `.py` 时直接返回 `_NO_TESTS_RC`（=5，
+  「拒绝零验证通过」）并且不起子进程**。影响面：sqlparse 143 个候选里 5 个（修复后 0 个），
+  tinydb 39 个里 **0 个** ⇒ **对已留档的报告零改动**。`JUDGE_VERSION` 3 → 4。
+- 测试：tests/test_golden_tasks.py（**39 个**）+ conftest `fixture_repo`（本地迷你仓库离线造
   buggy → fix → 非 fix 提交，不联网）。
 
 ### 9.6b eval/runner.py（M5-2 已实现：回归报告）
 
 ```python
+JUDGE_VERSION = 4                  # 手写整数；判定语义每改一次就 +1（写进报告的 ruler 指纹）
 DEFAULT_MODEL_FOR_PRICING = agent.pricing.DEFAULT_MODEL   # 单价查 agent/pricing.py 快照表
 DEFAULT_WS_ROOT = Path("data/eval/ws")
 ARMS = ("agent", "one-step", "single-shot")
@@ -2004,22 +2062,29 @@ ARMS = ("agent", "one-step", "single-shot")
 @dataclass TaskResult: task, passed, run, error, duration_s, cost_cny,
                        judge_summary, invalid_reason, zero_change, leak_reachable,
                        setup_s, patch_failed, budget_exhausted, judge_tampering,
-                       patch_error, raw_output, prompt
+                       patch_error, raw_output, prompt,
+                       judge_passed_count, judge_restored      # 本轮新增
                        @property judged        # error is None and not patch_failed → 进分母
                        @property effective_pass # judged and passed and invalid_reason is None → 进分子
 @dataclass ArmOutcome: run, patch_failed, patch_error, raw_output, prompt
 def estimate_cost_cny(prompt_hit, prompt_miss, completion) -> float   # miss 缺省 = prompt - hit
 def _snapshot_tree(root) -> dict[str, str]     # 工作区文件哈希快照（judge 之前测零变更）
+def _capture_judge_sensitive(ws) -> dict[str, bytes | None]    # P1：抓判定相关文件的当前内容
+def _restore_judge_sensitive(ws, captured, rels) -> (list, list)  # 返回 (恢复成功, 失败)
+def _tool_call_records(events) -> list[dict]   # 投影 type=="tool_call"（保留 aborted 三态）
+def _gate_block_records(events) -> list[dict]  # 投影 type=="gate_block" → {tool, source, reason}
 def _build_llm(mock) -> BaseLLM                # mock → MockLLM.text（无 key 冒烟验证管线）
 def _collect_sources(ws) -> dict[str, str]     # single-shot 的输入：全部非 tests/ 的 .py
 def single_shot_prompt(task, ws) -> str        # prompt 原样进报告（可审计）
 def _extract_diff(text) -> str                 # 抠 unified diff；抠不出返回 ""（不当补丁猜）
 def _apply_patch(ws, diff) -> tuple[bool, str]
 def _run_arm(arm, llm, task, ws) -> ArmOutcome # max_steps=1 if arm=="one-step" else 25
-def run_single(task, repo_dir, *, ws_root, mock, arm, validate) -> TaskResult
+def run_single(task, repo_dir, *, ws_root, mock, arm, validate, judge_guard=True) -> TaskResult
 def _aggregate(results) -> dict
-def run_eval(repo_dir=DEFAULT_REPO, *, ws_root, limit=5, mock=False, arm="agent") -> dict
-def main()   # CLI: --repo / --ws-root / --limit / --mock / --keep / --no-validate / --arm
+def run_eval(repo_dir=DEFAULT_REPO, *, ws_root, limit=5, mock=False, arm="agent",
+             judge_guard=True) -> dict
+def main()   # CLI: --repo / --ws-root / --limit（**候选数，不是任务数**）/ --mock / --keep /
+             #      --no-validate / --arm / --no-guard-judge
 ```
 
 - **流程**：闸门（拒掉的不进 LLM）→ 物化（物理剥离）→ 按 arm 跑 task_text 修 bug →
@@ -2037,7 +2102,8 @@ def main()   # CLI: --repo / --ws-root / --limit / --mock / --keep / --no-valida
   （provider-usage-first；端点不返回缓存字段时 `miss = prompt_tokens - hit` 兜底，
   否则全部输入按 ¥0 计、而同报告的 `total_tokens` 照旧计入 → 报告自相矛盾）。
 - **报告**（字段名逐一对应实际落盘 JSON）：ts / mode(mock|deepseek) / repo / **model / base_url /
-  repo_head** / arm / **gate{candidates, valid, rejected, oracle_baseline, enabled}** /
+  repo_head** / arm / **ruler{judge_version, runner_sha256, golden_tasks_sha256, pytest_version,
+  python_version}** / **gate{candidates, valid, rejected, oracle_baseline, enabled}** /
   candidates / pricing_snapshot_id / pricing_note / pricing_warning / judge_guard / judge_note /
   tasks / **judged**（完成率分母）/ invalid / not_scored / **passed** / patch_failed /
   completion_rate / total_tokens / total_cost_cny / total_setup_s / avg_cache_hit_ratio /
@@ -2045,14 +2111,25 @@ def main()   # CLI: --repo / --ws-root / --limit / --mock / --keep / --no-valida
   per_task[]（id / title / **fix_sha** / passed / **passed_effective** / error / duration_s /
   setup_s / steps / tokens / cost_cny / **patch_failed / patch_error / raw_output** /
   invalid_reason / zero_change / leak_reachable / budget_exhausted / judge_summary /
-  judge_tampering / single_shot_prompt），落 `data/eval/report-*.json`。
+  **judge_passed_count** / judge_tampering / **judge_restored** / **terminated_reason** /
+  **tool_calls** / **gate_blocks** / single_shot_prompt），落 `data/eval/report-*.json`。
   **自证字段**（`arm` / `model` / `base_url` / `repo_head` / `pricing_snapshot_id` / `gate` /
-  `candidates`）不是装饰：没有它们，两份报告是否同一批任务、同一把尺子就无法判定。
+  `candidates` / **`ruler`**）不是装饰：没有它们，两份报告是否同一批任务、同一把尺子就无法判定。
+  **`ruler` 是本轮补的**——原先六项交叉验证里**没有评测器自己**，而 `pytest` 与 `python` 的版本
+  直接决定 judge 结论（P4 的统计行形状、统计行判据都跟 pytest 版本有关）。
   `raw_output` 的意义同理——补丁没落地时把模型原始输出存进报告，**能不能翻案有据可查**
-  （本轮 5 个假阴性正是这样翻过来的，见 9.6d）。
-- 测试：tests/test_eval_runner.py（37 个：定价快照成本 / mock 冒烟整管线 / 报告字段可 JSON 落盘 /
-  `passed∧¬error` 口径 / 零变更判 invalid / 三臂 / `--keep` / `patch_failed` 不计入分母 /
-  闸门崩掉只拒那一个任务）。
+  （5 个假阴性正是这样翻过来的，见 9.6d）。
+- **三态纪律**（贯穿全部新字段）：`None` = **没做/没查**，`[]` = **做了且干净**，两者不可互换。
+  `judge_restored`、`judge_tampering`、`single-shot` 的 `tool_calls: []`（「没有工具可用」是
+  事实，不是「没检查」）都按这条走。`tool_calls` 里另留 `aborted` 键：它的语义是「这条调用
+  **没有执行**」，与「跑了但失败」必须分开。只有 `web_fetch`/`web_search` 额外带截断到 300 字符的
+  `arguments`——其余工具不落参数（体积，且参数里可能含被注入的文本）。
+- 测试：tests/test_eval_runner.py（**65 个**：定价快照成本 /
+  mock 冒烟整管线 / 报告字段可 JSON 落盘 / `passed∧¬error` 口径 / 零变更判 invalid / 三臂 /
+  `--keep` / `patch_failed` 不计入分母 / 闸门崩掉只拒那一个任务 / **恢复的三个危险位置（含
+  monkeypatch `judge`、在它被调用的那一刻读盘断言篡改文件已不存在）** / `judge_restored` 三态 /
+  `--no-guard-judge` 仍能复现归档口径 / **B1 的围栏错位回归（夹具 `tests/real_fence_desync.py`，
+  5 段真实 `raw_output` 原文）** / **`ruler` 指纹六项齐全**）。
 
 ### 9.6c agent/pricing.py（M5-5 新建：定价快照）
 
@@ -2107,7 +2184,7 @@ def pricing_note(model) -> str           # 可直接写进报告的成本口径�
 
 ```
 evalverify/
-├── diff_extract_fixed.py        # ★ 修复逻辑的【唯一真相源】（含 bug 机制的完整 ASCII 说明）
+├── diff_extract_fixed.py        # 第 0 阶段自校验用的【历史 bug 复现】（tier A，含 bug 机制的完整 ASCII 说明）
 ├── rescore_single_shot.py       # 离线重算：重抠 + 重落 + 重判，**LLM 调用 0 次**
 ├── reanalyse_patch_failed.py    # 逐任务取证：7 个 patch_failed 里，几个该由我负责
 ├── drive_three_arms.py          # 三臂大对照：可比性校验 → 同分母 → 配对四格 → 解耦归因
@@ -2129,11 +2206,24 @@ evalverify/
 3. **不覆盖留档。** 修正结果写**另一个文件**（`evalverify/report_single_shot_rescored.json`），
    `data/eval/report-*.json` 一个字节都不动；输出 JSON 里带 `rescored` 溯源块。
    报告里逐字段搬运的只有**非解析相关**的字段（`tokens` / `cost_cny` 照搬——那次调用**真的发生过**）。
-4. **修复代码只有一份。** `diff_extract_fixed.py` 是唯一真相源，`reanalyse_patch_failed.py` 与
-   `rescore_single_shot.py` 都 import 它。**两份副本 = 迟早漂移**，而这个 bug 的教训正是
+4. **修复代码只有一份，且它在版本库里。** 唯一真相源是 **`eval/runner.py`**（`JUDGE_VERSION = 4`）；
+   `evalverify/diff_extract_fixed.py` 只剩**第 0 阶段自校验用的历史 bug 复现**（tier A）——
+   它必须能复现旧行为，否则「先自校验」这条不变式就没了对象。
+   ⚠️ 原先这里写的是「`diff_extract_fixed.py` 是唯一真相源」，而 `evalverify/` **被 gitignore**
+   —— 那句话等于说「真相源不在仓库里」。本轮已纠正：判据回写进 `eval/runner.py`，
+   报告另加 `ruler` 指纹（`judge_version` + 两个评测源文件的 sha256 + `pytest`/`python` 版本），
+   把「**这把尺子是哪一把**」也变成可机检的。**两份副本 = 迟早漂移**，而这个 bug 的教训正是
    「解析器会悄悄决定分数」。
+   ⚠️ **一处已知的指纹失配，如实记**：留档报告 `report-20260912-210149.json` 跑完后，两个评测
+   源文件各收到**一次不改变行为的修正** —— `eval/golden_tasks.py` 改的是一段注释（把 `-P` 那段
+   「要等第二个仓定下来才量得到」改成探针**已经量到**的事实），`eval/runner.py` 改的是一句
+   **启动横幅**（`任务数 {limit}` → `候选 {limit}`，因为 `--limit` 限的是候选、真任务数过闸门
+   之前未知，那句错文案正是把人引到白跑一次付费评测的原因）。所以盘上这两个文件的 sha256
+   **不再等于**那份报告里的 `ruler.golden_tasks_sha256` / `ruler.runner_sha256`。
+   **这是指纹字段该有的行为，不是篡改** —— 判定语义没动（`JUDGE_VERSION` 仍是 4），全量 pytest
+   全绿背书。要复核那份报告，请按报告里记的 sha 去比对，别拿当前盘上的文件比。
 
-**被修的那个 bug**（`eval/runner.py:279`，本轮**仍在**——冻结不改）：
+**被修的那个 bug**（原 `eval/runner.py:279`，**本轮已修并回写**，`JUDGE_VERSION` 3 → 4）：
 
 ```python
 _FENCE_RE = re.compile(r"```(?:diff|patch)?[ \t]*\n(.*?)```", re.DOTALL)   # 开围栏只认三种 info string
@@ -2154,6 +2244,13 @@ _BARE_FENCE = re.compile(r"^[ \t]*```[ \t]*$", re.MULTILINE)    # C: 兜底切�
 **三档对照是设计的一部分，不是调试残留**：A（现行）/ B（只修围栏）/ C（B + 兜底截断）逐档独立
 落盘判分。A 必须复现 0/7（**证明复现忠实**），B/C 救回 5/7 —— 差额的来源因此是**可归因**的，
 而不是"改了几个地方就好了"。
+
+**回写与回归夹具（M5-6）**：C 档已按原样写进 `eval/runner.py` 的 `_extract_diff`，
+`JUDGE_VERSION` 3 → 4。回归用例**必须用真实的围栏错位原文**（从留档 5 个假阴性任务的
+`raw_output` 里裁一段内联进测试——`data/` 被 gitignore，夹具不能靠归档文件），因为
+**这个 bug 一条测试都不变红的原因，正是当时没有任何用例覆盖「diff 块前面有 ```python」**。
+修好之后的**实测**是另一次重跑的数，与 84.2% 这个**反事实修正值**并列，不可混讲
+（见 `docs/eval_three_arms_summary.md`「解析器修好之后」）。
 
 - ⚠️ **`evalverify/` 被 gitignore**（同 `m9verify/` 的三段式惯例）。接受的代价与补偿：
   这些脚本不进版本库，但它们产出的**结论**（修正值、归因、口径边界）**全部写进了**
@@ -2413,8 +2510,23 @@ def memory_frame(text, source) -> str        # **项目约定**外框（措辞�
 - **问题**：`app/cli.py` 的 `load_dotenv()` 把 `DEEPSEEK_API_KEY` 灌进 `os.environ`，而 `subprocess.run` 默认**继承父进程环境** —— 于是 `echo %DEEPSEEK_API_KEY%`（POSIX 下 `printenv DEEPSEEK_API_KEY`）一条命令就能把 key 打出来，**完全不需要读任何文件**。这是最短的外泄路径，比「读 `.env` 再外发」短得多，只盯着「读凭据 + 网络外发」的规则会系统性漏掉它。
 - **做法**：`subprocess.run(..., env=_scrubbed_env())`。`SENSITIVE_ENV_PATTERNS` 按**变量名**剔除：`*_API_KEY` / `API_KEY` / `*_TOKEN` / `TOKEN` / `*_SECRET` / `*_SECRET_*` / `*PASSWORD*` / `*PASSWD*` / `*_CREDENTIAL(S)` / `AWS_ACCESS_KEY_ID` / `AWS_SESSION_TOKEN` / `GH_TOKEN` / `GITHUB_TOKEN`。
 - **刻意不用白名单**：白名单会把 `VIRTUAL_ENV` / `PYTHONPATH` / 代理设置一并干掉，把正常任务跑坏。按名剔除是这里更合适的粒度。
-- **局限（不夸大）**：这是按**名**的黑名单，**不是保证** —— 换个名字（`MY_PRIVATE_STUFF=xxx`）照样漏；bash 也仍能 `type ..\.env` 直接把仓库根的 `.env` 读出来（bash 的沙箱只管 cwd，不管命令文本里的 `..`）。两条都在 README「已知未修复的绕过路径」的 S12 / S16。
-- **实测（真跑，非 mock）**：同一命令两版对照 —— `env=None`（修复前语义）输出 **35 字节、含真实 key**；`_scrubbed_env()` 输出 **18 字节、字面量 `%DEEPSEEK_API_KEY%`**。真跑 agent 时它把 `%DEEPSEEK_API_KEY%` 写进文件，`sk-` 出现 **0 次**。**但对照组也确认了上面那条残留是真的**：`type ..\.env` 与 `cat ../.env` 各返回 **336 字节、含真实 key**（`read` 工具读同一路径被硬 deny）。
+- **局限（不夸大）**：这是按**名**的黑名单，**不是保证** —— 换个名字（`MY_PRIVATE_STUFF=xxx`）照样漏。**原先这里还写着第二条「bash 也仍能 `type ..\.env` 直接读仓库根的 `.env`」—— 那条已经修了（S16，见 §9.10b）**，判据落在 `BashTool.execute()` 里；换掉的是一批新的边界（运行时拼出来的路径、编码写法等），逐条记在 README 的 S43–S49。按名黑名单这条本身仍在 README 的 S12。
+- **实测（真跑，非 mock）**：同一命令两版对照 —— `env=None`（修复前语义）输出 **35 字节、含真实 key**；`_scrubbed_env()` 输出 **18 字节、字面量 `%DEEPSEEK_API_KEY%`**。真跑 agent 时它把 `%DEEPSEEK_API_KEY%` 写进文件，`sk-` 出现 **0 次**。**同一组对照还确认了上面那条残留当时是真的**：`type ..\.env` 与 `cat ../.env` 各返回 **336 字节、含真实 key**（`read` 工具读同一路径被硬 deny）—— 它现在是本轮 S16 修复的**回归依据**：同一对写法在新判据下应双双被拒。
+
+#### bash 命令文本的路径沙箱（`agent/tools/bash.py` + `agent/permissions.py`，S16 修复）
+
+- **问题**：沙箱原本是「工具层的路径解析」——`read`/`write`/`edit` 的越界检查走 `_resolve`（硬 deny），而 bash 只校验 `cwd` 参数，**`command` 文本一个字符都不看**。于是 `type ..\.env` 能把仓库根的 `.env` 读出来，而 `read ../.env` 被拒。**同一个不变式有两个答案**，这是它最该修的理由（不只是"漏了一条路"）。
+- **落点（一份权威，两处执行）**：先把两份沙箱语义合成一份 —— 抽出纯函数 `resolve_in_workspace()`（`agent/tools/files.py`），`_resolve` 退化成薄壳，`PermissionsEngine._resolve` 委托它。**bash 用的是同一个函数**，不是抄一份。
+- **判据分两档，分档依据是确定性不同**（`command_path_verdict` 返回 `(deny, ask)`，调用方**必须分开处理** —— 合成一个布尔会让分层失效）：
+  - **相对逃逸 → 硬 DENY**：`../.env` 按 `cwd` 锚定后确实在工作区外，语义无歧义，与 `read ../.env` 被硬拒是同一个不变式。
+  - **绝对路径越界 / 含变量与命令替换 → ASK**：绝对路径可能是模式串而非路径（`grep -rn "/usr/lib" .`），取值本来就不确定 —— 误杀必须**可恢复**。
+- **两处执行点**：① `BashTool.execute()` 步骤 3，**只在 `ctx.permissions is None` 时落 deny 档**（与同文件里危险命令兜底同形：引擎在场时由引擎决策，此处仅兜底）。这一处是**必须**的 —— `runner._run_arm` 构造 `QueryEngine` 时**不传 `permissions`**，eval 的 `ctx.permissions` 恒为 `None`，而 S16 的实测证据正是在 eval 工作区里跑出来的。② `PermissionsEngine._decide()` 的**步骤 1'**，在 `_always`/`_turn` 记忆**之前**（否则用户开过一次 `allow_always`，收紧就永久失效 —— 与 `_apply_taint_ceiling` 那条对称）。ask 档放进 `_rule_check` 的 bash 分支，**可以**被记忆记住。
+- **`_classify()` 刻意不改**：它返回的 `(kind, target)` 是记忆与规则表的**键**，加一类会改记忆键与 `_rules` 结构，而沙箱判定压根不走规则层。
+- **与既有判据的关系**：`CREDENTIAL_MENTION` 抓「**提到**凭据文件」（含无路径的 `grep -rn "\.env" README.md`），但只在 `high` 会话生效；`_irreversible_kind` 判「不可逆动作类别」，也只在 `high` 经天花板生效；**新判据抓「路径真的越界」，任何会话都生效**。三者覆盖集**互不包含**，是叠加不是冗余。
+- **拒绝文案**：`describe()` / `denial_hint()` 收一个**可选** `ctx`（默认 `None`，既有单测调用不受影响），把越界的那条候选写进文案 —— 本仓纪律「拒绝必须带出处与解除方式」。
+- **刻意不接的地方**：`needs_permission()`（`base.py` / `bash.py`）**全仓没有生产调用者**，只有一条单测。挂上去等于造一处死代码。
+- **已知边界**：S43–S49（词法提取不解析 shell / `argv[0]` 豁免 / 无引擎只落 deny 档 / `~` 展开 / 不判隐式 I/O / 白名单是枚举的 / `cd ..` 与 `cd ../..` 不一致）。
+- **实测**：越界写法（`cat ../.env`、`type ..\.env`、`git -C ../o status`、`cp ../.env /tmp/x`）**全部拒**；正常写法（`python -m pytest tests/ -q`、`git status`、`ls -la`、`pip install requests`、`cd ..`、`echo hi`）**全部放行**；URL 与 `/dev/null` 放行（**URL 剔除是必须的，不是优化**：Windows 上 `Path("http://x/y").is_absolute()` 返回 `True`，不剔除会让所有含 URL 的命令变成越界）；`cat $HOME/.env` 在工具档**不拒**（钉「无引擎只执行 deny 档」）。另有一条用例专门钉「两份沙箱语义不许漂移」：对一组 raw 路径断言 `engine._resolve(...) is None` ⟺ bash 判 DENY ⟺ `ReadTool` 失败。
 
 #### 第三方（MCP）工具必须显式授权（`agent/mcp.py` + `agent/permissions.py`，A2）
 

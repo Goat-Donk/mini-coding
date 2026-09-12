@@ -1,9 +1,21 @@
 """M5-2 tests: eval/runner.py（离线 mock 冒烟：物化→agent→judge→清理→报告）。"""
+import re
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
+
 import pytest
 
 from agent.llm import MockLLM
-from eval.golden_tasks import GoldenTask, build_task, discover_fix_commits, git
-from eval.runner import _aggregate, estimate_cost_cny, run_eval, run_single
+from eval.golden_tasks import (
+    GoldenTask,
+    build_task,
+    discover_fix_commits,
+    git,
+)
+from eval.runner import _aggregate, _extract_diff, estimate_cost_cny, run_eval, run_single
+from tests.real_fence_desync import REAL_FENCE_DESYNC
 
 
 def test_estimate_cost_cny():
@@ -36,6 +48,9 @@ def test_run_eval_mock_smoke(tmp_path, fixture_repo):
     assert row["error"] is None            # pipeline 本身无异常
     assert row["steps"] == 1               # mock 一步给结论
     assert row["leak_reachable"] is False
+    # P4：mock agent 不改任何东西 → 判定真的跑了、确实一个用例都没通过。
+    # 0 与 None 在这里必须分得开（None = 没数出来）。
+    assert row["judge_passed_count"] == 0
     # 工作区已清理
     assert not (tmp_path / "ws" / row["id"]).exists()
 
@@ -59,6 +74,56 @@ def test_report_records_which_ruler_and_which_material(fixture_repo, tmp_path):
     assert report["repo_head"] == git(repo, "rev-parse", "HEAD")
     assert report["candidates"] == 1
     assert report["repo"] == str(repo)
+
+
+# ---------- 尺子指纹（B1）----------
+#
+# `repo_head` 钉"哪堆料"，`ruler` 钉"哪把尺子" —— 此前**只有前一半**。
+# 于是"换个解析器把同一批冻结输出重算一遍"这种事（本项目真做过）在报告上看不出来：
+# 两份报告长得一模一样、却是两把尺子。
+
+
+def test_report_carries_the_ruler_fingerprint(fixture_repo, tmp_path):
+    """报告要能机检出"这份判定是哪一版评测器做的"：五项俱全、且哈希对的是**对的文件**。
+
+    断言"等于此刻现算的哈希"不是同义反复 —— 它钉的是**配对关系**：
+    若有人把两项哈希都算成同一个文件，这条会红。
+    """
+    import hashlib
+    import sys
+    from pathlib import Path as _P
+
+    import pytest as _pytest
+
+    from eval.runner import JUDGE_VERSION
+
+    repo, base, fix = fixture_repo
+    report = run_eval(repo, ws_root=tmp_path / "ws", limit=5, mock=True)
+    ruler = report["ruler"]
+
+    assert set(ruler) == {
+        "judge_version", "runner_sha256", "golden_tasks_sha256",
+        "pytest_version", "python_version",
+    }
+    assert ruler["judge_version"] == JUDGE_VERSION
+    assert isinstance(ruler["judge_version"], int)   # 人读的版本号，不是哈希
+
+    root = _P(__file__).resolve().parent.parent
+    for key, rel in (("runner_sha256", "eval/runner.py"),
+                     ("golden_tasks_sha256", "eval/golden_tasks.py")):
+        want = hashlib.sha256((root / rel).read_bytes()).hexdigest()[:12]
+        assert ruler[key] == want, f"{key} 对不上 {rel}"
+
+    assert ruler["pytest_version"] == _pytest.__version__
+    assert ruler["python_version"] == sys.version
+
+
+def test_file_sha256_reports_unreadable_as_none_not_empty():
+    """量不到就是 `None`，不许写空串 —— 空串读起来像"文件是空的"，那是另一回事。"""
+    from eval.runner import _file_sha256
+
+    assert _file_sha256("eval/__no_such_file__.py") is None
+    assert _file_sha256("eval/runner.py") not in (None, "")
 
 
 # ---------- 指标诚实性（M5-5）----------
@@ -349,6 +414,283 @@ def test_extract_diff_handles_bare_diff_and_absence():
     assert _extract_diff("") == ""
 
 
+# ---------- B1：围栏错位（`_FENCE_RE` 回写）----------
+#
+# 这一节是**先写红、再修**的那个红。5 段夹具见 `tests/real_fence_desync.py`：
+# 逐字归档的原文（无密钥、不依赖 gitignore 的 `data/`），对应 M5-5 三臂留档里
+# 5 个 `patch_failed`。它们的成因是同一个：回复里 diff 块**前面**有一个
+# ```` ```python ```` 块，旧的开围栏只认裸围栏/`diff`/`patch` → 配对整体错位一格
+# → 抓不到 diff 块 → 兜底分支从 `diff --git` 一路切到**全文结尾**，把补丁后面
+# 那段散文也塞给了 `git apply`。
+#
+# 为什么这个 bug 一条测试都不变红：当时**没有任何用例**覆盖"diff 块前面还有别的
+# 围栏"这个真实形状。下面第 1、2、3 条各自钉住这个形状的一个侧面。
+
+
+#: diff 的合法行首。用来判断"抠出来的是不是一个**纯**补丁"。
+_DIFF_HEADERS = ("diff --git ", "index ", "--- ", "+++ ", "@@ ")
+
+
+def _is_patch(text: str) -> bool:
+    """这段文本是不是纯补丁：每行要么是补丁头/正文，要么是空行。
+
+    比"不含某些关键词"更强 —— 散文只要带进一行就以**任意**形态现形，
+    不依赖某一段回复恰好写了 `## 说明`。
+    """
+    for line in text.splitlines():
+        if line == "" or line[:1] in (" ", "+", "-", "\\"):
+            continue  # 上下文行 / 增删行 / "\ No newline at end of file" / 空行
+        if line.startswith(_DIFF_HEADERS):
+            continue
+        return False
+    return True
+
+
+def test_fence_desync_fixture_is_the_pathological_shape():
+    """夹具本身也要有牙：它必须真的是"diff 块前面还有个围栏、后面还有散文"。
+
+    没有这一条，后来的人只要把夹具里那段 ```` ```python ```` 删掉，
+    上面那条回归就变成永远为真 —— 夹具被"修好"了，而 bug 还在。
+    """
+    assert len(REAL_FENCE_DESYNC) == 5
+    for case in REAL_FENCE_DESYNC:
+        raw = case.raw_output
+        fences = [i for i, line in enumerate(raw.splitlines()) if line.lstrip().startswith("```")]
+        assert len(fences) >= 4, f"{case.task_id}: 围栏太少，不是错位形状"
+        # 第一个围栏**不是** diff/patch 块 —— 正是它当不了开围栏
+        first = raw.splitlines()[fences[0]].lstrip()[3:].strip().lower()
+        assert first not in ("diff", "patch"), f"{case.task_id}: 第一个围栏就是 diff 块"
+        # 最后一个围栏之后还有散文（兜底分支会把它一起切进来）
+        assert raw.splitlines()[fences[-1] + 1:], f"{case.task_id}: 补丁后面没有散文"
+
+
+@pytest.mark.parametrize("case", REAL_FENCE_DESYNC, ids=lambda c: c.task_id)
+def test_extract_diff_does_not_swallow_the_prose_after_the_patch(case):
+    """**就是那 5 个假阴性**：抠出来的必须是补丁，不许连补丁后面的散文一起抠。
+
+    散文被带进去的后果不是"少抠一点"，而是 `git apply` 整条失败 → 记
+    `patch_failed` → 被摘出完成率分母 —— **一个解析器 bug 直接决定头号数字**。
+    """
+    diff = _extract_diff(case.raw_output)
+    assert diff.startswith("diff --git"), case.task_id
+    assert _is_patch(diff), f"{case.task_id}: 抠出来的不是纯补丁（混进了散文）"
+
+
+def test_extract_diff_pairs_fences_across_an_info_string():
+    """开围栏必须接受**任意** info string，否则配对整体错位一格。
+
+    最小复现：`python` 块在前、`diff` 块在后。旧实现的配对视 `python` 块为无物，
+    于是把 `python` 块的**闭**围栏当成 diff 块的开围栏，diff 块本身被吃掉。
+    """
+    text = (
+        "分析如下：\n"
+        "```python\n"
+        "x = 1\n"
+        "```\n"
+        "\n"
+        "```diff\n"
+        "diff --git a/x b/x\n"
+        "--- a/x\n"
+        "+++ b/x\n"
+        "@@ -1 +1 @@\n"
+        "-a\n"
+        "+b\n"
+        "```\n"
+        "\n"
+        "## 说明\n"
+        "改好了。\n"
+    )
+    assert _extract_diff(text) == (
+        "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n"
+    )
+
+
+def test_extract_diff_marker_mentioned_in_prose_before_the_fence():
+    """**两处修复唯一可鉴别的地方**：正文先提了一句 `diff --git`，再给围栏补丁。
+
+    要鉴别，两个条件缺一不可 —— 我一开始只写了第一个，变异体照样溜过去：
+
+    1. 正文里出现 `diff --git` 这个串，而且**在真补丁之前**（兜底的起点是
+       `text.find("diff --git")`，取的是**第一次**出现的位置）；
+    2. 真补丁前面还有一个**带 info string 的围栏**（否则旧配对根本不塌，
+       ```` ```diff ```` 自己就能当开围栏）。
+
+    两条都满足时：旧配对塌掉 → 落到兜底 → 起点落在**那句正文**上 → 抠出一段以
+    正文开头的东西；新配对正常闭合 → 直接拿到补丁。
+
+    另有两种形状实测**不能**鉴别，写在这里免得再有人绕一圈：补丁前有
+    ```` ```python ````、补丁后是裸围栏（正是归档那 5 个假阴性的形状）—— 只修兜底
+    也能抠对，因为兜底停在**补丁自己的闭合围栏**处；补丁后跟带 info string 的围栏
+    同理，停的还是补丁自己的闭合围栏。
+    ⇒ 两处修复都留着：归档数据上它们等效，但"等效"不等于"冗余"。
+
+    ⚠️ 这个形状在归档的 21 个任务里**没有出现过**（逐个查过），所以它代表的是
+    **没被观测到、但真实模型会写**的形状，不是从留档数据里裁的。
+    """
+    text = (
+        "我会给一个 diff --git 格式的补丁。\n"
+        "\n"
+        "先看现在的实现：\n"
+        "\n"
+        "```python\n"
+        "def get(self, key):\n"
+        "    return self.cache.get(key)\n"
+        "```\n"
+        "\n"
+        "补丁：\n"
+        "\n"
+        "```diff\n"
+        "diff --git a/x b/x\n"
+        "--- a/x\n"
+        "+++ b/x\n"
+        "@@ -1 +1 @@\n"
+        "-a\n"
+        "+b\n"
+        "```\n"
+    )
+    assert _extract_diff(text) == (
+        "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n"
+    )
+
+def test_extract_diff_bare_fallback_stops_at_the_first_bare_fence():
+    """没围栏、直接贴 diff 时，兜底不许一路切到全文结尾。
+
+    补丁后面那段散文不是补丁的一部分。这条与上一条是两处独立的修复：
+    上一条管"配对"，这一条管"兜底"。只有上一条时，若模型**真的**没写开围栏，
+    兜底仍会把散文带进去。
+    """
+    text = (
+        "直接给你补丁：\n"
+        "diff --git a/x b/x\n"
+        "--- a/x\n"
+        "+++ b/x\n"
+        "@@ -1 +1 @@\n"
+        "-a\n"
+        "+b\n"
+        "```\n"
+        "\n"
+        "## 说明\n"
+        "改好了，跑过测试了。\n"
+    )
+    got = _extract_diff(text)
+    assert got.startswith("diff --git a/x b/x")
+    assert _is_patch(got), f"兜底把散文切进来了: {got[-40:]!r}"
+
+
+def test_extract_diff_still_ignores_non_diff_fences():
+    """放开 info string 不等于"什么块都要"：与补丁无关的块仍须被忽略。
+
+    放宽开围栏的**唯一**代价面就在这里，所以正反两侧都要钉。
+    """
+    text = (
+        "```python\n"
+        "print('这段不是补丁')\n"
+        "```\n"
+        "```text\n"
+        "这里也没有补丁体\n"
+        "```\n"
+    )
+    assert _extract_diff(text) == ""
+
+
+def test_extract_diff_a_mere_mention_is_taken_as_a_patch_pre_existing():
+    """只是**提到** `diff --git` 的块也会被当成补丁 —— 这是既有判据的定义，B1 没改。
+
+    判据是"块里含 `diff --git` 这个串"（`_is_diff_block`），B1 让它与**算出了归档
+    84.2% 那个反事实修正值**的离线重算实现保持逐字一致。理由：改判据就等于换尺子，
+    新报告与那个数字立刻不可比。（那份离线重算脚本在 `evalverify/` —— 该目录被
+    gitignore，是本地留档，**不在仓库里**，所以这里不能把它当成可核对的路径。）
+
+    方向是安全的：这种"块"喂给 `git apply` 只会失败 → 记 `patch_failed`
+    （如实记失败），不会把散文当成一次成功的修复。
+
+    这里只钉 B1 **确实改掉**的那一半：抠出来的东西里不再拖着那个闭合围栏。
+    """
+    text = "```text\ndiff --git 只是被提到了一下，没有真的补丁体\n```\n"
+    got = _extract_diff(text)
+    assert got.startswith("diff --git ")
+    assert not any(line.startswith("```") for line in got.splitlines())
+
+
+def test_extract_diff_picks_the_longest_diff_block():
+    """同时有多个候选块时取**最长**的那个 —— 既有规则，B1 保留。
+
+    模型有时先贴一小段示意、再贴真正的补丁；取第一个会把示意当补丁。
+    """
+    text = (
+        "```diff\n"
+        "diff --git a/x b/x\n"
+        "--- a/x\n"
+        "+++ b/x\n"
+        "@@ -1 +1 @@\n"
+        "-a\n"
+        "+b\n"
+        "```\n"
+        "```diff\n"
+        "diff --git a/y b/y\n"
+        "--- a/y\n"
+        "+++ b/y\n"
+        "@@ -1,3 +1,3 @@\n"
+        " a\n"
+        "-b\n"
+        "+B\n"
+        " c\n"
+        "```\n"
+    )
+    got = _extract_diff(text)
+    assert got.startswith("diff --git a/y b/y")
+    assert "a/x" not in got
+
+
+#: 本地 tinydb 克隆（`eval/repos/` 被 gitignore，所以这条只在有克隆的机器上跑）。
+_TINYDB = Path(__file__).resolve().parent.parent / "eval" / "repos" / "tinydb"
+
+
+@pytest.mark.skipif(
+    not (_TINYDB / ".git").exists(),
+    reason="本地没有 eval/repos/tinydb 克隆（gitignore 的运行期数据）；"
+    "这条要在真仓库上验，联网克隆属于付费/联网动作，默认不在这里做",
+)
+@pytest.mark.parametrize("case", REAL_FENCE_DESYNC, ids=lambda c: c.task_id)
+def test_extract_diff_real_false_negatives_now_apply_to_the_real_base(case):
+    """端到端：抠出来的补丁，真的能 `git apply --check` 过它的**真实基线**。
+
+    上面几条只证"抠出来的是补丁形状"，这条证"这个补丁对真实底座是可用的"——
+    中间隔着 hunk 上下文、行号、`--recount` 的宽容度，不能靠形状推出来。
+    （**不跑 apply，只 `--check`**：不落盘、不改工作区。）
+
+    旧实现在这里失败，且报错与归档 `patch_error` 逐字同形：
+    `warning: recount: unexpected line: ``` `。
+    """
+    base = git(str(_TINYDB), "rev-parse", f"{case.fix_sha}^").strip()
+    assert base, f"{case.task_id}: 本地克隆里找不到 {case.fix_sha} 的父提交"
+    diff = _extract_diff(case.raw_output)
+
+    tmp = Path(tempfile.mkdtemp(prefix="b1_fence_"))
+    try:
+        # 只还原补丁**碰到的**文件 —— `git archive | tar` 在本机 Defender 下会偶发
+        # 建不出文件（实测），逐文件 `git show` 是确定性的。
+        for rel in re.findall(r"^\+\+\+ b/(.+)$", diff, re.MULTILINE):
+            blob = subprocess.run(
+                ["git", "-C", str(_TINYDB), "show", f"{base}:{rel}"],
+                capture_output=True,
+            )
+            assert blob.returncode == 0, f"{case.task_id}: 基线里没有 {rel}"
+            target = tmp / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(blob.stdout)
+
+        patch = tmp / "_patch.diff"
+        patch.write_text(diff, encoding="utf-8", newline="\n")
+        proc = subprocess.run(
+            ["git", "apply", "--check", "--recount", str(patch)],
+            cwd=str(tmp), capture_output=True, text=True,
+        )
+        assert proc.returncode == 0, f"{case.task_id}: {proc.stderr.strip()}"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_single_shot_prompt_feeds_sources_but_no_test_files(tmp_path, fixture_repo):
     """喂料范围是判据：给全部非 tests 源码，**不给**任何定位提示、不含测试文件。
 
@@ -505,17 +847,67 @@ def test_judge_tampering_detects_nested_conftest():
     assert _judge_tampering({}, {"tests/conftest.py": "x"}) == ["tests/conftest.py"]
 
 
-def test_guard_off_leaves_tampering_as_null_not_empty(tmp_path, fixture_repo):
+def test_guard_default_is_ON(tmp_path, fixture_repo):
+    """默认必须是**开** —— 本轮把守卫口径翻了。
+
+    这条测试是**故意**在翻转时变红的那一条：旧版这里断言的是 `is False`。
+    让它红一次，是为了逼"改默认"这件事被有意识地做，而不是被一个默认参数悄悄带走。
+
+    两个入口的默认值**都要**钉住，而且必须一致：只翻 `run_eval`、
+    漏掉 `run_single`（或反过来）的话，从命令行走和从库直接调用走会变成两套口径 ——
+    这正是本仓"两份拷贝迟早漂移"咬过的那一类。
+    """
+    import inspect
+
+    for fn in (run_single, run_eval):
+        assert inspect.signature(fn).parameters["judge_guard"].default is True, (
+            f"{fn.__name__} 的 judge_guard 默认值不是 True"
+        )
+
+    repo, base, fix = fixture_repo
+    report = run_eval(repo, ws_root=tmp_path / "ws", limit=5, mock=True)
+    assert report["judge_guard"] is True
+    assert "guard=开" in report["judge_note"]
+
+
+def test_guard_off_is_still_reachable_to_reproduce_the_archived_ruler(
+    tmp_path, fixture_repo
+):
     """⚠️ **没检查**（None）与**查过且干净**（[]）必须能分开。
 
     填 [] 的话，"本轮没开守卫"会被读成"查过了没问题" —— 那正是本项目头号缺陷类
     （机制在、但读出来的意思是错的）。
+
+    而且这个开关**必须留着**：没有它，留档三份报告跑的那套裁判再也复现不出来
+    （本次口径翻转正好证明了这一点 —— 默认值一变，旧口径只剩这一个入口）。
     """
     repo, base, fix = fixture_repo
-    report = run_eval(repo, ws_root=tmp_path / "ws", limit=5, mock=True)
+    report = run_eval(repo, ws_root=tmp_path / "ws", limit=5, mock=True,
+                      judge_guard=False)
     assert report["judge_guard"] is False
     assert report["per_task"][0]["judge_tampering"] is None
+    assert report["per_task"][0]["judge_restored"] is None
     assert "guard=关" in report["judge_note"]
+
+
+def test_cli_exposes_no_guard_judge_as_the_escape_hatch():
+    """命令行上那个开关得真的在。
+
+    翻转默认值时最容易漏的就是它：`judge_guard` 默认变成 True 之后，
+    如果只剩 `--guard-judge`（`store_true`），它就成了一个**恒真空开关**，
+    而归档口径再也无法从命令行复现。所以这里走一次真 argparse。
+    """
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    proc = subprocess.run(
+        [sys.executable, "-m", "eval.runner", "--help"],
+        capture_output=True, text=True, cwd=str(Path(__file__).resolve().parent.parent),
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "--no-guard-judge" in proc.stdout
+    assert "--guard-judge" not in proc.stdout   # 旧开关已被取代，别留个恒真的壳
 
 
 def test_guard_on_reports_a_clean_empty_list(tmp_path, fixture_repo):
@@ -562,9 +954,11 @@ def test_guard_marks_a_tampered_pass_as_invalid(tmp_path, fixture_repo, monkeypa
     assert "判定相关文件" in row["invalid_reason"]
     assert guarded["passed"] == 0
 
-    # 同一情形、守卫关掉 → 这就是被 PoC 证明的那个洞：照单全收
+    # 同一情形、守卫关掉 → 这就是被 PoC 证明的那个洞：照单全收。
+    # **必须显式传 False**：默认已经是开的，靠默认值就复现不出旧口径了。
     state["n"] = 0
-    unguarded = run_eval(repo, ws_root=tmp_path / "ws2", limit=5, mock=True)
+    unguarded = run_eval(repo, ws_root=tmp_path / "ws2", limit=5, mock=True,
+                         judge_guard=False)
     assert unguarded["per_task"][0]["judge_tampering"] is None
     assert unguarded["per_task"][0]["passed"] is True
 
@@ -618,3 +1012,205 @@ def test_budget_exhausted_excludes_tasks_that_passed_anyway(tmp_path):
     rep = _aggregate([lucky])
     assert rep["passed"] == 1
     assert rep["budget_exhausted"] == 0
+
+
+def test_restore_runs_after_the_snapshot_and_before_judge(tmp_path, fixture_repo, monkeypatch):
+    """端到端钉住**三个危险位置**。只看 `passed is False` 是不够的：
+    恢复挪位之后"不通过"这个结果可能一模一样，而报告里的含义已经完全错了。
+
+    - 挪到 `after` 快照**之前** → `zero_change` 会变成 True（报告把"改了裁判"读成"空转"）、
+      `judge_tampering` 恒为空；
+    - 挪到 `judge` **之后** → 篡改已经生效（这里在 judge 被调用的**那一刻**读盘来钉）；
+    - 不记 `judge_restored` → 等于"我们悄悄把现场清干净了"。
+    """
+    import eval.runner as runner
+    from agent.llm import Usage
+    from agent.loop import RunResult
+    from eval.golden_tasks import JudgeResult
+
+    repo, base, fix = fixture_repo
+    seen: dict[str, bool] = {}
+
+    def fake_arm(arm, llm, task, ws):
+        """模拟 agent 往工作区根写了一个 conftest.py（真实的 PoC 注入点）。"""
+        (ws / "conftest.py").write_text(
+            "def pytest_collection_modifyitems(items):\n"
+            "    for i in items:\n"
+            "        i.add_marker('skip')\n",
+            encoding="utf-8",
+        )
+        return runner.ArmOutcome(
+            run=RunResult(final_text="", steps=2, usage=Usage(), events=[],
+                          terminated_reason="completed", task="t")
+        )
+
+    def fake_judge(task, ws):
+        # ⚠️ 在被调用的**那一刻**读盘，而不是事后看结果。
+        seen["conftest_at_judge"] = (ws / "conftest.py").exists()
+        return JudgeResult(passed=True, returncode=0,
+                           summary="1 passed in 0.10s", passed_count=1)
+
+    monkeypatch.setattr(runner, "_run_arm", fake_arm)
+    monkeypatch.setattr(runner, "judge", fake_judge)
+
+    report = run_eval(repo, ws_root=tmp_path / "ws", limit=5, mock=True)
+    row = report["per_task"][0]
+
+    assert seen["conftest_at_judge"] is False           # 恢复点在 judge 之前
+    assert row["zero_change"] is False                  # 恢复点也在 after 快照之后
+    assert row["judge_tampering"] == ["conftest.py"]    # 证据保留：确实被动过
+    assert row["judge_restored"] == ["conftest.py"]     # 而且记录了我们还回去了
+    assert row["passed"] is False                       # 恢复 ≠ 免责
+    assert "改动了判定相关文件" in row["invalid_reason"]
+    assert report["passed"] == 0
+
+
+def test_restore_is_off_when_the_guard_is_off(tmp_path, fixture_repo, monkeypatch):
+    """guard 关着时**不查也不还** —— 恢复清单是 None（没做），不是 []（做了、没事）。"""
+    import eval.runner as runner
+    from agent.llm import Usage
+    from agent.loop import RunResult
+    from eval.golden_tasks import JudgeResult
+
+    repo, base, fix = fixture_repo
+
+    def fake_arm(arm, llm, task, ws):
+        (ws / "conftest.py").write_text("tampered\n", encoding="utf-8")
+        return runner.ArmOutcome(
+            run=RunResult(final_text="", steps=2, usage=Usage(), events=[],
+                          terminated_reason="completed", task="t")
+        )
+
+    def fake_judge(task, ws):
+        return JudgeResult(passed=True, returncode=0,
+                           summary="1 passed in 0.10s", passed_count=1)
+
+    monkeypatch.setattr(runner, "_run_arm", fake_arm)
+    monkeypatch.setattr(runner, "judge", fake_judge)
+
+    report = run_eval(repo, ws_root=tmp_path / "ws", limit=5, mock=True,
+                      judge_guard=False)
+    row = report["per_task"][0]
+    assert row["judge_tampering"] is None
+    assert row["judge_restored"] is None
+    assert row["passed"] is True          # ← 旧口径：这个洞就是这么敞着的
+
+
+# ---------- B3：轨迹字段落盘（纯序列化，没有新增采集） ----------
+#
+# 三条都是"报告里缺一列，于是两种完全不同的东西在数据上同形"：
+# 没有 `terminated_reason` → 「环境把它掐死了」与「真没修对」分不开（README S41）；
+# 没有工具调用记录 → 「网络寻源未阻断」这句话无法查证；
+# 没有 `gate_blocks` → 事后翻轨迹只看到 `success=False`，不知道是哪一层拦的。
+
+
+def test_tool_call_records_carry_the_aborted_three_state():
+    """`aborted` 必须是**三态**：被取消 / 被跳过 / 真的跑了。
+
+    "跳过"（等用户输入时后面的调用不再执行）与"被取消"（abort 触发）都是
+    **没有执行**，但成因不同；把它们压成同一个值，报告就再也分不出是哪一种。
+    """
+    from eval.runner import _tool_call_records
+
+    recs = _tool_call_records([
+        {"type": "tool_call", "name": "bash", "success": True, "duration_ms": 12,
+         "exit_code": 0, "await_user": False},
+        {"type": "tool_call", "name": "read", "success": False, "duration_ms": 0,
+         "exit_code": None, "await_user": False, "aborted": True},
+        {"type": "tool_call", "name": "read", "success": False, "duration_ms": 0,
+         "exit_code": None, "await_user": False, "skipped": True},
+        {"type": "message", "text": "非 tool_call 事件不进投影"},
+    ])
+    assert [r["aborted"] for r in recs] == [False, True, None]
+    assert len(recs) == 3
+    assert recs[0]["exit_code"] == 0 and recs[2]["exit_code"] is None
+
+
+def test_only_web_tools_put_arguments_in_the_report():
+    """只有 `web_fetch`/`web_search` 落参数，且截断到 300 字符。
+
+    其余工具不落有两个理由，第二个更硬：体积，以及**参数里可能含被注入的文本**
+    （把不可信内容原样搬进报告，等于把报告的读者也拉进那条信任链）。
+    """
+    from eval.runner import _tool_call_records
+
+    recs = _tool_call_records([
+        {"type": "tool_call", "name": "web_search", "success": True,
+         "arguments": {"query": "x" * 500}},
+        {"type": "tool_call", "name": "bash", "success": True,
+         "arguments": {"command": "cat /etc/passwd"}},
+    ])
+    assert recs[0]["arguments"].startswith('{"query"')
+    assert len(recs[0]["arguments"]) == 300          # 截断过
+    assert "arguments" not in recs[1]                # bash 的命令不落盘
+
+
+def test_gate_block_records_are_projected():
+    """门禁阻断要能在报告里看见（`source` = 哪一层拦的，`reason` = 为什么）。"""
+    from eval.runner import _gate_block_records
+
+    recs = _gate_block_records([
+        {"type": "gate_block", "tool": "bash", "source": "permissions",
+         "reason": "危险命令，已拒绝"},
+        {"type": "tool_call", "name": "bash"},
+    ])
+    assert recs == [{"tool": "bash", "source": "permissions",
+                     "reason": "危险命令，已拒绝"}]
+
+
+def test_per_task_lands_the_trajectory_fields(tmp_path, fixture_repo, monkeypatch):
+    """端到端：三列都要出现在 `per_task` 里，且 `terminated_reason` 是**原样**落盘。
+
+    用 `steps=25`（多轮臂的 max_steps）+ `terminated_reason="aborted"` 这一组故意
+    错位的值，钉住"它取自 loop、不是从步数猜的" —— 这正是 `_budget_exhausted`
+    docstring 里那条纪律的同一件事。
+    """
+    import eval.runner as runner
+    from agent.llm import Usage
+    from agent.loop import RunResult
+
+    repo, base, fix = fixture_repo
+    events = [
+        {"type": "tool_call", "name": "bash", "success": True, "duration_ms": 5,
+         "exit_code": 0, "await_user": False},
+        {"type": "gate_block", "tool": "bash", "source": "permissions",
+         "reason": "危险命令，已拒绝"},
+        {"type": "tool_call", "name": "web_fetch", "success": False, "duration_ms": 3,
+         "exit_code": None, "await_user": False,
+         "arguments": {"url": "https://example.com"}},
+        {"type": "tool_call", "name": "bash", "success": False, "duration_ms": 0,
+         "exit_code": None, "await_user": False, "aborted": True},
+    ]
+
+    def fake_arm(arm, llm, task, ws):
+        return runner.ArmOutcome(run=RunResult(
+            final_text="", steps=25, usage=Usage(), events=events,
+            terminated_reason="aborted", task="t",
+        ))
+
+    monkeypatch.setattr(runner, "_run_arm", fake_arm)
+    report = run_eval(repo, ws_root=tmp_path / "ws", limit=5, mock=True)
+    row = report["per_task"][0]
+
+    assert row["terminated_reason"] == "aborted"      # 原始字符串，不是派生的布尔
+    assert row["budget_exhausted"] is False           # 步数=25 也不许猜成"撞预算"
+    assert [c["aborted"] for c in row["tool_calls"]] == [False, False, True]
+    assert row["tool_calls"][1]["arguments"] == '{"url": "https://example.com"}'
+    assert row["gate_blocks"] == [{"tool": "bash", "source": "permissions",
+                                   "reason": "危险命令，已拒绝"}]
+
+
+def test_single_shot_reports_zero_tool_calls_as_an_empty_list(tmp_path, fixture_repo):
+    """`single-shot` 臂**没有工具可用** → `[]`。是 `[]` 不是 `None`。
+
+    `None` 的意思是"没测到"，而这里是我们**确知**它一个工具都没有
+    （它的 `RunResult` 是手工构造的，`events=[]`）。两者混起来，
+    报告会开始怀疑一件根本不存在的测量失败。
+    """
+    repo, base, fix = fixture_repo
+    report = run_eval(repo, ws_root=tmp_path / "ws", limit=5, mock=True,
+                      arm="single-shot")
+    row = report["per_task"][0]
+    assert row["tool_calls"] == []
+    assert row["gate_blocks"] == []
+    assert row["terminated_reason"] == "completed"

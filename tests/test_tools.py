@@ -320,6 +320,145 @@ def test_bash_child_cannot_read_api_key(bash_ctx, monkeypatch):
     assert "sk-leak-me-if-you-can" in control.stdout
 
 
+# ---------- S16：bash 命令文本里的路径候选 ----------
+#
+# 修的是这个不对称：`read ../.env` 被硬拒，而 `cat ../.env` / `type ..\.env`
+# 一路畅通（沙箱原本只管 `cwd` 参数，`command` 文本一个字符都不看）。
+# 实测证据：`type ..\.env` 在 eval 工作区里返回过 336 字节含真实 key 的内容。
+#
+# 判据分两档，分档的依据是**确定性不同**（见 `command_path_verdict` 的 docstring）：
+# 相对逃逸语义无歧义 → 硬拒；绝对路径/含变量可能误杀 → 只 ask。
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cat ../.env",
+        'type "..\\..\\secrets.txt"',   # 引号只是词法边界，不是豁免
+        "cp ../.env ./copied.txt",
+        "git -C ../other status",
+        "echo hi > ../out.txt",         # 重定向目标不是命令位置
+        "FOO=../.env python -c pass",   # 赋值前缀的值也要查
+    ],
+)
+def test_s16_command_text_relative_escape_rejected(bash_ctx, command):
+    result = _bash().run({"command": command}, bash_ctx)
+    assert not result.success, result.output
+    assert "越出沙箱" in result.output
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git status",
+        "ls -la",
+        "echo hi",
+        "cd ..",                          # 裸 `..` 无分隔符 → 不是候选（见 S 表那条边界）
+        "python -m pytest tests/ -q",
+        "pip install requests",
+        "git log --oneline -- src/x.py",
+        "echo x > /dev/null",             # 设备名白名单：写它不构成文件能力
+        "curl https://example.com/x",     # URL 剔除是必须的，不是优化（见 bash.py）
+        'git commit -m "fix: a/b"',
+    ],
+)
+def test_s16_sandboxed_commands_not_rejected(bash_ctx, command):
+    """反向白名单：**不能把正常命令误杀**。
+
+    分层的全部意义就在这一组上 —— 只堵不误杀才谈得上"判据"，否则是路障。
+    """
+    result = _bash().run({"command": command}, bash_ctx)
+    assert "越出沙箱" not in result.output, result.output
+
+
+def test_s16_command_position_is_exempt(bash_ctx):
+    """argv[0] 豁免 —— 这是**必须**的，不是宽松。
+
+    被执行程序由 OS/PATH 解析，属"执行能力"不属"文件能力"；而且 bash 工具
+    自己就在启动工作区外的 `cmd` / `bash`，禁它等于自我矛盾。
+
+    用真实的 `sys.executable` 绝对路径构造一条**真能跑**的命令：只断言函数
+    返回值测不出"豁免之后它确实执行了"。
+    """
+    from agent.tools.bash import command_path_candidates
+
+    assert command_path_candidates(f"{sys.executable} -c print(1)") == []
+    assert command_path_candidates("/usr/bin/env python x.py") == []
+
+    result = _bash().run({"command": f"{sys.executable} -c print(1)"}, bash_ctx)
+    assert result.success, result.output
+    assert "越出沙箱" not in result.output
+    assert "1" in result.output
+
+
+def test_s16_quoted_command_path_stays_one_word():
+    """引号状态必须跟踪：带空格的绝对路径程序要**整段**处在命令位置。
+
+    不跟踪引号的话 `"C:\\Program Files\\python.exe"` 会被空格切成两半，后半段
+    `Files\\python.exe` 落在非命令位置 → 判成越界 → **误杀一条完全合法的命令**。
+    这跟"S16 是补漏"不矛盾：补漏的判据自己也不许制造新的假阳性。
+    """
+    from agent.tools.bash import command_path_candidates
+
+    assert command_path_candidates('"C:\\Program Files\\python.exe" -c x') == []
+
+
+def test_s16_quoted_path_with_space_is_split_into_fragments():
+    """已知边界，如实钉住：候选提取按**空白**切分，所以引号内含空格的路径
+    会被切成几段（`_PATHISH_RE` 的字符类里有 `\\s`）。
+
+    **方向是安全的**：候选取的是**并集**，任何一段越界都仍然触发 —— 所以只会
+    **多问**、不会**漏放**。代价是 `cat "C:\\Program Files\\x.txt"` 会多问一次
+    （`C:\\Program` 被当成绝对路径候选）。
+
+    写下来而不是"顺手把它修掉"：修掉要让候选跨空白，而"跨空白"与"用空白切词"
+    是同一个正则里互相打架的两条需求，改动面比收益大。README 的 S 表按此记。
+    """
+    from agent.tools.bash import command_path_candidates
+
+    assert command_path_candidates('cat "C:\\Program Files\\x.txt"') == [
+        "C:\\Program",
+        "Files\\x.txt",
+    ]
+
+
+def test_s16_urls_and_devices_are_not_candidates():
+    """URL 与设备名不产生候选。
+
+    URL 这条**不是优化**：Windows 上 `Path("http://example.com/x").is_absolute()`
+    返回 True（盘符被解析成 `http:`），不剔除会让**所有含 URL 的命令**判成越界 ——
+    包括上面白名单里那条 `curl`。
+    """
+    from agent.tools.bash import command_path_candidates
+
+    assert command_path_candidates("curl https://example.com/a/b.txt") == []
+    assert command_path_candidates("echo x > /dev/null") == []
+
+
+def test_s16_variable_path_not_denied_at_tool_level(bash_ctx):
+    """无引擎时**只执行 deny 档**：含变量的候选取值不可确定。
+
+    没人能回答"允许吗"，把 ask 落成拒绝 = 把"可能误杀"变成"一定误杀"。
+    这是分层的一半，另一半在 `PermissionsEngine._rule_check`（见
+    `tests/test_permissions.py` 的 S16 一节）。
+    """
+    result = _bash().run({"command": "cat $HOME/.env"}, bash_ctx)
+    assert "越出沙箱" not in result.output, result.output
+
+
+def test_s16_engine_present_defers_to_engine(tmp_path):
+    """引擎在场时工具**不二次否决** —— 同危险命令那一档的规矩（"此处仅兜底"）。
+
+    否则引擎判出的 allow_once / allow_always 会被工具层悄悄推翻，确认框成摆设。
+    """
+    from agent.permissions import PermissionsEngine
+
+    ctx = ToolContext(
+        workspace_root=tmp_path, permissions=PermissionsEngine(tmp_path)
+    )
+    result = _bash().run({"command": "cat ../missing-file.txt"}, ctx)
+    assert "越出沙箱" not in result.output, result.output
+
+
 # ---------- 危险模式不得误报（只拦"真的在调"，不拦"提到了"） ----------
 
 @pytest.mark.parametrize(

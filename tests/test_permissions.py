@@ -2,12 +2,15 @@
 import json
 from pathlib import Path
 
+import pytest
 from pydantic import BaseModel
 
 from agent.llm import LLMResult, MockLLM
 from agent.loop import QueryEngine
 from agent.permissions import Decision, PermissionsEngine, _irreversible_kind
 from agent.tools.base import Tool, ToolContext, ToolRegistry, ToolResult
+from agent.tools.bash import command_path_verdict
+from agent.tools.files import ReadTool
 
 
 def make_ctx(tmp_path: Path) -> ToolContext:
@@ -189,6 +192,196 @@ def test_path_out_of_sandbox(tmp_path):
     assert engine.check("read", {"path": "../secret.txt"}, ctx) is Decision.DENY
     assert engine.check("write", {"path": str(outside)}, ctx) is Decision.DENY
     assert engine.check("edit", {"path": str(outside)}, ctx) is Decision.DENY
+
+
+# ---------- S16：bash 命令文本里的路径（与 read/write/edit 同一个不变式） ----------
+#
+# 这一节的核心不是"多了一条判据"，而是**同一条沙箱规则不能有两种问法两种结果**。
+# 所以最有价值的一条是 `test_s16_sandbox_semantics_do_not_drift`。
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "../.env",           # 相对逃逸：S16 实测那条路
+        "../secret.txt",
+        "..\\..\\x.txt",
+        "/etc/passwd",       # 绝对越界
+        "~/secrets.txt",
+        "a.txt",             # 沙箱内（对照组：不能一律判越界）
+        "sub/a.txt",
+    ],
+)
+def test_s16_sandbox_semantics_do_not_drift(tmp_path, raw):
+    """**这是「沙箱语义只有一份」的牙齿。**
+
+    同一组原始路径，三处必须给同一个答案：
+
+    - `PermissionsEngine._resolve`（引擎层：read/write/edit 的硬拒依据）
+    - `command_path_verdict`（bash 命令文本层）
+    - `ReadTool`（工具层：真执行时再判一次）
+
+    合并前工具层与引擎层**各有一份逐字相同的拷贝**，而"两份拷贝迟早漂移"是
+    本项目已经吃过亏的缺陷类。谁再抄一份、或改 `resolve_in_workspace` 时漏掉
+    某一路，都会在这里红。
+
+    断言写成**三方相等**而不是各自对一个写死的期望值：真正的职责只有一个
+    （`resolve_in_workspace`），这条要守的是"没有第二套语义"。
+    """
+    engine = PermissionsEngine(tmp_path)
+    ctx = make_ctx(tmp_path)
+    command = f"cat {raw}"
+
+    engine_out = engine._resolve(raw, ctx) is None
+    deny, ask = command_path_verdict(command, cwd=tmp_path, workspace_root=tmp_path)
+    bash_out = raw in deny or raw in ask
+    read_out = "路径越界沙箱" in (ReadTool().run({"path": raw}, ctx).error or "")
+
+    assert engine_out == bash_out == read_out, (
+        f"{raw!r}: engine={engine_out} bash={bash_out} read={read_out}"
+    )
+
+
+def test_s16_sandbox_authority_pins_ground_truth(tmp_path):
+    """钉住**权威本身**的输出，不只是"三方一致"。
+
+    上面那条三方相等能抓住"有人又抄了一份实现"，但**抓不住"唯一那份被改坏"**——
+    改坏 `resolve_in_workspace` 会让三方**一起**给出错误答案，一致地错。
+    两条缺一不可：一条守"没有第二套语义"，这条守"那一套是对的"。
+    """
+    from agent.tools.files import resolve_in_workspace
+
+    def verdict(raw: str, cwd: Path | None = None) -> bool:
+        return (
+            resolve_in_workspace(
+                raw, cwd=cwd or tmp_path, workspace_root=tmp_path
+            )
+            is not None
+        )
+
+    assert verdict("../.env") is False
+    assert verdict("../secret.txt") is False
+    assert verdict("/etc/passwd") is False
+    assert verdict("~/secrets.txt") is False      # `~` 按 shell 真实行为展开
+    assert verdict("a.txt") is True               # 对照组：不是一律判越界
+    assert verdict("sub/a.txt") is True
+    # 相对路径锚定 **cwd** 而不是 workspace_root —— 从子目录 `../x.txt` 回到
+    # 工作区根部**不算逃逸**。锚错了会把这个正常写法判成越界。
+    assert verdict("x.txt", cwd=tmp_path / "sub") is True
+    assert verdict("../x.txt", cwd=tmp_path / "sub") is True
+
+
+def test_s16_layering_deny_vs_ask(tmp_path):
+    """分层的**内容**：相对逃逸硬拒，绝对越界/含变量只 ask。
+
+    两档的确定性不同 ⇒ 动作不同。合成一个布尔会让分层失效 —— 而分层的意义
+    正是"确定的那档硬拒、可能误杀的那档可恢复"。
+    """
+    engine = PermissionsEngine(tmp_path)
+    ctx = make_ctx(tmp_path)
+
+    assert engine.check("bash", {"command": "cat ../.env"}, ctx) is Decision.DENY
+    # 绝对路径可能只是 grep 的模式串 —— 误杀必须可恢复
+    assert engine.check("bash", {"command": 'grep -rn "/usr/lib" .'}, ctx) is Decision.ASK
+    # 变量取值不可确定
+    assert engine.check("bash", {"command": "cat $HOME/.env"}, ctx) is Decision.ASK
+    # 反向：沙箱内的写法一律放行
+    assert engine.check(
+        "bash", {"command": "python -m pytest tests/ -q"}, ctx
+    ) is Decision.ALLOW
+
+
+def test_s16_deny_beats_allow_rules(tmp_path):
+    """收紧类判据必须在**规则层之前** —— 否则一条 `cat *` 就把沙箱让掉了。"""
+    engine = PermissionsEngine(tmp_path, rules={"commands": {"allow": ["cat *"]}})
+    ctx = make_ctx(tmp_path)
+    assert engine.check("bash", {"command": "cat ../.env"}, ctx) is Decision.DENY
+    # 规则本身仍然有效（不是把整类命令都锁死了）
+    assert engine.check("bash", {"command": "cat a.txt"}, ctx) is Decision.ALLOW
+
+
+def test_s16_deny_beats_allow_always_memory(tmp_path):
+    """同一件事在**记忆**层：`allow_always` 也绕不过沙箱硬拒。
+
+    位置是硬要求：步骤 1' 必须在 `_always`/`_turn` 查表**之前**。否则用户开过
+    一次 `allow_always` 就永久失效 —— 而"记得越久越省事"正是他去开它的原因，
+    两个方向正好相反（同 `_apply_taint_ceiling` 那条 docstring）。
+
+    这里**直接写 `_always`** 而不是走确认框：记忆键就是**整条命令文本**
+    （`_classify` 对 bash 返回 `("command", command)`），只有直接种值才造得出
+    "同一条命令既有 allow_always 记忆、又命中相对逃逸"这个局面。本条测的是
+    **位置**，不是写入机制。
+    """
+    engine = PermissionsEngine(tmp_path)
+    ctx = make_ctx(tmp_path)
+    engine._always["cat ../.env"] = Decision.ALLOW
+    assert engine.check("bash", {"command": "cat ../.env"}, ctx) is Decision.DENY
+
+
+def test_s16_confirm_box_names_the_offending_path(tmp_path):
+    """确认框必须说清**是哪条路径越界**（本仓纪律：拒绝要带出处与解除方式）。
+
+    一个不说理由的确认框，训练出的是不看理由的人。
+    """
+    asked: list[str] = []
+    engine = PermissionsEngine(
+        tmp_path, confirm=lambda q: asked.append(q) or "allow_once"
+    )
+    ctx = make_ctx(tmp_path)
+
+    assert engine.check(
+        "bash", {"command": 'grep -rn "/usr/lib" .'}, ctx
+    ) is Decision.ALLOW
+    assert asked, "ask 档必须真的弹确认框（它是可恢复的那一档）"
+    assert "[沙箱]" in asked[0]
+    assert "/usr/lib" in asked[0]
+
+
+def test_s16_denial_hint_states_how_to_unblock(tmp_path):
+    """两档的**解除方式措辞必须不同** —— 这正是分档在用户侧的体现。"""
+    engine = PermissionsEngine(tmp_path)
+    ctx = make_ctx(tmp_path)
+
+    deny_hint = engine.denial_hint("bash", {"command": "cat ../.env"}, ctx=ctx)
+    assert deny_hint and "../.env" in deny_hint
+    assert "不能用 allow_* 绕过" in deny_hint
+
+    ask_hint = engine.denial_hint("bash", {"command": "cat $HOME/.env"}, ctx=ctx)
+    assert ask_hint and "allow_once" in ask_hint
+
+    # 无关命令不产出处（否则所有拒绝都会套上沙箱文案）
+    assert engine.denial_hint("bash", {"command": "git status"}, ctx=ctx) is None
+
+
+def test_s16_gate_block_carries_the_sandbox_reason_end_to_end(tmp_path):
+    """端到端：拒绝文案里必须**看得见是哪条路径越界** —— 两处接线各一条断言。
+
+    只测 `describe()` / `denial_hint()` 的返回值是不够的：那句话是**被 loop
+    组装进 gate_block 的**（`loop.py` 的 DENY 分支用前者、ASK 分支用后者）。
+    接线断在那一侧时，引擎自己再对也没用 —— 这一节的两条断言就是那两处接线的牙齿。
+    """
+    def run_once(command: str):
+        engine = make_engine(
+            tmp_path,
+            MockLLM.script(
+                MockLLM.tool("bash", {"command": command}).responses[0],
+                LLMResult(content="明白了"),
+            ),
+            permissions=PermissionsEngine(tmp_path),
+        )
+        result = engine.run("照做")
+        blocks = [e for e in result.events if e["type"] == "gate_block"]
+        assert blocks and blocks[0]["source"] == "permissions", blocks
+        return blocks[0]["reason"]
+
+    # DENY 档：走 describe()（loop 的 DENY 分支）
+    deny_reason = run_once("cat ../.env")
+    assert "../.env" in deny_reason
+    assert "不能用 allow_* 绕过" in deny_reason
+
+    # ASK 档（无确认交互 → 按拒绝处理）：走 denial_hint()（loop 的 ASK 分支）
+    ask_reason = run_once('grep -rn "/usr/lib" .')
+    assert "/usr/lib" in ask_reason
+    assert "allow_once" in ask_reason, ask_reason
 
 
 def test_edit_deny(tmp_path):

@@ -2,8 +2,11 @@
 import os
 import stat
 import subprocess
+import sys
 import tarfile
 from pathlib import Path
+
+import pytest
 
 from eval.golden_tasks import (
     EVAL_COMMIT_MESSAGE,
@@ -12,6 +15,7 @@ from eval.golden_tasks import (
     TaskValidity,
     _archive_to,
     _force_rmtree,
+    _run_pytest,
     build_task,
     discover_fix_commits,
     git,
@@ -592,3 +596,337 @@ def test_validate_tasks_streams_instead_of_batching(tmp_path, fixture_repo, monk
 
     assert [t.id for t, _ in it] == [tasks[1].id, tasks[2].id]
     assert calls == [t.id for t in tasks]
+
+
+# ---------- B2 / P4：判定必须真的跑过测试 ----------
+# 这几条测的是 eval/golden_tasks.py 这一层（判据与解析），
+# 恢复机制（P1）那一层在 tests/test_eval_runner.py 的同一节里。
+
+
+def test_judged_passed_never_reads_cannot_parse_as_zero():
+    """⚠️ 这一格是整条修复里最容易做错的地方。
+
+    `passed_count is None` 是"没数出来"，**不是**"一个都没通过"。把 `None` 读成 0
+    会把一次**真实通过**翻成失败 —— 修 bug 的动作本身制造一个新的假阴性。
+    留档的 `45a4d4b3` 正是这一格（见下一条）。
+    """
+    from eval.golden_tasks import _judged_passed
+
+    assert _judged_passed(0, None) is True    # 数不出来 → 保持通过（不许当 0）
+    assert _judged_passed(0, 0) is False      # 数出来了、确实零通过（全 skip 那个洞）
+    assert _judged_passed(0, 3) is True
+    assert _judged_passed(1, 0) is False
+    assert _judged_passed(5, None) is False   # 没收集到用例：本来就不是通过
+
+
+def test_parse_passed_count_anchors_on_the_tally_line():
+    """统计行必须按 pytest 的固定格式认（以 `in <秒>s` 收尾），不能"找第一个 N passed"。
+
+    后半段是真实的失败模式而不是假想：`_run_pytest` 把 stderr 拼在 stdout 后面，
+    而 pytest 在**统计行之后**还会向 stderr 打 unraisable traceback
+    （留档 `45a4d4b3` 就是这么来的）。那里面出现的 `2 passed` 是**异常消息的正文**。
+    """
+    from eval.golden_tasks import _parse_passed_count
+
+    assert _parse_passed_count("3 passed, 1 warning in 0.12s\n") == 3
+    assert _parse_passed_count("2 failed, 3 passed in 0.50s\n") == 3
+    assert _parse_passed_count("===== 4 passed in 0.2s =====\n") == 4
+    assert _parse_passed_count("4 skipped in 0.10s\n") == 0     # 统计行在、一个都没通过
+    assert _parse_passed_count("no tests ran in 0.01s\n") == 0
+    assert _parse_passed_count("ImportError: cannot import name 'x'\n") is None
+
+    # 统计行之后的异常正文里再出现一次 → 不能顶掉统计行
+    sneaky = (
+        "1 passed in 0.06s\n"
+        "Traceback (most recent call last):\n"
+        '  File "conftest.py", line 5, in __del__\n'
+        "    raise ValueError('2 passed')\n"
+    )
+    assert _parse_passed_count(sneaky) == 1
+
+
+def test_tally_line_is_recognised_after_a_minute():
+    """跑满 60 秒之后统计行长这样：`1 passed in 65.32s (0:01:05)`。
+
+    这一格是**实测**来的，不是手抄：pytest 8.4.1 的
+    `_pytest/terminal.py:format_session_duration()` 在 `seconds >= 60` 时返回
+    `f"{seconds:.2f}s ({dt})"` —— 时长后面**还有 `(H:MM:SS)` 一串**。
+    少了这一档，任何跑满一分钟的判定的 `passed_count` 都会是 `None`，
+    P4 在那类任务上**静默失效**（不制造假阴性，但那道闸门等于没装）。
+
+    所以这里直接调 pytest 自己的格式化函数取真串。pytest 哪天改了格式，
+    第一行断言会红 —— 那正是该回来重对实现的时候。
+    """
+    from _pytest.terminal import format_session_duration
+
+    from eval.golden_tasks import _parse_passed_count
+
+    dur = format_session_duration(65.32)
+    assert dur == "65.32s (0:01:05)"
+    assert _parse_passed_count(f"===== 1 passed in {dur} =====\n") == 1
+    assert _parse_passed_count(f"2 passed in {dur}\n") == 2
+    assert _parse_passed_count(f"3 skipped in {dur}\n") == 0
+
+
+def test_ensure_repo_refuses_to_guess_a_url_for_an_unregistered_repo(tmp_path):
+    """换仓时**不许猜 URL** —— 猜错会安静地克隆出一个不相干的仓。
+
+    这一格的分量在于失效模式：猜错了不会报错，闸门照样能跑出"有效任务"来，
+    于是第二轮评估整个建在**错的仓库**上而没人发现。所以未登记的仓名必须响亮地报错，
+    并且把已登记的仓列出来（人要能当场看出正确写法）。
+    """
+    from eval.golden_tasks import REPOS, ensure_repo
+
+    with pytest.raises(ValueError) as ei:
+        ensure_repo(tmp_path / "__nope__")
+    msg = str(ei.value)
+    assert "__nope__" in msg
+    assert all(name in msg for name in REPOS)   # 报错要能自解释
+
+
+def test_ensure_repo_is_idempotent_and_the_default_is_registered():
+    """默认仓必须在登记表里（否则 `--clone` 默认就不可用）；已存在的仓直接返回、不联网。"""
+    from eval.golden_tasks import DEFAULT_REPO, REPOS, ensure_repo
+
+    assert DEFAULT_REPO.name in REPOS
+    # 已克隆的仓：不联网、原样返回同一个路径（`--clone` 因此可以幂等地重复跑）
+    assert ensure_repo(DEFAULT_REPO) == DEFAULT_REPO
+
+
+def test_judge_pins_pytest_to_the_workspace(tmp_path):
+    """判定期跑 pytest 必须**钉在工作区**里（`--rootdir` / `--confcutdir`）。
+
+    不钉的后果是实测出来的（`evalverify/probe_pytest_flags.py`）：目标仓不自带 inifile 时，
+    rootdir 会爬回本仓根，于是**评测器自己的 `conftest.py` 被当插件加载**，
+    而且**本仓根目录进了 `sys.path`**（隐藏测试可以 `import eval.*`）。
+    工作区建在本仓的 `data/eval/ws/<任务>/` 下，祖先链里就是有本仓。
+
+    这条只钉 argv（真的钉住行为要造出"副本落在本仓之下"的几何，那是探针的活）——
+    argv 是这层实现的全部，值指向 `resolve()` 之后的绝对路径。
+    """
+    from eval.golden_tasks import _pytest_argv
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    argv = _pytest_argv(ws, ["tests/test_x.py"])
+
+    assert f"--rootdir={ws.resolve()}" in argv
+    assert f"--confcutdir={ws.resolve()}" in argv
+    assert argv[:2] == [sys.executable, "-m"]
+    assert "tests/test_x.py" in argv
+    assert argv[argv.index("-o") + 1] == "addopts="   # 目标仓的 addopts 必须被清掉
+
+
+# ---------- 非 .py 的测试数据文件不许当 pytest 节点 ----------
+#
+# 实测来源：sqlparse 的 143 个候选里有 5 个的 fix 提交同时改了 `tests/files/*.sql`
+# （新增一个 SQL 夹具当用例输入）。把这些路径当节点交给 pytest，它报
+# `not found: .../x.sql (no match in any of [<Dir files>])` 并以**退出码 4** 收场 ——
+# 用例一次都没跑，而闸门把它记成"判定无效"，于是一个有效任务凭空消失。
+# tinydb 的 `tests/` 全是 `.py`，所以这个形状在第一个仓上没出现过。
+
+
+def test_pytest_argv_drops_non_python_test_data_files(tmp_path):
+    """`.sql` 夹具不能进 argv，`.py` 一个都不能少（顺序也保持）。"""
+    from eval.golden_tasks import _pytest_argv, _pytest_targets
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    files = ["tests/files/casewhen_procedure.sql", "tests/test_split.py",
+             "tests/files/function_psql4.sql"]
+    argv = _pytest_argv(ws, files)
+
+    assert "tests/test_split.py" in argv
+    assert not any(a.endswith(".sql") for a in argv), "非 .py 的夹具被当成 pytest 节点了"
+    # 过滤只删不加，且保持原顺序 —— 否则"跑了哪几个测试文件"就不可比对
+    assert _pytest_targets(files) == ["tests/test_split.py"]
+
+
+def test_judge_refuses_a_target_set_with_no_python_file(tmp_path):
+    """只有非 `.py` 时**不许**去跑 pytest：没有节点参数 = 收集整个套件 = 白送通过。
+
+    判据落在"到底跑没跑"上：这里传一个**不存在的工作区**，只要它没去起子进程，
+    就会安静地返回一个"无效"结论，而不是抛 FileNotFoundError。
+    """
+    from eval.golden_tasks import _NO_TESTS_RC, _run_pytest
+
+    missing = tmp_path / "not-created-workspace"
+    res = _run_pytest(missing, ["tests/files/a.sql"])
+
+    assert res.returncode == _NO_TESTS_RC
+    assert res.passed is False
+    assert res.passed_count == 0
+    assert not missing.exists(), "判定器不该为了这次调用去建工作区（说明它真的起了子进程）"
+
+
+def test_run_pytest_refuses_a_session_where_nothing_actually_ran(tmp_path):
+    """**全 skip 时 pytest 退出码是 0** —— 这条断言就是那个洞本身。
+
+    这是留档 188 字节 PoC 的翻盘原理：conftest 注入一个钩子把用例全标 skip，
+    退出码 0 → 旧判据判"修好了"。所以这里不放 conftest（那是名单要管的事），
+    只钉住最底下那一层：**退出码 0 不足以证明任何事**。
+    """
+    ws = tmp_path / "ws"
+    (ws / "tests").mkdir(parents=True)
+    (ws / "tests" / "test_all_skipped.py").write_text(
+        "import pytest\n"
+        "\n"
+        "pytestmark = pytest.mark.skip(reason='全部跳过')\n"
+        "\n"
+        "def test_would_fail_if_it_ran():\n"
+        "    assert False\n",
+        encoding="utf-8",
+    )
+    r = _run_pytest(ws, ["tests/test_all_skipped.py"])
+    assert r.returncode == 0          # ← 退出码是 0，这正是那个洞
+    assert r.passed_count == 0        # 但一个用例都没通过
+    assert r.passed is False          # → 不许判通过
+    assert r.executed is True         # 测试确实跑了 → 这是"失败"，不是"判定无效"
+    assert r.error is None            # 所以进分母，不冤枉 agent
+
+
+def test_run_pytest_counts_a_real_pass_whose_tally_line_is_outside_the_summary(tmp_path):
+    """留档 `45a4d4b3` 的形状：**统计行落在最后 6 行之外**。
+
+    那次 `passed=True`，而落盘的 `judge_summary`（= 输出的最后 6 行）被
+    `PytestUnraisableExceptionWarning` 的 traceback 整段占满，搜不到任何 `N passed`。
+    这里是它的**真实复现**（session 级 fixture 在收尾时漏一个 `__del__` 会抛的对象，
+    GC 发生在 pytest 打完统计行之后，traceback 走 stderr、被拼到 `out` 末尾）——
+    不是手写的假输出。
+
+    它钉的是"**必须从完整 `out` 解析，不能从 `summary` 解析**"：拿 `summary` 当数据源，
+    再加上"数不出就当 0"，会把这一格真实通过翻成失败。
+    """
+    ws = tmp_path / "ws"
+    (ws / "tests").mkdir(parents=True)
+    (ws / "conftest.py").write_text(
+        "import pytest\n"
+        "\n"
+        "class _Boom:\n"
+        "    def __del__(self):\n"
+        "        raise ValueError('I/O operation on closed file.')\n"
+        "\n"
+        "@pytest.fixture(scope='session', autouse=True)\n"
+        "def _leak():\n"
+        "    yield\n"
+        "    b = _Boom()\n"
+        "    b.cycle = b          # 活到解释器退出，GC 落在统计行之后\n",
+        encoding="utf-8",
+    )
+    (ws / "tests" / "test_ok.py").write_text(
+        "def test_ok():\n    assert True\n", encoding="utf-8"
+    )
+    r = _run_pytest(ws, ["tests/test_ok.py"])
+
+    assert r.returncode == 0
+    assert " passed in " not in r.summary     # 6 行摘要里就是没有统计行
+    assert r.passed_count == 1                # 但完整输出里数得出来
+    assert r.passed is True                   # → 真实通过不许被翻成失败
+
+
+# ---------- B2 / P1：判定前把判定相关文件恢复回去 ----------
+
+def test_capture_and_restore_judge_sensitive_files(tmp_path):
+    """抓 → 篡改 → 还。三种改动（改内容 / 新增 / 删掉）都要能还原。"""
+    from eval.runner import _capture_judge_sensitive, _restore_judge_sensitive
+
+    ws = tmp_path
+    (ws / "conftest.py").write_text("original\n", encoding="utf-8")
+    (ws / "tests").mkdir()
+    (ws / "tests" / "__init__.py").write_text("", encoding="utf-8")
+    (ws / "tinydb").mkdir()
+    (ws / "tinydb" / "__init__.py").write_text("VERSION = '1'\n", encoding="utf-8")
+
+    cap = _capture_judge_sensitive(ws)
+    # `tests/__init__.py` 靠**相对路径**那一档才抓得到（它按名字叫 __init__.py）；
+    # `tinydb/__init__.py` 是合法源码，**绝不能**进这一档 —— 见下一条测试。
+    assert set(cap) == {"conftest.py", "tests/__init__.py"}
+
+    (ws / "conftest.py").write_text("tampered\n", encoding="utf-8")
+    (ws / "tests" / "__init__.py").write_text("import os; os._exit(0)\n", encoding="utf-8")
+    (ws / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+
+    changed = ["conftest.py", "pytest.ini", "tests/__init__.py"]
+    restored, failed = _restore_judge_sensitive(ws, cap, changed)
+
+    assert failed == []
+    assert restored == changed
+    assert (ws / "conftest.py").read_text(encoding="utf-8") == "original\n"
+    assert (ws / "tests" / "__init__.py").read_text(encoding="utf-8") == ""
+    assert not (ws / "pytest.ini").exists()          # 新增的 → 删掉
+
+
+def test_package_init_is_not_treated_as_judge_sensitive(tmp_path):
+    """`tinydb/__init__.py` 是**合法源码**，不是判定相关文件。
+
+    这一条防的是一个具体会犯的错：把 `"__init__.py"` 加进按名字匹配的名单
+    （为了抓 `tests/__init__.py`）—— 那样 P1 的恢复会把 agent 对 `tinydb/__init__.py`
+    的**真实修复还原回去**，直接制造假阴性。所以那一档只能用相对路径。
+    """
+    from eval.golden_tasks import _is_judge_sensitive
+    from eval.runner import _capture_judge_sensitive, _restore_judge_sensitive
+
+    assert _is_judge_sensitive("tests/__init__.py") is True
+    assert _is_judge_sensitive("tinydb/__init__.py") is False
+    assert _is_judge_sensitive("tinydb/storages/__init__.py") is False
+
+    (tmp_path / "tinydb").mkdir()
+    init = tmp_path / "tinydb" / "__init__.py"
+    init.write_text("VERSION = '3.15'\n", encoding="utf-8")
+    cap = _capture_judge_sensitive(tmp_path)
+    init.write_text("VERSION = '3.15'\n__all__ = ['a']\n", encoding="utf-8")  # agent 的修复
+
+    restored, failed = _restore_judge_sensitive(tmp_path, cap, [])
+    assert (restored, failed) == ([], [])
+    assert init.read_text(encoding="utf-8").endswith("__all__ = ['a']\n")  # 修复还在
+
+
+def test_restore_reports_failures_instead_of_raising(tmp_path):
+    """恢复失败必须**能被读出来**（调用方要据此作废这次判定），不是抛异常糊过去。"""
+    from eval.runner import _restore_judge_sensitive
+
+    (tmp_path / "conftest.py").mkdir()   # 目标是个目录 → write_bytes 抛 OSError
+    restored, failed = _restore_judge_sensitive(
+        tmp_path, {"conftest.py": b"x"}, ["conftest.py"]
+    )
+    assert restored == []
+    assert failed == ["conftest.py"]
+
+
+def test_gate_rejects_a_task_whose_gold_patch_touches_judge_sensitive_files(
+    tmp_path, fixture_repo
+):
+    """P1 唯一的真风险面：金标准自己改了判定相关文件、而它不在隐藏测试里。
+
+    那种任务在恢复之后连金标准都跑不过 —— 一个诚实的通过会被判成失败。
+    所以闸门要在**花一分钱之前**把它拒掉（纯元数据，不跑 pytest）。
+    """
+    from eval.golden_tasks import judge_sensitive_blind_spots, validate_task
+
+    repo, base, fix = fixture_repo
+    hidden = {"tests/test_app.py": "def test_add():\n    assert True\n"}
+
+    risky = GoldenTask(
+        id="risky", base_sha=base, fix_sha=fix, title="t", task_text="t",
+        changed_sources=["conftest.py", "src/app.py"],   # 根 conftest.py 不在 tests/ 下
+        hidden_tests=hidden,
+    )
+    assert judge_sensitive_blind_spots(risky) == ["conftest.py"]
+    v = validate_task(risky, repo)
+    assert v.valid is False
+    assert "判定相关文件" in v.reason
+
+    # 隐藏测试**覆盖到**的判定相关文件不算风险：judge 本来就会把它覆盖写回
+    covered = GoldenTask(
+        id="covered", base_sha=base, fix_sha=fix, title="t", task_text="t",
+        changed_sources=["src/app.py"],
+        hidden_tests={"tests/conftest.py": "x", "tests/test_app.py": "y"},
+    )
+    assert judge_sensitive_blind_spots(covered) == []
+
+    # 合法源码（tinydb/__init__.py）永远不在这份名单里 —— 否则会制造假阴性
+    ordinary = GoldenTask(
+        id="ordinary", base_sha=base, fix_sha=fix, title="t", task_text="t",
+        changed_sources=["tinydb/__init__.py"], hidden_tests=hidden,
+    )
+    assert judge_sensitive_blind_spots(ordinary) == []
