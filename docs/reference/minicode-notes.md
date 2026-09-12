@@ -2,6 +2,7 @@
 
 > 调研对象：[LiuMengxuan04/MiniCode](https://github.com/LiuMengxuan04/MiniCode)（本地 F:\MiniCode-main）
 > 调研日期：2026-09-10
+> 最近同步：**2026-09-12**（M9-8 / M5-5 之后重核）——§9 新增第 7、8 条差异化；§10 的三档结论与 ⑦ 行更新到 M9-8 口径；新增的"MiniCode 结构上给不了"两条**都在本地 TS 仓库实测核实过**（搜索范围写在正文里，因为这份笔记自己就记过两次"把没搜到当成不存在"的错误）。
 > 参考定位：**长会话上下文治理**（它的产品核心）+ 分层记忆 + 权限粒度 + 工具结果落盘。
 > 该项目也是简历对照对象（原 MiniCode 简历的 Skill/记忆/上下文压缩/多Agent/权限五项在源码里都能对上）。
 >
@@ -124,8 +125,37 @@ src/
 4. **轨迹驱动评估**（MiniCode 无 eval）——完成率/成本回归报告
 5. **记忆自进化**（MiniCode 只有加载无提取/consolidation）
 6. **step 级检查点/崩溃恢复**（MiniCode 是会话恢复，无任务中途续跑）
+7. **工作区 rewind 快照**（2026-09-12，M9-8）——见下
+8. **评测器分离与离线重算**（2026-09-12，M5-5）——见下
 
 第 2 条（cache-aware 布局）在 M8 之后还多了一层意义：它从"一个亮点"变成了**一条筛选规则** —— 移植任何机制前先问"它会不会改动 `_PREFIX_LEN` 之后的消息"。`update_plan` 就是被它挡下来一次的例子（我们只取落盘，不取参考实现那种每步注入 plan snapshot 的做法）。这条判据比"参考实现这么做"更硬：参考实现没有缓存概念，它的做法在 DeepSeek 的 prefix cache 下是负收益。
+
+### 7. 工作区 rewind 快照（2026-09-12，M9-8）
+
+`agent/workspace.py`（叶子模块，814 行）+ CLI 三个开关 + `/rewind` REPL 命令。修完 bug 能回到任意一步的**磁盘状态**，不只是对话状态。
+
+- **内容是内容寻址对象库 + 会话清单 + 检查点**，对象库**全局共享**（per-session 会让每次倒带重试都复制一遍工作区）。
+- **写盘顺序是不变式：对象 → 清单 → 检查点**（引用必须在被引用者之后写）—— 中途被杀只留**孤儿对象**，不留**说谎的引用**。
+- **`K < lo` 不是错误**（`lo = min(manifests)`，含 `--step 0`）：那是"那时什么都没受管"这个事实 → 全部路径回 `base`。**没有这一支，`base` 结构上不可达**；而夹在两快照中间的步仍报错（那是"不知道"，不是"没有"）。
+- **`/rewind` 默认只预览 + 二次确认**（默认 `n`）—— 全项目唯一的不可逆写操作。
+- 实测：`fork` 的磁盘增量 = **0 个对象 / 0 字节**（只多一份 599 B 清单），这是"对象库全局共享"决议的可观测证据；六条动线 A~F 真跑、变异 35/35。
+
+**为什么 MiniCode 结构上给不了这一条**（2026-09-12 实测核实，搜索范围 `F:\MiniCode-main\src\**\*.ts`）：它的 `snapshot` 命中全部是**内存状态 getter**（`plan/manager.ts:23`、`goal/manager.ts:48`、`loop/scheduler.ts:70`、`agents/manager.ts:182` 各自返回一份 JSON 状态），**没有一处是文件系统快照**；`backup` / `copyFile` / `stash` **零命中**；`history.ts` 是**输入历史**（`MAX_ENTRIES = 500` 的 REPL 历史），不是文件历史。而唯一出现 `restore` 的地方是 `permissions.ts:109-112`，把 `git restore --source` 列进**危险命令警告** —— 也就是说，**"文件回滚"在它那里是要防的风险，不是一项能力**。
+
+> ⚠️ 这条是 `M9-3` 那个 ⚠️ 的直接续集。当时 ⑦ 的如实标注是「**是对话分叉不是工作区分叉**（无工作区快照）」—— M9-5 的 B 动线真跑还直接看到过后果（分叉点在修 bug 之前，盘上文件却已经修好，模型 `read` 到已修好的文件、**却又说了一遍"我修好了失败的测试"**）。M9-8 就是把这个"已知会咬人的边界"变成"已修"。
+
+### 8. 评测器分离与离线重算（2026-09-12，M5-5）
+
+第 4 条说的是"**有**评估"，这一条说的是"**评估本身可信**"—— 两件不同的事，后者是这一轮补的。
+
+- **有效性闸门**（base 必败 + fix 必过）跑在**花 LLM 钱之前**：既砍掉"base 就能过"的白送分，也砍掉"金标准补丁在本机跑不过"的废任务。筛掉谁由闸门说了算，不由关键字说了算。
+- **物理剥离物化**：`git archive base_sha` → 隔离工作区 `git init` + 单次提交，给 agent「一个没有未来的单一初始提交」；**泄漏探针**每次跑都测（`git cat-file -e <fix_sha>` 必须 exit 1、`rev-list --all --count` 必须 = 1）—— 把"不泄漏"从一句声称变成一条可复核的量。
+- **指标口径写死**：`judged = error is None and not patch_failed`；`zero_change` 在 `judge` **之前**测（judge 会把隐藏测试写回工作区，之后再算 diff 永远非零 = 检查等于没做）。硬顺序 `materialize → leak_probe → snapshot → run → snapshot → zero_change → judge`。
+- **定价快照**：历史报告按其**当时**的快照计费，官方下架后置 `archived`、价格锁死、查不到时回落并如实标注（不返回 `None`、不抛异常）。
+- **离线重算机制**（`evalverify/`，本项的核心）：`runner.py` 冻结 → 解析器 bug 用**零 LLM 调用**的重算还原。四条硬不变式：**零 LLM 调用** / **先自校验**（第 0 阶段用现行解析器重算必须逐字段复现留档聚合才继续）/ **不覆盖留档** / **修复代码只有一份**。
+- **它兑现了什么**：`single-shot` 的留档完成率 52.4%（11/21）里，**5 个假阴性是我自己的 `_FENCE_RE` 解析器缺陷**造成的（开围栏只认 ` ``` `/` ```diff `/` ```patch `，前面一个 ` ```python ` 块让围栏配对整个错位一格）—— **一条测试都不会变红，却直接改掉头号指标**。离线重算修正为 84.2%（16/19）。**修正值是反事实**（回答"如果解析器没这个 bug 会被判成什么"），不是实测；那个 bug 仍在 `runner.py` 里。
+
+**为什么 MiniCode 结构上给不了这一条**：第 4 条已经说了它**没有 eval** —— 没有评估层，就谈不上"评测器与执行器分离"，更谈不上"评测器本身可被审计"。这一条的真正价值不在分数，在于它证明了一件更难的事：**我知道分数是被谁决定的。**
 
 ## 10. 12 项「核心能力」逐条对照（2026-09-11 核实）
 
@@ -141,7 +171,7 @@ src/
 | ④ | 进程内 Goal（跨回合推进 + 暂停/恢复/完成检查） | ✅ `cli-commands.ts:25-30` 全套 `/goal` `/goal status` `/goal pause [reason]` `/goal resume` `/goal clear`；`goal/context.ts`、`tools/goal.ts`、`index.ts:317` `goal.manager.dispose()` | ❌ 无（`pause/resume/goal_manager/active_goal` 全 0 命中） | ✅ **已补（M9-6）**：`/goal` 全套 + 目标随检查点落盘 + REPL 自动续跑。**判分权在人手里**：模型只有 `declare_goal_done`（刻意不叫 `complete_goal`）—— 它**声明**，运行时随即跑人给的 `--check` 命令、**退出码说了算**；判定三态（`passed`/`failed`/`invalid`） |
 | ⑤ | 进程内 Loop（固定间隔重复提示词，与 Goal 互斥） | ✅ `cli-commands.ts:22-24` `/loop [Nm\|Nh] <prompt>`（默认 10m、最小 1m）+ `/loop stop`；`loop/scheduler.ts:74` 有"已有 Loop 先 stop"的互斥校验 | ❌ 无 | ❌ **真不做**：它与 Goal **抢同一个回合执行器**，TS 为此在 `runtime/session-runtime.ts` 写了**五处 throw + 一个 busy 谓词** —— **定时器人人写得出来，贵的是那一整套互斥不变式** |
 | ⑥ | 全屏 TUI（历史/滚动/slash 菜单/审批） | ✅ `tty-app.ts`（Ink/React） | ✅ 自研 ANSI，无第三方 TUI 库；`main.py:639 run_tty_app` | ❌ **真不做**（成本是**第二个前端自带一整套状态机**：TS `src/tui/` 只有 8 个 .ts，而该移植版长成 **19 个 .py / 4,941 行**；Windows 还要 `ctypes` 开 `ENABLE_VIRTUAL_TERMINAL_PROCESSING` + `msvcrt` 逐键读）。行式 REPL 已覆盖**能力**面（流式渲染/工具卡片/状态位）；`readline` 历史**已放行、尚未实现** |
-| ⑦ | 按项目持久化 + 恢复/重命名/分叉/压缩 | ✅ `cli-commands.ts:77/82/87/92/147` `/resume` `/rename` `/new` `/fork` `/compact`；`index.ts:11,53-137` `forkSession`；`session.ts:22` `rename` 事件 | ⚠️ resume 有；隔离是**读时过滤** `meta.workspace == workspace`（扁平 `~/.mini-code/sessions/<uuid>.json`，非 hash 路径）；**rename/fork 无** | ✅ **已补（M9-3）**：resume 本就是 **step 级**检查点，`--fork --step K` 因此能**回到任意一步**（TS 的 fork 是**会话级**的）；`--rename` + `--sessions`。**是对话分叉不是工作区分叉**（无工作区快照） |
+| ⑦ | 按项目持久化 + 恢复/重命名/分叉/压缩 | ✅ `cli-commands.ts:77/82/87/92/147` `/resume` `/rename` `/new` `/fork` `/compact`；`index.ts:11,53-137` `forkSession`；`session.ts:22` `rename` 事件 | ⚠️ resume 有；隔离是**读时过滤** `meta.workspace == workspace`（扁平 `~/.mini-code/sessions/<uuid>.json`，非 hash 路径）；**rename/fork 无** | ✅ **已补（M9-3）**：resume 本就是 **step 级**检查点，`--fork --step K` 因此能**回到任意一步**（TS 的 fork 是**会话级**的）；`--rename` + `--sessions`。**M9-3 时是对话分叉不是工作区分叉**（无工作区快照）→ **M9-8 已补上工作区 rewind 快照**，这条缺口消失（见 §9 第 7 条） |
 | ⑧ | provider usage 优先 + tail estimate + 自动压缩 + 折叠 + 裁剪 | ✅ 5/5。`utils/token-estimator.ts:6` `provider_usage_plus_estimate` / `:130` `tailMessages = messages.slice(i+1)`；`compact/` 下 auto-compact / context-collapse / microcompact / snipCompact 全在 | ⚠️ **只有 auto-compact 真接线**。`token_count_with_estimation()`（`context_manager.py:245`）无运行路径调用方，且自认"退化为 estimate_only"；tail estimate 无；collapse 无对应模块；snip 实际是整条丢弃 | ✅ **更强**：usage-first + 尾部估算 + snip + LLM 摘要**全部真接线**。**context collapse 真不做** —— 同类机制实测（P7-d）单次省 5,128 token ↔ 多付 **45,304 miss token（8.8 倍）**，代价形状是后缀失效，与我们**唯一的缓存亮点**直接冲突 |
 | ⑨ | 内置工具含 Web fetch/search | ✅ `tools/web-fetch.ts` / `web-search.ts` / `ask-user.ts` | ✅ 真网络 IO（非桩）：`web_fetch.py:53` 真 `urllib` + SSRF 拦截；`web_search.py:26` 真打 DuckDuckGo | ✅ **已补（M9-2）**：`agent/tools/web.py` 的 `web_fetch` / `web_search` + SSRF 拦截（**重写，不照抄移植版**——它的 `_is_safe_url` 有四个真漏洞，见下） |
 | ⑩ | SKILL.md + MCP stdio 或远程 HTTP，tools/resources/prompts | ✅ `skills.ts` + `tools/load-skill.ts` + `/skills`；`mcp.ts:62` `'streamable-http'` → **远程 HTTP 有** | ⚠️ skills 真实现；MCP **tools/resources/prompts 三项都有**（`mcp.py:531/540/553`），但**传输只有 stdio**（http/sse 零命中） | ✅ **已补（M9-4）**：`Transport` 抽象 + **stdio 与 Streamable HTTP 两种传输**，协议层与传输分离；tools/resources/prompts **三个能力面**（后两个**声明了能力且列表非空**才注册）。真跑接上 DeepWiki 的公开远程端点 |
@@ -150,7 +180,9 @@ src/
 
 ### 三档结论
 
-- **TS → 我们（截至 M9-7，2026-09-11）**：**12 项里 9 项完整落地**（①②③④⑦⑨⑩⑪⑫）。**剩下三项都不是"没做完"，是"真不做"且各有留痕的理由**：⑤ Loop（与 Goal 抢同一个回合执行器，贵的是那套互斥不变式）、⑥ 全屏 TUI（成本是第二套状态机）、⑧ 只差 context collapse 一块（同类机制实测单次省 5,128 token ↔ 多付 45,304 miss token，与我们的缓存亮点直接冲突）。**唯一新立的未开工条目是 M9-8 工作区 rewind 快照**，它不属于这 12 项。
+- **TS → 我们（截至 M9-8 / M5-5，2026-09-12）**：**12 项里 9 项完整落地**（①②③④⑦⑨⑩⑪⑫）。**剩下三项都不是"没做完"，是"真不做"且各有留痕的理由**：⑤ Loop（与 Goal 抢同一个回合执行器，贵的是那套互斥不变式）、⑥ 全屏 TUI（成本是第二套状态机）、⑧ 只差 context collapse 一块（同类机制实测单次省 5,128 token ↔ 多付 45,304 miss token，与我们的缓存亮点直接冲突）。
+  **M9-7 那条"唯一新立的未开工条目"已收口**：M9-8 工作区 rewind 快照于 2026-09-12 完成（变异 35/35、六条动线 A~F 真跑），⑦ 行随之更新（对话分叉 → 对话 + 工作区双分叉）。
+  ⇒ **当前没有任何一项处于"做了一半"或"排着队"的状态**：12 项里 9 项落地、3 项留痕不做；12 项之外的两条差异化（工作区 rewind、评测器分离与离线重算）也已落地。**唯一仍开着的口子在评估层内部**（`TASKS.md` M5-5 的「遗留」一节那三条：`_FENCE_RE` 未回写、`conftest.py` 注入绕过、`env_timeout` 取证不到），**不在与 MiniCode 的对照面上**。
 - **Python 移植 → 我们**：③⑧⑫ **我们更强**（那边是死代码 / 半接线 / 只在高压才跑，我们是真接线）；①⑥ 它强（⑥ 是我们明确不做的）。**⑨⑪ 已补齐** —— 而且⑨ 这一项我们是**照它的意图重写、不照抄**：它的 `_is_safe_url` 有四个真漏洞（见下面「移植版的四个 SSRF 漏洞」）。② 在它那里是**同步阻塞、无句柄**，M9-7 之后我们这一项是**超过**它的。
 
 ### 移植版的四个 SSRF 漏洞（我们重写而不是照抄的理由）
