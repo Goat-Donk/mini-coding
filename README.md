@@ -5,7 +5,7 @@
 
 > **一句话**：把 Claude Code 的架构用 Python 重写一遍——不是移植代码，是移植设计。
 > 14,425 行源码 / 31 个模块 / 847 个测试。真实跑分见[评估章节](#评估eval)。
-📄 文档：[技术方案 `docs/TECH_SPEC.md`](docs/TECH_SPEC.md) · [架构详解 `docs/architecture.md`](docs/architecture.md) · [任务清单 `TASKS.md`](TASKS.md) · [**评估三臂结论汇总（一页纸）**](docs/eval_three_arms_summary.md)（[HTML 版，双击即开](docs/eval_three_arms_summary.html)） · [参考笔记 `docs/reference/`](docs/reference/)
+📄 文档：[技术方案 `docs/TECH_SPEC.md`](docs/TECH_SPEC.md) · [架构详解 `docs/architecture.md`](docs/architecture.md) · [任务清单 `TASKS.md`](TASKS.md) · [**评估三臂结论汇总（一页纸）**](docs/eval_three_arms_summary.md)（[HTML 版，双击即开](docs/eval_three_arms_summary.html)） · [**跨仓泛化对比**](docs/eval_cross_repo_comparison.md) · [参考笔记 `docs/reference/`](docs/reference/)
 
 ---
 
@@ -517,6 +517,23 @@ $ python -m eval.runner --limit 39 --arm single-shot
 **据此可推出的读法**：`single-shot` 的 ¥0.8423 是**冷缓存价**，¥0.3453 是**热缓存价**，两者**不能当作同一条臂的两次成本**来比。**边界如实留着**：直接量到的是「同一段字节第二次发送 ≈99% 命中」；「15:30 那次是冷缓存」是**推断**（无法回查 provider 侧的缓存状态），只是不存在第二个能产生那段字节的来源。另外逐任务的 hit/miss **没有落盘**（只有 `tokens` 与 `cost_cny`），所以每轮的命中率**无法从归档报告重算**。所有 ¥ 都按 `archived` 的定价快照估算，**是量级估算，不是账单**。
 
 > **这条顺带提前说准一件事**（可在 `sqlparse` 的数字出来后核对）：三臂里 `agent` / `one-step` 会**热**（system prompt 与 tinydb 各轮相同），而 `single-shot` 的 prompt 与 tinydb 的**逐字节不同**（任务文本与整包源码都不一样）→ 它应当是**冷**的，成本落在冷价那一档。跨仓比成本时**必须先说清这一点**，否则会把缓存冷热读成「sqlparse 更贵」。
+
+##### 第二仓（`sqlparse`）数字出来后：这句预测**对了两条、错了一条**
+
+| 预测 | 实测（`sqlparse`） | 结果 |
+|---|---|---|
+| `agent` 会**热** | 平均命中率 **0.926** | ✅ |
+| `single-shot` 会**冷** | **0.000** | ✅ |
+| `one-step` 会**热**（理由：system prompt 与 tinydb 各轮相同） | **0.000** | ❌ **错了** |
+
+**错在哪：把「system prompt 相同」当成了「前缀会命中」**，漏掉了**时间**这个变量。
+`sqlparse` 的 `one-step` 跑在 23:50，而 tinydb 上一轮结束在 21:01 —— **中间隔了 2 小时 49 分**，
+provider 侧的磁盘缓存**已经过期**。system prompt 确实逐字节相同，但那段字节**已经不在缓存里了**。
+`agent` 之所以还是热的，是因为它**在同一次运行内部**就热了（每一步给已缓存的前缀续新的一段），不需要跨运行续命。
+
+⇒ 这条错误比它看起来有价值：它顺带给出了**缓存 TTL 过期的第二个独立证据点**（第一个见 TASKS.md 的 P7 系列）。**跨仓比成本时，除了「发没发过这段字节」，还要问「隔了多久」** —— 这两件事都写进下面那张表了。
+
+> 完整的跨仓对比（控对比表 + 通过率与成本效率 + 口径差声明 + 已知偏差）见 **[`docs/eval_cross_repo_comparison.md`](docs/eval_cross_repo_comparison.md)**。
 
 #### 配对比较：聚合百分比会骗人
 

@@ -2733,6 +2733,93 @@ M9-8 之前它无条件说是真的，现在带着 `--rewind` 时它会变成假
 
 ---
 
+### 9.14 跨仓泛化：第二仓 `sqlparse` + 冷热启动成本对比（M5-7 已实现）
+
+**目标**：第一仓 `tinydb` 的结论（三臂完成率、循环的价值、缓存成本）**换一个仓库还成不成立**。
+完整交付物在 `docs/eval_cross_repo_comparison.md`（追踪在版本库里），本节只记**规格与判据**。
+
+**多仓参数化（已在 M5-6 就位，本轮首次真用）**：`runner.py` 的 `--repo` +
+`ensure_repo(repo_dir, *, clone_url=…)`；报告里已有 `repo` / `repo_head` 字段，
+所以多仓跑出来的报告**天然可区分**，不需要另加字段。
+
+**新增一条闸门结果字段的用法**：两仓的 `gate.valid` 分别是 21（39 候选）与 19（20 候选）——
+**分母从报告里算，不许写死**。`evalverify/drive_three_arms.py` 原先在 6 处写死了 `21`
+（第一仓的有效任务数）并**真参与计算**：换到第二仓后同一份输出自相矛盾
+（2a 打 5/21 = 23.8%、2b 打 5/19 = 26.3%）。已全部改为从数据派生，并**双向回归**
+（第二仓修正真错误、第一仓数字零变化）。
+
+**判据（跨仓对比的硬约束，违反即误引）**：
+
+1. **两仓通过率不得并栏**，必须有独立的《受控对比（Controlled Comparison）》列，
+   逐项列出 `judge_guard`、缓存冷热、仓库体积倍率、`runner_sha256`、闸门淘汰率、分母。
+2. **体积倍率必须标明是哪一把尺子**：`single-shot` 实际喂入的源码段（2.52×）/
+   整仓 `.py` 含 tests（2.10×）/ 包 `.py` 不含 tests（2.02×）。三者不可互换引用。
+3. **成本可比性先看缓存冷热**：`agent` 两仓同为热（0.892 / 0.926）、`single-shot` 取**冷-冷**那一对、
+   `one-step` 两仓**不可比**（0.884 热 vs 0.000 冷）。
+4. **`judge_guard` 不同的两份报告不是同一套判定规则**：`guard=False` 时
+   `judge_tampering` / `judge_restored` 一律 `null` = **没检查**，不是「查过且干净」。
+
+**实测结论（正面产出）**：`agent` 臂跨仓是**干净的受控对照** —— 单价 **1.000×**、token 0.971×、
+成本 0.971×；`single-shot` 冷–冷对齐的 **2.48×** 几乎全部来自体积（token 2.37× × 单价 1.047×）；
+缓存冷热在**同仓内**能单独造成 **2.41×** 的单价差。⇒ 本轮**没有**「跨仓更贵」的证据。
+
+#### 本轮新增的两条工程教训（评测基础设施，都不是产品代码的 bug）
+
+**① `subprocess.run(timeout=…)` 在 Windows 上有清道夫死锁。**
+
+```
+proc = subprocess.run(cmdline, ..., timeout=timeout)   # agent/tools/bash.py:310-325
+except subprocess.TimeoutExpired:
+    return ToolResult.fail("命令超时...")               # ← 永远到不了
+```
+
+超时后只 `kill()` **直接子进程**（`cmd /c` 壳），随后在 `raise` 之前**再调一次
+`process.communicate()` 排空管道**；孙进程（python）仍握着管道写端 ⇒ 这次排空**永久阻塞**。
+
+- **直接证据**：`Get-CimInstance` 遍历 runner（PID 111176）的子进程树**为空**（直接子进程已被 kill），
+  而孤儿 python 的 `ParentPID` 指向一个**已死的壳**；runner CPU 连续 100 秒 Δ=0.00。
+- **后果**：**bash 工具的 120 s 超时形同虚设**。本轮 `agent` 臂为此白烧 9 次超时
+  （556/319/255/231/187/136/135/134/134 s，合计 ≈2087 s，全部 `exit_code=None`）。
+- **本轮的处置是运维层的**（后台看门狗按**真实创建时间**清孤儿，不改任何评测代码），
+  **根因未修** —— 修法应是把 `subprocess.run` 换成显式 `Popen` + 超时后 `kill` 整棵进程树
+  （Windows 用 `taskkill /T`），**不是**加长超时。
+
+**② `_run_pytest` 完全没有超时**（`eval/golden_tasks.py:545-548`）。
+
+```python
+p = subprocess.run(_pytest_argv(...), cwd=workspace, capture_output=True, text=True)
+#                                                                    ↑ 没有 timeout
+```
+
+判定器一旦遇到**非终止测试**就**永久钉死整条臂**，没有任何东西会来收尾。
+
+- **本轮实测**：任务 `8b034273` 的 `agent` 补丁在 `group_comments` 里把 `eidx` 退到了 `tidx` 之前
+  → `group_tokens(sql.Comment, tidx, eidx)` 起点大于终点 → 那个 Comment token 没被合并掉
+  → 外层 `token_next_by(t=T.Comment, idx=tidx)` **每次都返回同一个 token** ⇒ 测试非终止。
+  `probe772.py` 15 s 硬超时实测：**补丁版未结束、`git HEAD` 的 base 版毫秒级 `rc=0`**
+  —— **死循环是补丁自己造的，不是 base 的 bug**（这一点我先前判错过，已纠正并留痕）。
+- **后果**：判定器单核烧 300 s+ 不终止，整条臂钉死。本轮由外部 `taskkill` 终止，
+  该任务因此记 `passed=False`（**该判定为真**，但归档报告不含「被外部终止」的痕迹 —— 取证缺口）。
+- **修法（下一轮）**：`_run_pytest` 加超时，且**超时单列一档**（同 `JudgeResult.executed`
+  的三态教训：算通过和算没通过都是错的），**不要**让它退化成「测试没过」。
+
+#### 本轮暴露的真缺陷（**未修，列为下一轮第一件事**）
+
+`eval/golden_tasks.py:229` 的 `render_task_text` 把仓库名**写死**：
+
+```python
+    return f"""以下是 tinydb 仓库中一个真实 bug 的报告：
+```
+
+`eval/runner.py` 的 `single_shot_prompt` 与 `run_single` 都用 `task.task_text`，
+所以第二仓 `sqlparse` 的**三条臂**收到的任务文本全都自称「tinydb 仓库」（第一仓不受影响）。
+
+**不修的理由**：`eval/golden_tasks.py` 的 sha256 是报告 `ruler` 指纹的一部分
+（`4b226f39befd`），改了它这三份报告的指纹立刻失效，而本轮的前提是「已归档的数字可复核」。
+**改完必须重跑才能引用新数字。**
+
+---
+
 ## 10. 验收总命令
 
 ```bash
