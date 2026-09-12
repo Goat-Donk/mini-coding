@@ -49,6 +49,12 @@ DEFAULT_REPO = Path("eval/repos/tinydb")
 REPOS: dict[str, str] = {
     # 基准：10 个源文件 · 71,659 字符 · 估算 17.9k tokens（字符/4） · 39 个候选
     "tinydb": TINYDB_REPO,
+    # 第二个目标仓（M5-6 选定并实跑过闸门）：flat 布局、**没有 inifile**、
+    # 原地 `python -m pytest` 就能收集（不用装任何东西）—— 正是它把 `--rootdir`/
+    # `--confcutdir` 那条边界逼了出来（tinydb 自带 pytest.ini，对那两个参数是 no-op）。
+    # 实测：143 个候选 → 闸门后 54 个有效；single-shot 的输入按 `_collect_sources` 逐任务
+    # 实测 12.4 万 ~ 15.1 万字符（随提交变化），故这里不写单一字符数。
+    "sqlparse": "https://github.com/andialbrecht/sqlparse.git",
     # 下面这些只登记"量过"，不代表都已入库当目标仓（体积/候选数的取舍见 README）。
     "flake8": "https://github.com/PyCQA/flake8.git",
     "tomlkit": "https://github.com/python-poetry/tomlkit.git",
