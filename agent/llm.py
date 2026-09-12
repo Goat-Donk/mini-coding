@@ -13,8 +13,6 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Callable, Sequence
 
-from openai import OpenAI
-
 
 @dataclass
 class Usage:
@@ -167,6 +165,8 @@ class DeepSeekClient(BaseLLM):
             )
         self.base_url = base_url or os.environ.get("DEEPSEEK_BASE_URL", self.DEFAULT_BASE_URL)
         self.model = model or os.environ.get("DEEPSEEK_MODEL", self.DEFAULT_MODEL)
+        # 惰性导入：`openai` 冷导入 ≈3.0s，占 `app.cli` 冷启动的九成；MockLLM 与无 key 子命令都不需要它。
+        from openai import OpenAI
         self._client = OpenAI(
             api_key=self.api_key,
             base_url=self.base_url,
