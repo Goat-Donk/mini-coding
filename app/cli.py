@@ -40,6 +40,7 @@ from agent.session import (
     resolve_session,
     session_name,
     set_session_name,
+    update_meta,
 )
 from agent.state import user as user_message
 from agent.tools.ask import build_ask_tool
@@ -48,6 +49,16 @@ from agent.tools.goal import build_goal_tools
 from agent.tools.plan import render_plan
 from agent.tools.skills import build_skill_tools
 from agent.tools.subagent import build_subagent_tools
+from agent.workspace import (
+    ACTION_DELETE,
+    ACTION_RESTORE,
+    ACTION_UNRESOLVABLE,
+    SnapshotError,
+    WorkspaceSnapshots,
+    drop_snapshots,
+    list_snapshot_sessions,
+    object_store_stats,
+)
 
 app = typer.Typer(no_args_is_help=True)
 
@@ -233,6 +244,8 @@ def _do_fork(
     ref: str | None,
     step: int | None,
     name: str | None,
+    *,
+    rewind: bool = False,
 ) -> tuple[Session, object]:
     """从某一步分叉出新会话，返回 `(Session, AgentState)`（并打印分叉信息）。
 
@@ -259,12 +272,24 @@ def _do_fork(
         fg=typer.colors.BRIGHT_BLACK,
     )
     # 这句必须打：不说的话，"回到第 3 步"极容易被理解成工作区也回去了。
-    # 我们的分叉只复制**对话**，文件停在当前状态（没有工作区快照机制）。
-    typer.secho(
-        "  注意: 这是对话分叉 —— 工作区文件**不会**回滚到那一步，"
-        "分叉后的 agent 看到的是当前的文件",
-        fg=typer.colors.YELLOW,
-    )
+    #
+    # **它必须跟着 `--rewind` 分叉写。** M9-8 之前它无条件说"工作区不会回滚"，
+    # 那时它是真的（没有回滚机制）；现在 `--fork --step K --rewind` 会让文件也
+    # 回到第 K 步，同一句话就成了一句**假话** —— 而它恰恰是用户用来判断
+    # "文件动没动"的那一句。分叉这一支说的仍然是"下一步会发生什么"，因为此刻
+    # 回滚还**没**发生（还要过预览与确认），先宣告"已经回去了"是另一种假话。
+    if rewind:
+        typer.secho(
+            "  注意: 这次还带了 --rewind —— 下一步会把工作区**文件**也回滚到那一步"
+            "（默认先预览、要你确认）。两件事是分开做的：分叉搬对话，回滚动文件",
+            fg=typer.colors.YELLOW,
+        )
+    else:
+        typer.secho(
+            "  注意: 这是对话分叉 —— 工作区文件**不会**回滚到那一步，"
+            "分叉后的 agent 看到的是当前的文件。要连文件一起回去，加 --rewind",
+            fg=typer.colors.YELLOW,
+        )
     return fork, restored
 
 
@@ -307,6 +332,28 @@ def _confirm_prompt(question: str) -> str | None:
         typer.secho("（读不到输入，按拒绝处理）", fg=typer.colors.BRIGHT_BLACK)
         return None
     return _CONFIRM_CHOICES.get(str(raw).strip())
+
+
+def _yes_no_prompt(question: str) -> str | None:
+    """是/否确认框（`--rewind` 用）。返回 `"y"` / `"n"` / None（读不到输入）。
+
+    **不能复用 `_confirm_prompt`**：那个返回的是权限引擎的粒度串
+    （`allow_once`/`deny_turn`…），是给"这次工具调用怎么办"用的六选一。回滚要的
+    是一个二选一，把两种语义塞进同一个函数，将来改菜单就会改到另一边的语义上。
+
+    默认值是 `"n"`：确认框的默认值就是用户不假思索按下的那个 —— 而回滚是全项目
+    唯一一个会**覆盖和删除用户文件**的操作。
+    """
+    typer.echo()
+    typer.secho("─" * 68, fg=typer.colors.BRIGHT_BLACK)
+    typer.secho(question, fg=typer.colors.YELLOW)
+    try:
+        raw = typer.prompt("确认回滚？(y/N)", default="n", show_default=False)
+    except (EOFError, KeyboardInterrupt, typer.Abort):
+        typer.secho("（读不到输入，按取消处理）", fg=typer.colors.BRIGHT_BLACK)
+        return None
+    answer = str(raw).strip().lower()
+    return "y" if answer in ("y", "yes", "是") else "n"
 
 
 def _build_llm(mock: bool) -> BaseLLM:
@@ -627,6 +674,237 @@ def _print_plan(workspace_root: Path, session_id: str | None, step: int | None) 
     typer.echo(render_plan(state.plan) if state.plan else "（该会话没有计划清单）")
 
 
+# ---------- M9-8：工作区回滚（--snapshots / --drop-snapshots / --rewind） ----------
+
+#: `restore` 预览里每种动作的记号。用 `+`/`-`/`~` 而不是文字，是因为一屏要装下
+#: 几十行，人扫的是**形状**（哪里多了一行、哪里少了一行），不是读句子。
+_ACTION_MARK = {
+    ACTION_RESTORE: ("~", "还原"),
+    ACTION_DELETE: ("-", "删除"),
+    # 这两个是"我们做不到"的，必须和人能做的动作在视觉上分开 —— 混在一起会让人
+    # 以为"这一栏也会被处理"。
+    ACTION_UNRESOLVABLE: ("?", "做不到"),
+}
+
+
+def _render_rewind_preview(plan) -> str:
+    """把回滚预览渲染成人话（决议 2：默认必须是预览，执行要二次确认）。
+
+    四个部分缺一不可，因为它们回答的是四个不同的问题：
+
+    1. **要动哪些文件** —— 用户唯一真正在批准的东西。
+    2. **有多少文件不受影响** —— 否则一屏 `~` 会让人以为"所有文件都要变"。
+    3. **不在管辖范围的文件数** —— 没被 write/edit 碰过的。不写这一栏，用户会
+       以为回滚是"整个工作区回到第 K 步"，而它其实只回滚**我们改过的那几个**。
+    4. **不可回滚的副作用计数**（bash / 其它工具）—— 决议 6：这是**独立的
+       一维**，不混进第 3 条。`git commit`、`pip install`、发出的网络请求都不会
+       因为文件回滚而撤销，把这两件事合并计数等于替用户把风险抹掉。
+    """
+    lines: list[str] = []
+    changes = plan.changes
+    if not changes:
+        lines.append("  （没有需要改动的文件 —— 工作区已经是那一步的样子）")
+    for action in changes:
+        mark, label = _ACTION_MARK.get(action.kind, ("?", action.kind))
+        delta = ""
+        if action.kind == ACTION_RESTORE:
+            cur = "不存在" if action.current_size is None else f"{action.current_size} B"
+            delta = f"（{cur} → {action.target_size} B）"
+        elif action.kind == ACTION_DELETE:
+            cur = "不存在" if action.current_size is None else f"{action.current_size} B"
+            delta = f"（{cur} → 删除）"
+        lines.append(f"  {mark} {label}  {action.rel} {delta}".rstrip())
+
+    lines.append("")
+    lines.append(f"  不受影响: {len(plan.unchanged)} 个文件（它们在这段里没变过）")
+    if plan.outside:
+        lines.append(
+            f"  不在管辖范围: {plan.outside} 个文件"
+            "（从没被 write/edit 碰过，回滚**不动**它们）"
+        )
+    if plan.shell_calls or plan.other_calls:
+        # 这一栏永远用醒目的颜色打（调用方负责着色）：它是这个功能**如实标注**的
+        # 那一半 —— 文件回去了，命令造成的后果没有。
+        lines.append(
+            f"  ⚠ 不会被回滚的副作用: {plan.shell_calls} 次 bash 调用"
+            f" + {plan.other_calls} 次其它工具调用"
+        )
+    return "\n".join(lines)
+
+
+def _do_rewind(
+    workspace_root: Path,
+    sid: str,
+    step: int | None,
+    *,
+    force: bool,
+    confirm=None,
+) -> int | None:
+    """回滚工作区到第 K 步。返回**已经落在那一步的目标步号**，没执行则 `None`。
+
+    返回步号而不是 bool，是因为调用方要拿它拼下面那句"继续"的命令
+    （`--resume --step K`）—— 步号在 `plan()` 里才定下来（`step=None` 时取最近
+    一个有快照的步），调用方自己算会算错，而算错的那句话会把人引到一个错位的
+    对话上。
+
+    `confirm` 是确认回调（默认 `_yes_no_prompt`）：REPL 要传自己的版本，否则
+    常驻模式里 `input()` 会和 REPL 自己的行读取打架。
+
+    **默认只预览**（决议 2）。理由不是保守：回滚会**覆盖和删除用户的文件**，
+    而这是全项目唯一一个不可逆的写操作（对象库留了旧字节，但被覆盖的文件本身
+    没有 undo）。确认框的默认值必须是"不执行"那个方向。
+    """
+    snapshots = WorkspaceSnapshots(workspace_root, sid)
+    try:
+        plan = snapshots.plan(step)
+    except SnapshotError as exc:
+        typer.secho(f"回滚失败: {exc}", fg=typer.colors.YELLOW)
+        raise typer.Exit(1)
+
+    typer.secho(
+        f"回滚预览: {_session_label(workspace_root, sid)} 的工作区 → 第 {plan.target_step} 步",
+        fg=typer.colors.CYAN, bold=True,
+    )
+    typer.echo(_render_rewind_preview(plan))
+
+    if not plan.changes:
+        # 没事可做就不弹确认框 —— 但**仍然返回步号**：调用方靠它拼"继续"那句话，
+        # 而"工作区已经就是那一步的样子"同样需要告诉用户对话该回到哪一步。
+        return plan.target_step
+
+    if not force:
+        if confirm is None:
+            confirm = _yes_no_prompt
+        answer = confirm(
+            f"确认把上面这 {len(plan.changes)} 个文件回滚到第 {plan.target_step} 步？"
+            "（这会覆盖/删除磁盘上的文件，不可撤销；加 --force 可跳过此问）"
+        )
+        if answer != "y":
+            typer.secho("已取消（工作区未改动）", fg=typer.colors.BRIGHT_BLACK)
+            return None
+
+    report = snapshots.restore(plan)
+    typer.secho(
+        f"工作区已回滚到第 {plan.target_step} 步: "
+        f"{len(report.done)} 个文件处理完成",
+        fg=typer.colors.GREEN, bold=True,
+    )
+    if report.failures:
+        # **绝不假装清干净了**：逐条报出失败的文件与原因。这里不退出码非零 ——
+        # 回滚本身做完了，失败的是其中几个文件，而项目里的退出码语义是"命令
+        # 有没有做成"，把它和"部分文件没到位"混起来会让脚本判错。
+        typer.secho(
+            f"⚠ {len(report.failures)} 个文件没能回到位:", fg=typer.colors.RED, bold=True
+        )
+        for rel, why in report.failures:
+            typer.secho(f"    {rel}: {why}", fg=typer.colors.RED)
+    # 记进 meta：`--resume` 时靠它判断"模型的记忆和盘面已经对不上了"（见
+    # `_reinject_rewind`）。写 meta 而不是只打印 —— 打印出的字留在上一个进程的
+    # 屏上，而下一个进程要读的是文件。
+    update_meta(
+        workspace_root, sid,
+        last_rewind={"step": plan.target_step, "files": len(report.done)},
+    )
+    return plan.target_step
+
+
+def _reinject_rewind(state) -> None:
+    """恢复会话时，如果这个会话的工作区被回滚过，**必须告诉模型**。
+
+    不告诉会怎样：模型的历史里写着"我改了 a.txt、我删了 b.txt"，而盘上那些改动
+    已经没了。它会基于一份**不存在的现状**往下推理 —— 比如"上个回合我已经把
+    config 改好了"，于是跳过这一步。这不是记忆模糊，是记忆**明确地错了**。
+
+    触发判据是 `state.step > target`：回滚发生在第 target 步，而恢复到的这一步
+    比它晚 —— 中间那些步的工作已经被抹掉了，才需要说。等于或早于 target 时，
+    历史与盘面一致，补投反而是噪音（还会平白改一次消息前缀、破缓存）。
+
+    与 `_reinject_plan`/`_reinject_goal` 同一条纪律：**只在恢复时补一次**，
+    而且用 user 角色 + 说明来源 —— 这是运行时的事实通知，不是人说的话。
+    """
+    info = getattr(state, "last_rewind", None)
+    if not isinstance(info, dict):
+        return
+    target = info.get("step")
+    if not isinstance(target, int) or state.step <= target:
+        return
+    state.messages.append(
+        user_message(
+            f"（运行时通知：本会话的工作区曾被回滚到第 {target} 步 —— "
+            f"第 {target} 步之后所有 write/edit 造成的文件改动都已经不在磁盘上了。"
+            "你历史里那些改动记录描述的是**当时的**盘面，不要以为它们现在还在。"
+            "动手前先读一遍相关文件确认真实现状。）"
+        )
+    )
+    state.record_event("rewind_notice", target=target, current_step=state.step)
+    typer.secho(
+        f"工作区回滚通知: 已回滚到第 {target} 步（当前 step {state.step}）",
+        fg=typer.colors.YELLOW,
+    )
+
+
+def _print_snapshots(workspace_root: Path) -> None:
+    """列出所有有工作区快照的会话 + 全局对象库占用（`--snapshots`）。
+
+    与 `--sessions` 的区别是刻意的：那个列的是**对话**，这个列的是**文件**。
+    一个会话可能有检查点却一个快照都没有（从没改过文件，或 M9-8 之前建的）——
+    所以两张表不能合并。
+    """
+    usages = list_snapshot_sessions(workspace_root)
+    stats = object_store_stats(workspace_root)
+    typer.secho("工作区快照:", fg=typer.colors.CYAN, bold=True)
+    if not usages:
+        typer.echo("  （没有任何会话留下工作区快照）")
+    for usage in usages:
+        steps = usage.steps
+        shown = ", ".join(str(s) for s in steps[:8]) + ("…" if len(steps) > 8 else "")
+        typer.echo(
+            f"  {_session_label(workspace_root, usage.session_id)}"
+            f"  步骤 [{shown}]  {len(steps)} 份清单 {usage.manifest_bytes} B"
+        )
+    typer.echo("")
+    typer.secho(
+        f"全局对象库: {stats.objects} 个对象 {stats.total_bytes} B"
+        f"（被 {stats.live} 个引用指着）",
+        fg=typer.colors.CYAN, bold=True,
+    )
+    # 孤儿单独报、不混进总数里：它们是**写盘顺序**的正常残留（对象写完、清单
+    # 还没写就被杀），不是 bug，也不自动删（决议 1 的清理是人的动作）。
+    typer.echo(
+        f"  孤儿对象: {stats.orphans} 个 {stats.orphan_bytes} B"
+        "（没有任何清单引用 —— 通常是崩溃残留，不自动删）"
+    )
+    typer.echo("  清理某个会话的快照: python -m app.cli --drop-snapshots --session-id <id>")
+
+
+def _do_drop_snapshots(workspace_root: Path, ref: str | None) -> None:
+    """删掉一个会话的快照清单并回收无人引用的对象（`--drop-snapshots`）。
+
+    这是决议 1 里"允许用户手动清理"的出口：基座快照无条件存全量，磁盘代价靠
+    **可见 + 可清理**来兜，而不是靠一个默认关掉的开关（那样最需要基座的场合
+    恰恰是没开它的场合）。
+    """
+    sid = _resolve_sid(workspace_root, ref)
+    try:
+        result = drop_snapshots(workspace_root, sid)
+    except SnapshotError as exc:
+        typer.secho(f"清理失败: {exc}", fg=typer.colors.YELLOW)
+        raise typer.Exit(1)
+    typer.secho(
+        f"已删除 {_session_label(workspace_root, sid)} 的 {result.manifests_removed} 份快照清单，"
+        f"回收 {result.objects_removed} 个对象（{result.bytes_freed} B）",
+        fg=typer.colors.GREEN, bold=True,
+    )
+    if result.kept_shared:
+        # 必须解释这个差额：不说的话用户看到"删了 5 份清单只回收 2 个对象"，
+        # 只会以为清理有 bug。真相是对象库**跨会话共享**（决议 5）。
+        typer.echo(
+            f"  {result.kept_shared} 个对象因为**别的会话还在引用**而保留"
+            "（对象库是全项目共享的）"
+        )
+    typer.echo(f"  该会话的检查点未动，仍可 --resume；仅 --rewind 对这几步失效")
+
+
 @app.command()
 def run(
     task: str = typer.Argument(
@@ -657,7 +935,22 @@ def run(
     ),
     fork: bool = typer.Option(
         False, "--fork",
-        help="从 --step 那一步分叉出新会话（**对话**分叉，不回滚工作区文件）",
+        help="从 --step 那一步分叉出新会话（**对话**分叉；要连文件一起回退就再加 --rewind）",
+    ),
+    snapshots: bool = typer.Option(
+        False, "--snapshots",
+        help="列出所有会话的工作区快照 + 全局对象库占用（含孤儿对象数）后退出",
+    ),
+    drop_snapshots: bool = typer.Option(
+        False, "--drop-snapshots",
+        help="删掉 --session-id 那个会话的工作区快照并回收无人引用的对象（不动检查点）",
+    ),
+    rewind: bool = typer.Option(
+        False, "--rewind",
+        help="把工作区回滚到 --step 那一步（**默认只预览**；加 --force 才真改盘）",
+    ),
+    force: bool = typer.Option(
+        False, "--force", help="--rewind 时跳过确认，直接执行",
     ),
     checkpoint_every: int | None = typer.Option(
         None, "--checkpoint-every",
@@ -691,6 +984,15 @@ def run(
     if sessions:
         _print_sessions(workspace_root)
         raise typer.Exit()
+    if snapshots:
+        # 与 `--sessions` 同类：纯读 `data/` 下的文件，不建会话、不碰模型。
+        # 与它分开成两条命令是刻意的 —— 一个是**对话**的清单，一个是**文件**的
+        # 清单，一个会话完全可能有检查点却一个快照都没有（从没改过文件）。
+        _print_snapshots(workspace_root)
+        raise typer.Exit()
+    if drop_snapshots:
+        _do_drop_snapshots(workspace_root, session_id)
+        raise typer.Exit()
     if plan:
         # 放在"任务不能为空"检查之前：--plan 本来就不带任务
         _print_plan(workspace_root, session_id, step)
@@ -709,18 +1011,44 @@ def run(
 
     forked_sid: str | None = None
     if fork:
-        fork_session, _fork_state = _do_fork(workspace_root, session_id, step, rename)
+        fork_session, _fork_state = _do_fork(
+            workspace_root, session_id, step, rename, rewind=bool(rewind)
+        )
         forked_sid = fork_session.session_id
-        if not task.strip() and not repl:
-            # 只分叉、不续跑：分叉本身是零成本的（不动模型），而续跑要花钱。
-            # 不带上任务就退出，把"要不要接着跑"留给用户显式说 —— 下面已经
-            # 打出了可执行的续跑命令。（`--repl` 时不退出：人已经在终端前，
-            # 进去之后第一行输入就是"要不要接着跑"。）
-            typer.secho(
-                f'  继续: python -m app.cli --resume --session-id {forked_sid} "你的指示"',
-                fg=typer.colors.CYAN,
-            )
-            raise typer.Exit()
+
+    # ---- M9-8：工作区回滚。位置在这里是**算出来的**，不是随手放的 ----
+    #
+    # 必须在下面那个"只分叉不续跑"的 Exit **之前**：`--fork --step K --rewind`
+    # 是"倒带重试"的黄金组合，回滚放在 Exit 之后的话，分叉成功了、文件却没回去
+    # —— 而命令看上去一切正常（退出码 0、输出齐全、"已分叉"也打出来了）。
+    #
+    # 回滚哪份快照：`--fork` 时用**分叉出来的那个**会话。分叉已经把 K 之前的
+    # 清单搬过去了（`_copy_snapshots`），而单独 `--fork` 出来的会话在回滚这件事上
+    # 跟源会话指向同一批文件 —— 用分叉的那个，语义才是"我刚分出来的这条线"。
+    rewound_step: int | None = None
+    rewind_sid: str | None = None
+    if rewind:
+        rewind_sid = forked_sid or _resolve_sid(workspace_root, session_id)
+        rewound_step = _do_rewind(workspace_root, rewind_sid, step, force=force)
+
+    if (fork or rewind) and not task.strip() and not repl:
+        # 只分叉／只回滚、不续跑：这两件事都是零模型成本的（不动模型），而续跑
+        # 要花钱。不带上任务就退出，把"要不要接着跑"留给用户显式说 —— 下面给出
+        # 可执行的那一行。（`--repl` 时不退出：人已经在终端前，进去之后第一行
+        # 输入就是"要不要接着跑"。）
+        #
+        # 提示里带上 `--step`，因为那才是真正"回到第 K 步"的命令：**对话**由
+        # `--resume --step K` 回去，**文件**由刚才的 `--rewind` 回去了。只写
+        # `--resume` 会让对话停在最新一步、对着一个回到过去的文件系统干活 ——
+        # 那正是 `_reinject_rewind` 要兜的那种错位。
+        hint_sid = forked_sid or rewind_sid or _resolve_sid(workspace_root, session_id)
+        hint_step = rewound_step if rewound_step is not None else step
+        step_flag = f" --step {hint_step}" if hint_step is not None else ""
+        typer.secho(
+            f'  继续: python -m app.cli --resume --session-id {hint_sid}{step_flag} "你的指示"',
+            fg=typer.colors.CYAN,
+        )
+        raise typer.Exit()
 
     if not resume and forked_sid is None and not task.strip() and not repl:
         typer.secho(
@@ -830,6 +1158,11 @@ def run(
                 # 当成"用户说的话"塞进去，模型会以为是人给的指令。
                 _reinject_plan(restored)
             _reinject_goal(restored)
+            # M9-8：工作区被回滚过的话，**必须**在模型开口之前告诉它。
+            # 放在最后：它是"现状通知"，比计划/目标更基础 —— 计划说"要做什么"，
+            # 这一条说"你以为做过的事其实没做"。顺序反过来的话，模型会先读到
+            # 计划、形成"我推进到第 5 项了"的印象，再被告知盘面是第 2 步的样子。
+            _reinject_rewind(restored)
             if task.strip():
                 # 续跑指示：`--resume "..."` 曾经**静默丢掉**这个参数（run_from 用的是
                 # state.task），于是「拒绝文案让你 --clear-taint 复位后重试」这条动线

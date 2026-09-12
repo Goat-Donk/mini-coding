@@ -33,6 +33,7 @@ from pathlib import Path
 from agent.goal import Goal
 from agent.llm import Usage
 from agent.security import TAINT_MEDIUM, TAINT_NONE, higher
+from agent.workspace import WorkspaceSnapshots
 from agent.state import AgentState
 
 # 不落盘的字段：运行时对象（回调、句柄），不是状态。**这份名单应该保持短**——
@@ -210,6 +211,33 @@ def session_name(workspace_root: Path, session_id: str) -> str | None:
     return name if isinstance(name, str) and name else None
 
 
+def last_rewind(workspace_root: Path, session_id: str) -> dict | None:
+    """读这个会话最近一次**工作区回滚**（meta 里的 `last_rewind`）。
+
+    与 `session_name` 同一条纪律：**不抛错**。恢复一个 meta 损坏的会话仍然应该
+    能跑起来（轨迹与检查点都好好的），而这里读不到只是少一条"盘面变过"的通知。
+    真要"名字丢了要响"，出口是 `--sessions` 的 `meta_error`。
+
+    形状校验只到"是不是 dict、step 是不是 int"为止 —— 与 `list_sessions` 读
+    `forked_from` 同一口径：读出来的东西是要被信任的输入，先验形状再用。
+
+    `bool` 要单独排掉：Python 里 `isinstance(True, int)` 是 True（bool 是 int 的
+    子类），于是一个手改出来的 `{"step": true}` 会安静地当成第 1 步。JSON 序列化
+    我们自己写的东西永远不会产出它，所以这只可能来自手改 —— 而手改出来的东西
+    最不该被当成事实。
+    """
+    try:
+        raw = read_meta(workspace_root, session_id).get("last_rewind")
+    except ValueError:
+        return None
+    if not isinstance(raw, dict):
+        return None
+    step = raw.get("step")
+    if not isinstance(step, int) or isinstance(step, bool):
+        return None
+    return raw
+
+
 # ---------- state 序列化（全字段，不手写白名单） ----------
 
 def dump_state(state: AgentState) -> dict:
@@ -328,6 +356,10 @@ class Session:
         )
         self._on_event = on_event  # 可选监听器（UI 实时流式渲染用），失败不影响轨迹
         self._ticks = 0  # 恢复后重新计数：每 N 步（本段运行）写一个检查点
+        # M9-8 工作区快照：登记 write/edit 的改动、按步落清单、支持 --rewind 回滚。
+        # 挂在 Session 上而不是引擎上，是为了让"worker 拿不到它"成为**结构性**事实
+        # （worker 的引擎 session=None）。见 agent/workspace.py 的模块 docstring。
+        self.snapshots = WorkspaceSnapshots(self.workspace_root, session_id)
         # 只读工具是并发执行的，emit 会被多个线程同时调用；
         # 加锁保证 JSONL 一行一个完整事件、不会两行交错（轨迹可被逐行解析）
         self._write_lock = threading.Lock()
@@ -363,6 +395,17 @@ class Session:
             self._write(state)
 
     def _write(self, state: AgentState) -> Path:
+        # ★ M9-8 写盘顺序：**对象 → 清单 → 检查点**。快照必须在检查点之前落盘。
+        #
+        # 反过来的话，一次断电就能造出"检查点说有快照、快照却不存在"——一份**说谎的
+        # 引用**，而用户看到的是一个能 `--resume`、却回滚不了的会话。按这个顺序被杀，
+        # 最坏只留下**孤儿对象**（不可达的字节），谁都读不到它，也不会有谁去读。
+        # 见 `agent/workspace.py` 不变式 3 与 `docs/design/m9-8_rewind.md` §2.4。
+        #
+        # 放在 `_write` 而不是 `checkpoint`：`_write` 是**所有**落盘路径的必经之地
+        # （含 `force=True` 的 await_user 那一处），挂在节流判断里面会让强制检查点
+        # 漏掉快照 —— 那正好是"机制在、测试绿、真跑发现没生效"的老路。
+        self.snapshots.capture(state.step)
         payload = {
             "session_id": self.session_id,
             "step": state.step,
@@ -433,7 +476,16 @@ class Session:
             stored = _stored_cadence(payload)
             if stored is not None:
                 session.checkpoint_every = stored
-        return session, load_state(payload, session_id)
+        state = load_state(payload, session_id)
+        # M9-8：`--rewind` 是**另一个进程**里做的事，它把"我把工作区抹回到第 K 步"
+        # 写进 meta。恢复时必须把它带进 state —— 否则模型历史里写着"我改了 a.txt"、
+        # 而盘上那个改动已经没了，它会照着一份**明确错误**的现状往下推理。
+        #
+        # 放在 `from_checkpoint` 而不是两个入口（CLI 单发 + REPL）里各读一次：
+        # 这就是"两处各写一遍 → 迟早有一处漏"的形状，而漏掉的那一处，症状是
+        # 模型安静地基于不存在的文件干活。取回来之后 `_reinject_rewind` 才有东西可用。
+        state.last_rewind = last_rewind(workspace_root, session_id)
+        return session, state
 
     def _load_payload(self, step: int | None) -> dict:
         if step is None:
@@ -473,16 +525,21 @@ class Session:
 
         **它是对话分叉，不是工作区分叉。** 这条必须说清楚，否则很容易被当成
         "时光倒流"：工作区（文件）不会被回滚到第 N 步的样子，分叉后的 agent 看到
-        的是**当前**的工作区。想做"回到第 3 步且文件也回到第 3 步"，需要的是
-        工作区快照，我们**没有**这个机制。所以 CLI 在分叉后会把这句打出来。
+        的是**当前**的工作区。想做"回到第 3 步且文件也回到第 3 步"，是用
+        `--fork --step K --rewind` 组合出来的（M9-8）：对话由 fork 回到第 K 步，
+        工作区由 rewind 回到第 K 步。**单独用 `--fork` 仍然只搬对话。**
 
-        搬什么（三样，都以 fork_step 为界）：
+        搬什么（四样，都以 fork_step 为界）：
         1. **检查点 `step-1..fork_step`** —— 于是新会话可以 `--resume --step K`
            回到其中任意一步，而不只是分叉点。
         2. **轨迹里 `step <= fork_step` 的行**。不能整份复制：轨迹是**追加**的，
            源会话在 fork_step 之后的 `security_finding` 也会被一起搬过去，
            分叉出来的会话于是"继承"了它根本没发生过的事件。
         3. **meta 里的 `forked_from`**（来源 + 步数），供 `--sessions` 显示血统。
+        4. **工作区快照清单 `step-1..fork_step`**（M9-8）。只搬清单、**不复制对象**
+           —— 对象库是项目级共享的，清单里的 sha 在原库仍然可读。不带这一步，
+           分叉会话的 `--rewind` 就是空的（有检查点、没有快照），而"回到分叉点"
+           恰恰是分叉最常见的后续动作。
         """
         source = cls(Path(workspace_root), session_id)
         payload = source._load_payload(step)
@@ -506,6 +563,7 @@ class Session:
             copied["session_id"] = sid
             fork._write_payload(n, copied)
 
+        fork._copy_snapshots(source, fork_step)
         fork._copy_trajectory(source, fork_step)
         update_meta(
             Path(workspace_root), sid,
@@ -515,6 +573,31 @@ class Session:
             forked_from={"session": session_id, "step": fork_step},
         )
         return fork, load_state(fork._load_payload(fork_step), sid)
+
+    def _copy_snapshots(self, source: "Session", fork_step: int) -> int:
+        """把源会话 `step <= fork_step` 的工作区快照清单搬过来，返回搬了几份。
+
+        **只搬清单，不复制对象** —— 对象库是项目级共享的（M9-8 决议 5），清单里的
+        sha 在原库里仍然可读。所以这一步的代价是几 KB 的 JSON，与被快照的文件
+        总大小无关。同理，"删掉源会话会不会弄坏分叉的快照"也不需要担心：
+        `drop_snapshots` 按**所有**清单现算活跃集，分叉的清单算在内。
+
+        源会话没有快照（M9-8 之前的会话、或已被 `--drop-snapshots`）→ 静默搬 0 份。
+        这不是错误：分叉一个旧会话是正常操作，而分叉出来的会话本来就没法 rewind
+        回到源会话的过去（它没有那些清单）。CLI 会在报错时如实说"没有工作区快照"。
+        """
+        copied = 0
+        for n in source.snapshots.steps():
+            if n > fork_step:
+                continue
+            payload = source.snapshots.read_manifest(n)
+            if payload is None:
+                # 坏清单**不搬**：搬过来就是搬了一份"读不了"的引用，而分叉会话
+                # 会因此在 `plan()` 时拒绝回滚（那是它该做的，但没必要继承这个病）。
+                continue
+            self.snapshots.import_manifest(n, payload)
+            copied += 1
+        return copied
 
     def _copy_trajectory(self, source: "Session", fork_step: int) -> int:
         """把源轨迹里 `step <= fork_step` 的行搬过来，返回搬了多少行。

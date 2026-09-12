@@ -142,6 +142,18 @@ class AgentState:
     # 入口复位（M9-5 修的正是这个），把跨回合的东西放进去等于重造那个 bug。
     goal: Optional["Goal"] = None
 
+    # M9-8 最近一次工作区回滚（`--rewind` / REPL `/rewind` 写进 meta，恢复时读回来）。
+    # 形状 `{"step": int, "files": int}` 或 None（从没回滚过）。
+    #
+    # 它和 `taint` 一样是**权威状态本身**、随检查点走 —— 但不落检查点 payload 的
+    # 顶层，而是走 meta：回滚是**人的动作**、发生在两个进程之间（`--rewind` 一个
+    # 进程、`--resume` 另一个），写进检查点会造出一个"回滚本身就是一次 agent 工作"
+    # 的假象。
+    #
+    # 为什么必须有这个字段：不告诉模型"盘面被抹回去过"，它就会照着历史里那些
+    # 已经不存在的改动往下推理（`_reinject_rewind` 是它在上下文里的出口）。
+    last_rewind: Optional[dict] = None
+
     # M3 上下文记账：最近一次 llm.chat 的 usage（provider 锚点）；compact 后置 stale
     last_usage: Optional[Usage] = None
     usage_stale_reason: Optional[str] = None                 # "tool_output_truncated" | "snip_compact" | "llm_compact"

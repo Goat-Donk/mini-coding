@@ -23,6 +23,7 @@ from agent.session import (
     validate_name,
 )
 from agent.tools.base import ToolRegistry
+from agent.workspace import FileChange
 
 
 def make_engine(tmp_path: Path, llm: MockLLM, *, session: Session | None = None) -> QueryEngine:
@@ -310,8 +311,15 @@ def test_checkpoint_round_trips_every_state_field(tmp_path):
         ),
     }
     all_fields = {f.name for f in dataclasses.fields(AgentState)}
-    assert set(values) | {"emitter"} == all_fields, (
-        f"AgentState 新增/删除了字段，本测试未覆盖：{all_fields ^ (set(values) | {'emitter'})}"
+    # 两个**刻意**不随检查点往返的字段：
+    # - `emitter`：运行时回调对象，落不了盘也不该落。
+    # - `last_rewind`（M9-8）：它的产地是 **meta**，不是检查点。回滚由 `--rewind`
+    #   在**另一个进程**里做，那个进程既不建会话也不落检查点 —— 事实只能写进
+    #   meta。再往检查点里存一份就是第二个真相源（"检查点说 5、meta 说 9，听谁的"），
+    #   而本项目对这类冗余一律不留。它靠 `from_checkpoint` 从 meta 读回来。
+    not_in_checkpoint = {"emitter", "last_rewind"}
+    assert set(values) | not_in_checkpoint == all_fields, (
+        f"AgentState 新增/删除了字段，本测试未覆盖：{all_fields ^ (set(values) | not_in_checkpoint)}"
     )
 
     state = AgentState(**values)
@@ -321,9 +329,12 @@ def test_checkpoint_round_trips_every_state_field(tmp_path):
     session.checkpoint(state)
     _, restored = Session.from_checkpoint(tmp_path, "s-round", step=7)
 
-    for name in all_fields - {"emitter"}:
+    for name in all_fields - not_in_checkpoint:
         assert getattr(restored, name) == values[name], name
     assert restored.emitter is None  # 回调不落盘（恢复后由入口重新接）
+    # `last_rewind` 从 **meta** 回来，不是从检查点 —— 这个会话没有 meta，所以是
+    # None。它自己的往返由 `test_rewind_notice_survives_a_resume` 那一组钉住。
+    assert restored.last_rewind is None
     assert isinstance(restored.usage, Usage)  # 类型也回来了，不只是 dict
     assert isinstance(restored.goal, Goal)  # 同上：漏解码器时这里是个 dict
 
@@ -777,4 +788,221 @@ def test_validate_name_rejects_an_id_shape_that_exists(tmp_path):
     seed_steps(tmp_path, "s20260911-000000", 1)
     with pytest.raises(ValueError):
         validate_name(tmp_path, "s20260911-000000")
+
+
+# ---------- M9-8：工作区快照的接线 ----------
+#
+# 这一组测的**不是**快照模块自己（那 48 条在 `tests/test_workspace.py`），而是
+# 「它真的被用上了」。本项目头号缺陷类是「机制在、单测绿、没有任何东西路由到它」
+# —— hooks 曾整体漏接 CLI、permissions 曾漏接 CLI、`tool_result_store` 三个入口
+# 全都没传。快照自己的单测**结构上**抓不到这一类，只有下面这几条能。
+
+def write_round(path: str, content: str):
+    return MockLLM.tool("write", {"path": path, "content": content}).responses[0]
+
+
+def test_engine_write_lands_in_a_snapshot(tmp_path):
+    """★ 端到端接线：工具报告改动 → loop 登记 → 检查点落盘时写成清单。"""
+    (tmp_path / "a.txt").write_text("v0", encoding="utf-8")
+    session = Session(tmp_path, "snap1", checkpoint_every=1)
+    engine = make_engine(
+        tmp_path,
+        MockLLM.script(write_round("a.txt", "v1"), MockLLM.text("完成").responses[0]),
+        session=session,
+    )
+    engine.run("改文件")
+
+    steps = session.snapshots.steps()
+    assert steps, "引擎跑过一次成功的 write，却一个工作区快照都没落（接线断了）"
+    # 撤销到"我们碰它之前"能拿回原文 —— 这是整条链路的最终证据
+    report = session.snapshots.restore(session.snapshots.plan(0))
+    assert report.failures == ()
+    assert (tmp_path / "a.txt").read_text(encoding="utf-8") == "v0"
+
+
+def test_untouched_session_writes_no_snapshots(tmp_path):
+    """★ 反面：没改过文件的会话，`ws/` 目录**压根不该存在**。
+
+    漏了这一条，一个"总是建目录/总写空清单"的实现也能让上面那条通过 ——
+    而每个纯聊天会话都在无谓地付这个机制的代价。
+    """
+    session = Session(tmp_path, "snap2", checkpoint_every=1)
+    engine = make_engine(
+        tmp_path,
+        MockLLM.script(*tool_rounds(2), MockLLM.text("完成").responses[0]),
+        session=session,
+    )
+    engine.run("只是看看")
+
+    assert session.list_checkpoints()          # 检查点照落
+    assert session.snapshots.steps() == []
+    assert not session.snapshots.manifest_dir.exists()
+
+
+def test_manifest_is_written_before_the_checkpoint(tmp_path, monkeypatch):
+    """★ 写盘顺序不变式：**对象 → 清单 → 检查点**。
+
+    反过来的话，一次断电就能造出"检查点说有快照、快照却不存在"——一份**说谎的
+    引用**。这条测试直接钉住顺序：在写 `step-N.json` 的那一刻，`ws/step-N.json`
+    必须**已经**在盘上了。
+    """
+    (tmp_path / "a.txt").write_text("v0", encoding="utf-8")
+    session = Session(tmp_path, "ord1", checkpoint_every=1)
+    seen: list[tuple[int, bool]] = []
+    original = session._write_payload
+
+    def spy(step: int, payload: dict):
+        seen.append((step, session.snapshots.manifest_path(step).exists()))
+        return original(step, payload)
+
+    monkeypatch.setattr(session, "_write_payload", spy)
+    engine = make_engine(
+        tmp_path,
+        MockLLM.script(write_round("a.txt", "v1"), MockLLM.text("完成").responses[0]),
+        session=session,
+    )
+    engine.run("改文件")
+
+    assert seen, "引擎一步都没落检查点，这条测试没测到东西"
+    # 判据写成"**这一步有清单 → 写检查点的那一刻它必须已经在盘上**"，而不是
+    # "从第一次出现清单起都为真"：后者在"顺序反了、且只有一个检查点"时会退化成
+    # 一个找不到 True 的空断言（`next()` 抛 StopIteration），失败得含糊。
+    with_manifest = set(session.snapshots.steps())
+    assert with_manifest, "引擎写过文件却一个快照都没落，上面那条测的不是顺序"
+    for step, existed in seen:
+        if step in with_manifest:
+            assert existed, f"第 {step} 步的检查点写在它的清单**之前**（说谎的引用）"
+
+
+def test_forced_checkpoint_also_snapshots(tmp_path):
+    """`force=True`（`ask_user` 那条路）绕过节流，但**不能**绕过快照。
+
+    快照挂在 `_write` 里而不是 `checkpoint` 的节流判断里，正是为了这一条 ——
+    挂在节流里面的话，"强制检查点"这条路径就会漏掉快照，而那正好是
+    「机制在、测试绿、真跑发现没生效」的老形状。
+    """
+    (tmp_path / "a.txt").write_text("v0", encoding="utf-8")
+    session = Session(tmp_path, "force1", checkpoint_every=999)   # 节流大到永不触发
+    session.snapshots.note_write(
+        FileChange(path=tmp_path / "a.txt", before=b"v0")
+    )
+    (tmp_path / "a.txt").write_text("v1", encoding="utf-8")
+
+    state = AgentState(session_id="force1", task="任务", system_prompt="sys")
+    state.step = 1
+    session.checkpoint(state, force=True)
+
+    assert session.snapshots.steps() == [1]
+
+
+def test_fork_copies_the_snapshot_manifests(tmp_path):
+    """fork 的契约从"三样"变"四样"：检查点、轨迹、meta、**以及快照清单**。
+
+    不带第四样，分叉会话的 `--rewind` 就是空的（有检查点、没有快照），而
+    "回到分叉点"恰恰是分叉之后最常见的动作。
+    """
+    (tmp_path / "a.txt").write_text("v0", encoding="utf-8")
+    source = Session(tmp_path, "src", checkpoint_every=1)
+    engine = make_engine(
+        tmp_path,
+        MockLLM.script(write_round("a.txt", "v1"), MockLLM.text("完成").responses[0]),
+        session=source,
+    )
+    engine.run("改文件")
+    assert source.snapshots.steps()
+
+    fork, _ = Session.fork(tmp_path, "src", step=max(source.snapshots.steps()))
+
+    assert fork.snapshots.steps() == source.snapshots.steps()
+    # 只搬清单、不复制对象：分叉的清单指向的是同一个共享对象库
+    report = fork.snapshots.restore(fork.snapshots.plan(0))
+    assert report.failures == ()
+    assert (tmp_path / "a.txt").read_text(encoding="utf-8") == "v0"
+    # 而且搬过来的清单认自己的会话名，不照抄源会话（那是说谎的记录）
+    n = fork.snapshots.steps()[0]
+    assert fork.snapshots.read_manifest(n)["session_id"] == fork.session_id
+
+
+def test_fork_only_copies_manifests_up_to_the_fork_point(tmp_path):
+    """分叉点**之后**的清单不搬：那是源会话的"未来"，不是分叉会话的经历。
+
+    搬过来会造出一个自相矛盾的会话 —— 检查点、轨迹都停在 K，`--rewind` 却能
+    把它带回 K 之后某一个盘面。`plan(K)` 与"我经历过什么"必须指的是同一件事。
+    """
+    (tmp_path / "a.txt").write_text("v0", encoding="utf-8")
+    seed_steps(tmp_path, "src", 2)
+    source = Session(tmp_path, "src", checkpoint_every=1)
+    for step, text in ((1, "v1"), (2, "v2")):
+        before = (tmp_path / "a.txt").read_bytes()
+        (tmp_path / "a.txt").write_text(text, encoding="utf-8")
+        source.snapshots.note_write(FileChange(path=tmp_path / "a.txt", before=before))
+        source.snapshots.capture(step)
+    assert source.snapshots.steps() == [1, 2]
+
+    fork, _ = Session.fork(tmp_path, "src", step=1)
+
+    assert fork.snapshots.steps() == [1]
+    # 而且第 1 步那份清单仍然可用（对象库共享，没跟着被截断）
+    report = fork.snapshots.restore(fork.snapshots.plan(0))
+    assert report.failures == ()
+    assert (tmp_path / "a.txt").read_text(encoding="utf-8") == "v0"
+
+
+def test_fork_of_a_session_without_snapshots_still_works(tmp_path):
+    """分叉一个 M9-8 之前的会话（有检查点、没快照）是正常操作，不是错误。"""
+    seed_steps(tmp_path, "old", 2)
+    fork, _ = Session.fork(tmp_path, "old", step=2)
+    assert fork.snapshots.steps() == []
+    assert fork.list_checkpoints() == [1, 2]
+
+
+# ---------- M9-8：回滚事实经 meta 往返 ----------
+
+def test_last_rewind_survives_a_resume(tmp_path):
+    """`--rewind` 写进 meta 的"我回滚过"，`--resume` 必须读得回来。
+
+    这一条是 `_reinject_rewind` 的前置：读不回来的话，模型历史里写着"我改了
+    a.txt"、盘上那个改动却已经没了，它会照着一份**明确错误**的现状推理，
+    而且不会有任何报错。
+    """
+    from agent.session import last_rewind, update_meta
+
+    seed_steps(tmp_path, "rw", 5)
+    assert last_rewind(tmp_path, "rw") is None      # 从没回滚过
+    update_meta(tmp_path, "rw", last_rewind={"step": 2, "files": 3})
+
+    assert last_rewind(tmp_path, "rw") == {"step": 2, "files": 3}
+    _, state = Session.from_checkpoint(tmp_path, "rw", step=5)
+    assert state.last_rewind == {"step": 2, "files": 3}
+
+
+def test_garbage_last_rewind_reads_as_none(tmp_path):
+    """meta 里那个字段形状不对（手改坏了 / 老版本写的）→ 当没有，不炸。
+
+    与 `session_name` 同一条纪律：恢复一个 meta 有毛病的会话仍然应该能跑起来，
+    这里读不到只是少一条通知。
+    """
+    from agent.session import last_rewind, update_meta
+
+    seed_steps(tmp_path, "rw2", 3)
+    for bad in ({"files": 3}, {"step": "五"}, {"step": True}, ["step", 3], "第 2 步"):
+        update_meta(tmp_path, "rw2", last_rewind=bad)
+        assert last_rewind(tmp_path, "rw2") is None, bad
+    _, state = Session.from_checkpoint(tmp_path, "rw2", step=3)
+    assert state.last_rewind is None
+
+
+def test_rename_does_not_wipe_last_rewind(tmp_path):
+    """`--rename` 是**合并**式更新 —— 起个名字不该把回滚记录抹掉。
+
+    （`update_meta` 的合并语义早有测试，但那条测的是 `forked_from`。多一个字段
+    就多一次被覆盖式写抹掉的机会，而"名字起完，回滚记录就没了"是纯静默的。）
+    """
+    from agent.session import last_rewind, set_session_name, update_meta
+
+    seed_steps(tmp_path, "rw3", 2)
+    update_meta(tmp_path, "rw3", last_rewind={"step": 1, "files": 1})
+    set_session_name(tmp_path, "rw3", "回滚过的会话")
+
+    assert last_rewind(tmp_path, "rw3") == {"step": 1, "files": 1}
 

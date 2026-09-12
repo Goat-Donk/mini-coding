@@ -287,7 +287,8 @@ step 5  完成
 
   **✅ 2026-09-11 完成。实现**：`agent/session.py` 的元数据层（`meta_path` / `read_meta` / `update_meta` / `validate_name` / `set_session_name` / `session_name` / `SessionInfo` / `SessionNotFound` / `list_sessions` / `resolve_session` / `unique_session_id` / `default_fork_name`）+ `Session.fork` / `_copy_trajectory` / `_write_payload` → `app/cli.py` 的 `--sessions` / `--rename` / `--fork`，以及把"取会话 id"收成一处的 `_resolve_sid`。
   - **比 TS 版细一档**：TS 的 `/fork` 是**会话级**的（整段复制、从"现在"接着走），我们挂在 step 级检查点上，`--fork --step K` 能回到**任意一步**再开一条路。这不是多写出来的代码，是**检查点粒度的直接推论** —— 讲这一条比讲实现本身更有说服力。
-  - **它是对话分叉，不是工作区分叉**（必须主动说）：文件**不会**回滚到第 K 步的样子，分叉后的 agent 看到的是**当前**工作区。我们**没有**工作区快照机制（`grep rewind|snapshot` 在 `agent/ app/` 下零命中，2026-09-11 核实）。CLI 分叉后**把这句打印出来** —— 一句会让人误判成"文件也回去了"的提示，比没有提示更糟。
+  - **单独用它时，它是对话分叉，不是工作区分叉**（必须主动说）：文件**不会**回滚到第 K 步的样子，分叉后的 agent 看到的是**当前**工作区。CLI 分叉后**把这句打印出来** —— 一句会让人误判成"文件也回去了"的提示，比没有提示更糟。
+    - **M9-8 之后这句只在「不带 `--rewind`」时成立**（2026-09-12 补）：当时这条写的是「我们**没有**工作区快照机制（`grep rewind|snapshot` 在 `agent/ app/` 下零命中，2026-09-11 核实）」—— 那句在写下的当天是真的，M9-8 之后就成了假话。现在 `--fork --step K --rewind` 让文件**也**回到第 K 步，所以 CLI 的提示**按有没有 `--rewind` 分叉成两句**。**留这段不是考古**：一句无条件写死的提示，加了新出口之后它自己会开始骗人，这正是本项目记录在案的头号缺陷类（接线漂移）。
   - **fork 搬三样，都以 fork 点为界**：① 检查点 `step-1..K`（于是新会话还能 `--resume --step` 回到其中任意一步）；② 轨迹里 `step <= K` 的行 —— **不能整份复制**，轨迹是追加的，源会话在 K 之后才发生的 `security_finding` 会被一起搬过去，分叉会话于是"继承"了它根本没经历过的事；③ meta 里的 `forked_from`（`--sessions` 用它显示血统）。**解析不了的轨迹行原样保留**：那是 kill 在写一半时唯一留下的现场。
   - **副本里唯一按新会话重写的是 `session_id`**。`load_state` 会 pop 掉它所以今天无害，但谁哪天直接读 `payload["session_id"]` 就会拿到源会话 —— 属"当前无人读、将来必有人读"的错值，在写入时修掉比留着便宜。
   - **`_write_payload(step, payload)` 把"怎么落盘"抽出来给 `_write` 与 `fork` 共用**：分叉写的是从别处读来的 payload，内容不由本会话的 state 决定，但原子写/缩进/编码必须是同一份知识 —— 各写一遍的失败方式是静的。
@@ -345,7 +346,7 @@ step 5  完成
   - **符号命令表 `_COMMANDS` 是 `/help` 正文的唯一来源**：命令与帮助写在两个地方，迟早出现"帮助里有、实际没有"（或者反过来）。有一条测试断言 `/help` 列出的名字**恰好等于** `_COMMANDS` 的键集合。
   - **退出语必须给出可执行的续跑命令**（M7 教训：一条走不通的指引比没有更糟）。这条让 `_wrap_up` 多做一件事：退出时**无论走了几步都强制落一次检查点** —— 检查点是**按节拍**写的（默认 5 步）且**只在有工具调用的步上 tick**，所以纯聊天、或者只走两三步工具就退出，都写不出检查点，而那行承诺的命令跑起来会直接报"读不到检查点"。**这条是单测与真跑一起挖出来的**（见下）。
   - **每回合报的是增量，不是会话累计**：`RunResult.steps` / `usage` 五个返回点给的都是 `state.step` / `state.usage`。REPL 用回合前后的快照相减 —— 而不是让 loop 再维护第二套"本回合用量"的记账，那就是「两处各写一遍 → 漂移」。**`Usage` 是可变 dataclass，`state.usage += ...` 是原地累加**，所以快照必须 `dataclasses.replace()` 复制；不复制的话相减恒为 0 **且不报错**，只是"每次都说这回合没花钱"。
-  - **测试**：`tests/test_repl.py` **34 例**（本仓第一条 `CliRunner(input=...)` stdin 端到端也在这里，7 例）+ `tests/test_loop.py` 8 例（多回合契约 + `ensure_tool_pairing` 纯函数）+ `tests/test_permissions.py` 2 例。全量 **559 全绿**（原 515）。
+  - **测试**：`tests/test_repl.py` **34 例**（本仓第一条 `CliRunner(input=...)` stdin 端到端也在这里，7 例）+ `tests/test_loop.py` 8 例（多回合契约 + `ensure_tool_pairing` 纯函数）+ `tests/test_permissions.py` 2 例。全量 **559 全绿**（原 515；**这是 M9-5 当时的数字**，M9-8 之后为 707）。
   - **变异测试 19/19 被抓住**（`m9verify/mutate_m9_5.py`）。八类失效模式各覆盖：每轮预算的起点、回合边界上的复位（`terminated_reason` / `new_turn` 的调用点 / `new_turn` 是否真清 `_turn` / 是否误清 `_always`）、入口重放的去重守卫、中断残局（不补配对 / 补了不记事件）、两条硬不变量（未知命令当任务发 / 半切换）、命令解析（大小写 / `raw` vs `strip` 后的行 / 空行）、增量记账（快照不复制 / `Usage.__sub__` 字段写错）、退出承诺（不强制落检查点 / `/new` 用秒级 id）。**三类需要说明**：
     - **一个证明过的等价变异体**（未设，不留在列表里骗计数）：`loop.py:214` 的 `_run_loop(..., budget_start=state.step)`。改成省略该实参**在任何输入下都不可观测** —— `_run_loop` 的兜底正是 `if budget_start is None: budget_start = state.step`，而两次读 `state.step` 之间没有任何东西改它（`ensure_tool_pairing` 只可能追加 tool 结果消息，`state.task = text` 与 `messages.append` 都不碰 step）。两处是**恒等**的，不是"碰巧一样"。保留显式传参是因为它把"本轮预算从这一步起"写在调用点上（`run_from` 那条路靠兜底，语义不同），不是为了测出什么。
     - **一个依赖时序、如实标注的**：`/new` 用 `unique_session_id` 而不是 `new_session_id`（后者粒度是**秒**）。变异回去之后，`/new` 与起始会话撞 id 需要**两次调用落在同一秒内**才算命中 —— 测试里是几毫秒的事，理论上跨秒就会 MISS。这条防的是**真实缺陷**（两个"不同"的会话静默共用同一个检查点目录，后者覆盖前者、全程不报错），它值得留着，只是不假装它是确定性的。
@@ -377,7 +378,7 @@ step 5  完成
   - **`_FIELD_DECODERS` 那一行是载荷性细节**：`load_state` 走 `AgentState(**raw)`，而 dataclass **不做类型检查** —— 漏了 `"goal"` 这一行，`state.goal` 会是个 `dict`，直到有人读 `.status` 才抛错，而那个炸点被 `_run_loop` 的 `except Exception` 吞成 `terminated_reason="error"`，**看起来像引擎出错**。一条测试 + 一条变异体专门钉它，并把这条纪律写进 `session.py` 的注释。
   - **`/goal` 的解析规则只有两条且必须确定**：带 `--check` 一定是设定；不带 `--check` 且首词是已知子命令（`status`/`pause`/`resume`/`clear`）→ 子命令；两者都不是 → 用法错（**只在命令内失败，不带走 REPL**，有测试钉着）。**已知边界如实记**：目标文本里出现字面 ` --check ` 会被切开 —— **不做引号解析**，加一层"半个 shell"只会造出第二个有歧义的解析器。`/goal X` 在已有未结束目标时**拒绝**（防旧目标的检查命令无声消失，而它是"完成与否"的唯一判据）；`/goal clear` 置 `None` 而**不是**置 `done`（后者会在轨迹里留下一句没发生过的成功）；`/goal resume` 在 `done` 时**拒绝**（完成是终态，能反复"完成"一次的目标等于没有检查）。
   - **`_STOP_REASONS` 每个原因都要有话说**：暂停是自动推进的唯一出口，理由说不清的话人只会看到「它自己停了」。而 `BURST_STOP_REASONS` 里 **`"completed"` 刻意不在**：一个回合"正常跑完"（模型给了文字、不再调工具）恰恰是自动推进要继续的情形 —— 目标的完成与否由人给的检查命令说了算，不由模型停不停下来说了算。
-  - **测试**：`tests/test_goal.py` **38 例**（创建/暂停恢复/清除、三态判定、门禁拦下→invalid、批前复位、截断 40 行、schema 扁平无 `$defs`、REPL 一拍多回合与人工暂停、`dump_state`→`load_state` 回来是 `Goal` 实例、暂停跨进程往返仍门住一拍、`--goal` 不碰 LLM、`/help` 键集合等于 `_COMMANDS`）+ `tests/test_repl.py` / `tests/test_session.py` 补契约。全量 **597 全绿**（原 559；**这是 M9-6 当时的数字**，M9-7 之后为 623）。
+  - **测试**：`tests/test_goal.py` **38 例**（创建/暂停恢复/清除、三态判定、门禁拦下→invalid、批前复位、截断 40 行、schema 扁平无 `$defs`、REPL 一拍多回合与人工暂停、`dump_state`→`load_state` 回来是 `Goal` 实例、暂停跨进程往返仍门住一拍、`--goal` 不碰 LLM、`/help` 键集合等于 `_COMMANDS`）+ `tests/test_repl.py` / `tests/test_session.py` 补契约。全量 **597 全绿**（原 559；**这是 M9-6 当时的数字**，M9-7 之后为 623、M9-8 之后为 **707**）。
   - **变异测试 20/20 被抓住**（`m9verify/mutate_m9_6.py`）：声明直接当完成 / 检查不走门禁链 / 无效→失败 / 无效→通过 / 失败也结束回合 / 通过不结束回合 / 判定不回喂 / 批前不复位 / 跑目标文本而非命令 / 无超时上限 / 漏解码器 / 输出不截断 / 暂停照样推进 / `clear` 实现成 done / 声明能自造目标 / 人工回合不暂停 / 到期不停止 / 恢复时每回合重投。
     - **一个如实标注的 MISS（不是缺陷，是不变式的推论）**：「人工回合不暂停」这个变异体实证 **MISS**，而原因是**结构性的** —— `loop()` 在进提示符前一定先跑一拍，而 `_run_goal_burst` 结尾一定 `_pause_goal(stop)`，所以**人拿到提示符时目标绝不可能是 active**，那句 `_pause_goal` 命中的永远是"已经暂停/已完成"的拒绝分支。这是「一拍 = 一次授权」不变式的直接推论，与动线 ④ 在纯 stdin 流程里不可观测**同源**（见下）。
   - **真实 LLM 端到端五条动线全跑**（DeepSeek 官方通路，真工作区 `m9verify/ws_m96_a|b|c|d|e/`，真 pytest 真跑；日志 `goal_a|b|b2|c|d|e.log` + 驱动脚本 `drive_m9_6.py` 的三个 case）：
@@ -434,10 +435,28 @@ step 5  完成
   - **如实标注（README S21–S26 已写）**：**worker 只活一个回合**；`close_agent` 最坏卡 ~120s；`settle()` 的 join **有界 1.5s**（超时未停的如实报"跑到一半被杀"，`abandon` 动线看到的就是这一支）；父→子**没有独立级联 abort 通路**（对 TS 契约的偏离，靠 `settle()` 在回合边界实现）；worker 完整轨迹**不进**父会话 JSONL，只留一条摘要事件；**用量计入父会话 → 缓存命中率被稀释**（并发 44% vs 串行 64% 是同向的现象，但**两条动线是不同会话，不能当受控对照读**）。
   - **一处如实记的计划偏离**：**`/agents` 斜杠命令与 `_prompt` 的 `agents:N` 状态位没有做**，理由是**结构性的**、已在代码里核实：`workers = AgentWorkers(...)` 在 `loop.py:357`（`_run_loop` 内，每回合新建），`self._settle_workers(workers, state)` 在 `loop.py:486` 的无条件 `finally` 里（覆盖 6 个返回点 + `KeyboardInterrupt`）→ **回合之间活跃 worker 恒为 0**。于是 `/agents` 永远打印"（没有子代理）"、`agents:N` 永远是 `agents:0` —— 两个都是本项目头号缺陷类的形状（机制在、没人 routing），而恒显一个值的状态位会让人不再看它。可见性改由 `subagent_settled` → `EventPrinter`（`app/cli.py:82-86`）承担，**这一条已由 `abandon` 动线真跑验收**。对照值得讲：`--plan`/`--goal` 能落盘导出是因为它们**跨回合存活**，worker 是进程内瞬时的、盘上什么都没有。
 
-- [ ] **M9-8 工作区 rewind 快照**（新增，2026-09-11 立条目，尚未开工）
-  - **它把一条已写进五处文档的"如实标注"变成"已修"**：`TASKS.md:290`、`docs/architecture.md:286`、`docs/interview_guide.md:134`、`docs/TECH_SPEC.md:1656`、`CLAUDE.md:33` 都写着**「`/fork` 只分叉对话，工作区文件不回滚」**。M9-5 的 B 动线真跑**直接看到了后果**（`TASKS.md:360` 原话）：分叉点是 step 2（修 bug 之前），但盘上文件已经是修好的 —— 于是新分支的模型 `read` 到的是"已经修好"的文件、**却又在结论里说了一遍"修好了失败的测试"**。这不是"缺个功能"，是**一个已知会咬人的边界一直挂在文档里**，而且它咬的方式是让模型说出一句它没有做过的事。
+- [x] **M9-8 工作区 rewind 快照**（2026-09-11 立条目，**2026-09-12 完成并真跑验证**）
+  - **它把一条已写进五处文档的"如实标注"变成"已修"**：本文件的 M9-3 条目、`docs/architecture.md` §3.6「分叉与命名」、`docs/interview_guide.md` §4 与 §12 的 4f 条、`docs/TECH_SPEC.md` §9.3b、`CLAUDE.md` 的 M9-3 段 都写着**「`/fork` 只分叉对话，工作区文件不回滚」**（原稿引的是行号，但行号会随编辑漂移 —— 起草后一天内就有两处失效，所以改成按章节定位）。M9-5 的 B 动线真跑**直接看到了后果**（本文件 M9-5 条目「如实说明未做」第 ② 点原话）：分叉点是 step 2（修 bug 之前），但盘上文件已经是修好的 —— 于是新分支的模型 `read` 到的是"已经修好"的文件、**却又在结论里说了一遍"修好了失败的测试"**。这不是"缺个功能"，是**一个已知会咬人的边界一直挂在文档里**，而且它咬的方式是让模型说出一句它没有做过的事。
   - **挂在我们已有的 step 级检查点上**（`--rewind --step K`），**不是**"回退最近 N 次编辑"：Python 移植版是后者，我们是前者 —— step 与检查点、`/fork --step K` 共用**同一个坐标系**，而"最近 N 次编辑"要另立一套账（还得处理"一次编辑被后续编辑部分覆盖"）。
   - **要老实回答的难点（开工前必须先想清楚，不然会做成一个假的 rewind）**：① 只读工具与 `bash` 的副作用**不可回滚**（`pytest` 写的 `.pyc`、`git` 改的状态、任意命令的任意后果）—— 快照只能覆盖**我们自己经 `write`/`edit` 写的文件**，这一点必须写在命令输出里，不能让人以为"回滚了 = 什么都没发生"；② 快照存哪（`Session` 目录旁边 vs 工作区内的 `.codeagent/`）—— 存工作区内会被自己快照进自己；③ 与 `subagent` 的关系：**worker 的写操作在 M9-7 之后不存在**（只读白名单），所以快照不必跨线程，但**要有一条断言钉住这个前提**（否则哪天白名单松了，rewind 会静默漏掉 worker 写过的文件）。
+
+  **实现证据（每一项都可复现）**
+  - **新叶子模块 `agent/workspace.py`（814 行，纯标准库）**：`WorkspaceSnapshots`（`note_write` / `capture` / `plan` / `restore` / `steps` / `usage` / `import_manifest`）、`FileChange`、`RestoreAction/Plan/Report`、`SnapshotUsage` / `ObjectStoreStats` / `DropResult`、模块级 `_put_object` / `_get_object` / `_live_shas` / `object_store_stats` / `list_snapshot_sessions` / `drop_snapshots`。**不认识 `QueryEngine`/`AgentState`**（同 `agent/subagents.py` 的叶子约定）。
+  - **写盘顺序不变式：对象 → 清单 → 检查点**。任何一步被杀留下的只能是**孤儿对象**（不可达的字节），不能是**说谎的引用**。清单用**临时文件 + 原子替换**写。三个方向的边界测试逐条点名：`test_capture_writes_objects_before_manifest`（顺序）、`test_manifest_write_never_leaves_a_partial_target`（写一半被杀，目标名一次都不出现）、`test_torn_manifest_tmp_is_invisible`、`test_capture_survives_a_crash_between_manifest_and_checkpoint`、`test_half_written_object_is_not_counted_and_reads_as_missing`、`test_corrupted_object_is_detected_by_hash`、`test_corrupt_manifest_does_not_half_apply`。
+  - **`--rewind` 默认预览 + 二次确认**（`--force` 跳过）。预览是纯读的：B 动线对**两个目标**（命中快照的第 5 步、走 `base` 分支的第 1 步）各拒绝两次（答 `n` 与答**空**），盘面**逐字节未变**；确认框每次都真的问了。
+  - **全局共享对象库 + 跨会话回收**（用户拍板）。`data/snapshots/objects/{sha[:2]}/{sha}.bin`，`fork` **只复制清单、一个对象都不复制**；回收靠**从所有剩余清单现算** live set（`_live_shas`），**不存引用计数**。跨会话边界测试 6 条：`test_objects_are_shared_across_sessions`、`test_two_sessions_really_share_the_base_object`、`test_drop_keeps_objects_another_session_still_references`、`test_drop_reclaims_objects_nobody_references`、`test_corrupted_object_affects_both_sessions_the_same_way`、`test_concurrent_put_object_keeps_one_intact_copy`。
+  - **`--fork --step K --rewind`**（用户拍板 P1）：回滚落在"只分叉不续跑"那个 `Exit` **之前**，两件事一起做。真 CLI 子进程验证：退出码 0、分叉警告跟着 `--rewind` 改了口径、文件真的回到第 5 步、收尾给出 `--resume --step 5` 的出口。
+  - **测试**：`tests/test_workspace.py` **785 行 / 49 例**（新建；数字按 `pytest --collect-only` 数），加 `test_cli.py` / `test_repl.py` / `test_session.py` 的接线契约 22 例，全量 **707 passed in 81.36s**。
+  - **变异测试**：`m9verify/mutate_m9_8.py`（506 行）**35 条，35/35 全被抓、零 SKIP、零 MISS**（`m9verify/mutate_m9_8.log`）。四个 MISS 全部修掉，其中**三个是测试本身没牙齿**（断言分辨不出差别 / 边界数据缺失 / 用户参数掩盖了被测行为），一个是**脚本自身的锚点缺陷**（`str.replace(..., 1)` 换到了逐字相同的另一个函数上，症状与"MISS"完全同形）。
+  - **真实 LLM 动线 A~F**（`m9verify/drive_m9_8.py`，639 行，六份日志）：A 真改动 → 真快照（8 步 / 53676 token / 缓存命中 96% / 11.4s）；B 预览纯读；C 真回滚两条分支（走清单的第 5 步 + 走 `base` 的第 1 步）；D `--fork --step 5 --rewind` 走真 CLI；E 磁盘口径 + 并发探针；F `--snapshots` / `--drop-snapshots`。
+  - **实测数字（E 动线，本机 Windows 10 + NTFS，**不许与 README 的 token 数字混着比**）**：
+    - **基座成本 = 被 `write`/`edit` 碰过的文件的原始字节之和，不是整个工作区** —— 工作区 5 个文件 / 8892 B，进清单的只有 2 个，基座 **1949 B**（21.9%），且那个百分比只取决于"改了几个文件"。→ 用户裁定"直接存完整基座、不加开关"的依据。
+    - 清单 599 B vs 对象 4339 B ≈ **13.8%**（每步全量清单的代价）；孤儿对象 **0 个**。
+    - **`fork` 的磁盘增量：0 个对象 / 0 字节**，清单 +599 B。→ 全局共享对象库的依据（per-session 会让每次倒带重试都复制一遍当时的工作区）。
+    - **回收**：删源会话的 2 份清单 → 回收 1 个对象 / 746 B，3 个因别的会话还在引用而保留。
+    - **并发写同一对象（8 线程 × 5 轮 = 40 次，抢同一个目标名）**：裸替换冲突 **24~30 次**（`PermissionError`，6 次独立重跑：30/25/27/24/28/26），经 `_put_object` **未捕获异常 0 次**。→ **不加锁**（用户裁定 7：不要凭空增加锁的复杂度）。如实标注：Linux 上 `rename(2)` 通常不抛 `EACCES`，那条容错分支在别的平台上可能是死代码；两个平台都不需要锁。
+  - **`plan()` 的新语义（初稿算法里没有的一支）**：`K` **低于所有快照**不是错误 —— `min(manifests)` 就是"第一个有受管文件的步"，比它还早的步"那时什么都没受管"是**事实**，于是所有路径回到各自的 `base`。**没有这一支，`base` 是结构上不可达的**。与它成对的是：夹在两快照中间的步（如 5 与 10 之间的 7）**仍然报错** —— 那是"不知道"，不是"没有"。
+  - **六条开放问题的决议**全部写进 `docs/design/m9-8_rewind.md` §10（含初稿提问原文与结论的逐条对照）。
 
 ### 明确不做（理由留痕）
 
@@ -461,12 +480,13 @@ step 5  完成
 
 ## 进度快照
 
-- 当前里程碑：**M9 完成**（第一批 M9-1、M9-2；第二批 M9-3 fork + rename、M9-4 MCP 远程 HTTP + resources/prompts；第三批 M9-5 常驻交互模式 REPL、M9-6 ④ Goal；**压轴 M9-7 ② sub-agent 并发 —— 2026-09-11 完成，变异 29/29、四条动线真跑、623 测试全绿**）。**12 项核心能力清单全部落地。** 只剩 **M9-8 工作区 rewind 快照**（2026-09-11 立条目，尚未开工）
+- 当前里程碑：**M9 全部完成 —— 12 项核心能力清单落地 + M9-8 工作区 rewind 快照（2026-09-12 完成）**。第三批 M9-5 常驻交互模式 REPL、M9-6 ④ Goal；压轴 M9-7 ② sub-agent 并发（2026-09-11，变异 29/29、四条动线真跑）；**M9-8 工作区 rewind 快照 —— 2026-09-12 完成，变异 35/35、六条动线 A~F 真跑、707 测试全绿**。**里程碑清单已清空，无未开工项。**
 - 上一里程碑：**M8 完成**（P1–P7 全部完成；四项真实验证已跑，见上节）
 - 上一里程碑：**M7 完成**（M7-1~M7-6 + Part C 全部完成；四条真实 LLM 端到端验证 V1–V4 已全跑，工作区 `m7verify/`、`m7verify-nolock/` 已 gitignore）
-- 代码状态：**11,207 行源码 / 29 模块 / 623 测试全绿**（`python -m pytest tests/ -o addopts="" -q` → `623 passed in 90.86s`，无 skip）
-  - 口径：源码 = `agent/` + `app/` + `eval/` 下的非空 `.py`（不含 `eval/repos/` 克隆仓），模块数 = 其中非空的 `.py` 文件数。**按文件系统数，不按 git 跟踪数** —— 新文件在提交前也该算进去（M9-5 时 `app/repl.py`(503) 与 `tests/test_repl.py`(785) 尚未提交，按 git 数会各少一份，这正是上一条从 8,310 跳到 9,139 里的一部分；M9-6 的 `agent/goal.py`(232) / `agent/tools/goal.py`(118) / `tests/test_goal.py`(927)、M9-7 的 `agent/subagents.py`(540) / `tests/fake_llm.py` 同理，目前也尚未提交）。
-  - `tests/` 合计 **11,809 行**（上一版 11,760；M9-7 的 `test_subagent.py` 6 例 → 32 例）。
+- 代码状态：**12,568 行源码 / 30 模块 / 707 测试全绿**（`python -m pytest tests/ -o addopts="" -q` → `707 passed`，无 skip；M9-8 完成时那一次 **81.36s**、2026-09-12 文档同步后又跑一次 **88.47s** —— **用例数稳定，墙钟随机器负载浮动**）
+  - 口径：源码 = `agent/` + `app/` + `eval/` 下的非空 `.py`（不含 `eval/repos/` 克隆仓），模块数 = 其中非空的 `.py` 文件数。**按文件系统数，不按 git 跟踪数** —— 新文件在提交前也该算进去（M9-5 时 `app/repl.py`(503) 与 `tests/test_repl.py`(785) 尚未提交，按 git 数会各少一份，这正是上一条从 8,310 跳到 9,139 里的一部分；M9-6 的 `agent/goal.py`(232) / `agent/tools/goal.py`(118) / `tests/test_goal.py`(927)、M9-7 的 `agent/subagents.py`(540) / `tests/fake_llm.py`、M9-8 的 `agent/workspace.py`(814) / `tests/test_workspace.py`(785) 同理，目前也尚未提交）。
+  - `tests/` 合计 **13,385 行 / 27 个非空 `.py`**（28 个文件，含一个空的 `__init__.py`；上一版 11,809 行；M9-8 的 `tests/test_workspace.py` 785 行 / 49 例是新增的）。
+  - 验证脚本：`m9verify/mutate_m9_8.py`(506 行) / `m9verify/drive_m9_8.py`(639 行) + 六份动线日志。
 - **M8 期间发现并修复的真 bug（真跑挖出来的，不是单测挖的）**：
   1. **`update_plan` 的引导缺失（elicitation gap）**：工具实现了、测试全绿、计划也能落盘 —— 但 system prompt 里**一个字都没提它**，模型 6 步跑完一次都没调。修法：prompt 里写明"任务复杂时先调 `update_plan` 排一份 3~6 步的简短计划"。修前 0 次 / 修后 2 次（同 P7-c 表）
   2. **`--resume` 静默丢掉 `checkpoint_every`**：`from_checkpoint` 的默认值是 5，而 `--resume` 这条路径没转发 → `--resume --checkpoint-every 1` 静默回落成"每 5 步一次"。后果不是报错，而是**恢复出来的这一段一步都不落盘**（kill 在 step 5，续跑到 step 9，检查点数还是 5）。修好后同一段跑出 `[1..10]`

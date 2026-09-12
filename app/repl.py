@@ -53,6 +53,7 @@ from agent.session import (
     DEFAULT_CHECKPOINT_EVERY,
     Session,
     derive_taint,
+    last_rewind,
     set_session_name,
     unique_session_id,
 )
@@ -64,10 +65,12 @@ from agent.tools.plan import render_plan
 from app.cli import (
     _Runtime,
     _do_fork,
+    _do_rewind,
     _extract_learned,
     _print_sessions,
     _reinject_goal,
     _reinject_plan,
+    _reinject_rewind,
     _resolve_session_ref,
     _session_label,
 )
@@ -89,6 +92,10 @@ _COMMANDS: dict[str, tuple[str, str]] = {
     "/sessions": ("_cmd_sessions", "列出所有会话（名字/步数/检查点数/分叉来源）"),
     "/rename": ("_cmd_rename", "给当前会话起个人看得懂的名字"),
     "/clear-taint": ("_cmd_clear_taint", "复位本会话的污染标记（**人的动作**）"),
+    "/rewind": (
+        "_cmd_rewind",
+        "把工作区文件回滚到第 N 步（省略 = 最近一个有快照的步）；默认先预览后确认",
+    ),
 }
 
 #: `/goal` 的子命令（不带 `--check` 时按它们解析）。**顺序无关**，只用于判"首词
@@ -627,6 +634,63 @@ class Repl:
         # 记一条 taint_cleared，所以下次从这个检查点恢复时同样有效。
         self.state.clear_taint(reason="repl:/clear-taint")
         typer.secho("污染标记已复位为 none", fg=typer.colors.GREEN)
+
+    def _cmd_rewind(self, arg: str) -> None:
+        """`/rewind [step]` —— 把**工作区文件**回滚到第 N 步（M9-8）。
+
+        与 `/fork` 是**互补**的两件事，这也是为什么命令名不合并：`/fork` 搬的是
+        **对话**，`/rewind` 动的是**文件**。要"倒带重试"，两条都要。
+        （CLI 把它们拼成 `--fork --step K --rewind`。）
+
+        `arg` 不是整数时**直接返回**而不是当 0 用：0 在这里是有真实含义的坐标
+        （"撤销我们做过的一切"），把一个打错的字静默当成它，等于把用户的工作区
+        一次抹干净。
+        """
+        step: int | None = None
+        if arg:
+            try:
+                step = int(arg)
+            except ValueError:
+                typer.secho(f"步数要是个整数: {arg}", fg=typer.colors.YELLOW)
+                return
+        target = _do_rewind(
+            self.workspace_root,
+            self.session.session_id,
+            step,
+            force=False,
+            # 传自己的确认回调：REPL 里 Ctrl+C 的语义是"退出"，而在一个确认框里
+            # 它必须是"取消"（见 `_confirm_rewind`）。默认的 `_yes_no_prompt`
+            # 用的是 typer.prompt，把 Ctrl+C 抛成 Abort 再被 `_dispatch` 那一层
+            # 接成别的意思，就分不清"我不想回滚"和"我想退出"了。
+            confirm=self._confirm_rewind,
+        )
+        if target is None:
+            return
+        # **当场的对话也要知道。** `_reinject_rewind` 走的是 meta，那条路只在
+        # `--resume` 时生效；REPL 里人是**在一段活着的对话中途**回滚的，模型
+        # 下一秒就要开口，它手上那份"我刚改过 X"的记忆已经作废了。
+        # 这里复用同一个 `_reinject_rewind` 而不是另写一句话：两处各写一遍，
+        # 迟早有一处忘了说"先读一遍文件确认真实现状"。
+        self.state.last_rewind = last_rewind(self.workspace_root, self.session.session_id)
+        _reinject_rewind(self.state)
+
+    def _confirm_rewind(self, question: str) -> str:
+        """`/rewind` 的确认框：读一行 y/n。**默认 n**。
+
+        直接用 `input()` 而不是 `typer.prompt`：REPL 的主循环本来就用 `input()`
+        读行（`:244`），用同一个读法，提示符、Ctrl+C、EOF 的行为都跟人已经习惯的
+        那一套一致。EOF / Ctrl+C 一律按**取消**返回 —— 回滚是全项目唯一一个会
+        覆盖和删除用户文件的操作，读不到明确同意就不能做。
+        """
+        typer.secho("─" * 68, fg=typer.colors.BRIGHT_BLACK)
+        typer.secho(question, fg=typer.colors.YELLOW)
+        try:
+            raw = input("确认回滚？(y/N) ")
+        except (EOFError, KeyboardInterrupt):
+            typer.echo()
+            typer.secho("（读不到明确同意，按取消处理）", fg=typer.colors.BRIGHT_BLACK)
+            return "n"
+        return "y" if raw.strip().lower() in ("y", "yes", "是") else "n"
 
     # ---------- 内部 ----------
 

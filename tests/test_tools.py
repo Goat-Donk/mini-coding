@@ -609,6 +609,83 @@ def test_preview_defaults_to_none(files_ctx):
     assert _read().preview({"path": "x"}, files_ctx) is None
 
 
+# ---------- M9-8：工具报告的 file_changes（工作区快照的 base 来源） ----------
+#
+# 这一组测的是**给快照的原料**，不是快照本身。三条契约各自对应一个容易写错的地方：
+# 报告里必须是**写盘之前**的字节、必须是**原样字节**（不能是解码后的文本）、
+# 失败时**什么都不报**。写错任何一条，回滚都会安静地还原出错误的内容。
+
+def test_write_reports_the_bytes_it_overwrote(files_ctx):
+    path = files_ctx.workspace_root / "f.txt"
+    path.write_text("旧内容", encoding="utf-8")
+
+    result = _write().run({"path": "f.txt", "content": "新内容"}, files_ctx)
+
+    assert result.success
+    assert len(result.file_changes) == 1
+    change = result.file_changes[0]
+    assert change.path == path
+    assert change.before == "旧内容".encode("utf-8")   # ★ 写盘**之前**的
+    assert not change.base_unknown
+    assert path.read_bytes() == "新内容".encode("utf-8")
+
+
+def test_write_reports_a_new_file_as_not_existing(files_ctx):
+    result = _write().run({"path": "new.txt", "content": "hi"}, files_ctx)
+
+    change = result.file_changes[0]
+    assert change.before is None        # "之前不存在" —— 回滚时该删掉它
+    assert not change.base_unknown      # 而不是"读不到"
+
+
+def test_edit_reports_raw_bytes_not_the_decoded_text(files_ctx):
+    """★ `before` 必须是**原样字节**。
+
+    `EditTool` 的 `old_content` 是 `errors="replace"` 解出来的文本；拿它重新编码
+    当 base，带 BOM 或非 UTF-8 的文件就会与盘上的原始字节不一致，而错误要到
+    回滚时校验哈希才暴露。所以工具报告的是它**另外读的**那份字节。
+    """
+    path = files_ctx.workspace_root / "bin.txt"
+    original = b"\xef\xbb\xbf# \xff\xfe not utf-8\n"
+    path.write_bytes(original)
+
+    result = _edit().run(
+        {"path": "bin.txt", "old_string": "not utf-8", "new_string": "changed"},
+        files_ctx,
+    )
+
+    assert result.success
+    assert result.file_changes[0].before == original    # 逐字节相等，不是重新编码的
+    assert path.read_bytes().startswith(b"\xef\xbb\xbf")  # BOM 也没被抹掉
+
+
+def test_failed_write_reports_no_change(files_ctx):
+    """写盘失败 → **一个改动都不报**：盘上没变，登记它会让快照以为改过。"""
+    result = _write().run({"path": "../escape.txt", "content": "x"}, files_ctx)
+
+    assert not result.success
+    assert result.file_changes == ()
+
+
+def test_edit_that_matches_nothing_reports_no_change(files_ctx):
+    (files_ctx.workspace_root / "f.txt").write_text("hello\n", encoding="utf-8")
+
+    result = _edit().run(
+        {"path": "f.txt", "old_string": "not here", "new_string": "x"}, files_ctx
+    )
+
+    assert not result.success
+    assert result.file_changes == ()
+
+
+def test_read_only_tools_report_no_change(files_ctx):
+    """只读工具一个改动都不报 —— 快照那边于是"什么都没发生"，一个字节都不写。"""
+    (files_ctx.workspace_root / "f.txt").write_text("hello\n", encoding="utf-8")
+
+    assert _read().run({"path": "f.txt"}, files_ctx).file_changes == ()
+    assert _write().run({"path": "g.txt", "content": "x"}, files_ctx).file_changes != ()
+
+
 def test_edit_preview_is_capped_for_the_human(files_ctx):
     """预览是给人看的，必须有上限：几万字符的 diff 会把人逼成闭眼点允许。"""
     from agent.tools.files import DIFF_PREVIEW_CHARS

@@ -4,13 +4,13 @@
 
 ## 项目定位
 
-求职作品集：**CodeAgent** —— 参考 [pengchengneo/Claude-Code](https://github.com/pengchengneo/Claude-Code) 源码架构，用 Python 从零实现的小型 AI Coding Agent（11,207 行 / 29 模块 / 623 测试）。核心循环手写（不套 Agent SDK），支撑层用成熟库（openai / pydantic / streamlit / typer / pytest）。差异化：cache-aware 上下文 + 缓存省钱指标、step 级检查点恢复 + **step 级分叉/会话命名**、**常驻交互模式（REPL，一行一个回合）**、**进程内目标 + 显式完成检查（判分权在人手里）**、**并发子代理（句柄式 spawn/wait/close + 回合边界结算）**、block-at-submit hooks、轨迹驱动评估（真实 tinydb 提交 + 隐藏测试）、记忆自进化、MCP 工具接入（**stdio + Streamable HTTP 两种传输**）、注入文本检测 + 会话污染天花板、联网工具 + SSRF 拦截、skills 渐进披露、计划清单跨回合、提问暂停/续答、改动前 diff 复核。
+求职作品集：**CodeAgent** —— 参考 [pengchengneo/Claude-Code](https://github.com/pengchengneo/Claude-Code) 源码架构，用 Python 从零实现的小型 AI Coding Agent（12,568 行 / 30 模块 / 707 测试）。核心循环手写（不套 Agent SDK），支撑层用成熟库（openai / pydantic / streamlit / typer / pytest）。差异化：cache-aware 上下文 + 缓存省钱指标、step 级检查点恢复 + **step 级分叉/会话命名 + 工作区回滚快照（`--rewind` 与 `--fork` 共用同一个 K）**、**常驻交互模式（REPL，一行一个回合）**、**进程内目标 + 显式完成检查（判分权在人手里）**、**并发子代理（句柄式 spawn/wait/close + 回合边界结算）**、block-at-submit hooks、轨迹驱动评估（真实 tinydb 提交 + 隐藏测试）、记忆自进化、MCP 工具接入（**stdio + Streamable HTTP 两种传输**）、注入文本检测 + 会话污染天花板、联网工具 + SSRF 拦截、skills 渐进披露、计划清单跨回合、提问暂停/续答、改动前 diff 复核。
 
-> 数字口径（改数字时请沿用）：**源码 = `agent/` + `app/` + `eval/` 下非空 `.py` 文件的全部行数**（含空行；不含 `eval/repos/` 的克隆仓，它被 gitignore）；**模块数 = 其中非空的 `.py` 文件数**（4 个空 `__init__.py` 不计）；**测试 = `tests/` 行数 / pytest 用例数**。**按文件系统数，不按 git 跟踪数** —— 新文件在提交前也该算进去（M9-6 的 `agent/goal.py`(232) `agent/tools/goal.py`(118) `tests/test_goal.py`(927) 当时尚未提交）。
+> 数字口径（改数字时请沿用）：**源码 = `agent/` + `app/` + `eval/` 下非空 `.py` 文件的全部行数**（含空行；不含 `eval/repos/` 的克隆仓，它被 gitignore）；**模块数 = 其中非空的 `.py` 文件数**（4 个空 `__init__.py` 不计）；**测试 = `tests/` 行数 / pytest 用例数**。**按文件系统数，不按 git 跟踪数** —— 新文件在提交前也该算进去（M9-8 的 `agent/workspace.py`(814) 与 `tests/test_workspace.py`(785) 目前尚未提交）。
 
-**已验证状态**：真实 LLM 端到端跑通（修 bug 全流程、kill+`--resume` 续跑、eval 出真实报告 50% 1/2）。README「评估」章节有真实数字与口径说明。**M6 收尾后又补齐三项此前只是单测覆盖的验证**：compact 在真实 token 压力下真实触发（当时是两级；M8 加了分级截断，现为三级 compact）、MCP 接真实第三方 server（官方 `mcp-server-time`，stdio）并确认仍走权限/hook 门禁链、Streamlit 控制台用真实 Chrome 打开并操作控件跑通 mock 任务。**M9-4 又补了一项**：MCP 接**真实远程 HTTP** server（DeepWiki 的 Streamable HTTP 端点，走公网）并端到端跑通工具调用。**M9-5 又补了三轮**：常驻 REPL 的多回合上下文接续（第二回合不重读源码就改对）、`/rename`+重进+`/fork 2` 新分支接着跑、`--review-edits` 下答「本回合允许」后下一回合同一命令**重新被问**（`m9verify/repl_a|b|c.log`）。**M9-6 又补了五条 Goal 动线**（`m9verify/goal_*.log`）：建目标→自动续跑→声明→检查真跑通过 / 一开始必然失败的检查→回喂→继续修→再声明→通过 / `pause`+`resume` / 人敲一行字 / `--resume` 一个有活跃目标的会话（检查照跑）。**M9-6 真跑没有挖出产品缺陷** —— 如实记，因为前面几轮都挖出了东西、这里没有；真跑暴露的是**我自己写的一条测试素材错误**（见下）。
+**已验证状态**：真实 LLM 端到端跑通（修 bug 全流程、kill+`--resume` 续跑、eval 出真实报告 50% 1/2）。README「评估」章节有真实数字与口径说明。**M6 收尾后又补齐三项此前只是单测覆盖的验证**：compact 在真实 token 压力下真实触发（当时是两级；M8 加了分级截断，现为三级 compact）、MCP 接真实第三方 server（官方 `mcp-server-time`，stdio）并确认仍走权限/hook 门禁链、Streamlit 控制台用真实 Chrome 打开并操作控件跑通 mock 任务。**M9-4 又补了一项**：MCP 接**真实远程 HTTP** server（DeepWiki 的 Streamable HTTP 端点，走公网）并端到端跑通工具调用。**M9-5 又补了三轮**：常驻 REPL 的多回合上下文接续（第二回合不重读源码就改对）、`/rename`+重进+`/fork 2` 新分支接着跑、`--review-edits` 下答「本回合允许」后下一回合同一命令**重新被问**（`m9verify/repl_a|b|c.log`）。**M9-6 又补了五条 Goal 动线**（`m9verify/goal_*.log`）：建目标→自动续跑→声明→检查真跑通过 / 一开始必然失败的检查→回喂→继续修→再声明→通过 / `pause`+`resume` / 人敲一行字 / `--resume` 一个有活跃目标的会话（检查照跑）。**M9-6 真跑没有挖出产品缺陷** —— 如实记，因为前面几轮都挖出了东西、这里没有；真跑暴露的是**我自己写的一条测试素材错误**（见下）。**M9-8 又补了六条动线**（`m9verify/drive_m9_8.py`，工作区 `m9verify/ws_m98/`）：写盘产快照 → 预览不动盘 → 真回滚 → `--fork --step K --rewind` → 磁盘实测 → `--drop-snapshots` 回收，**这一步的核心产出是"决定之前先测"**（见 M9-8 段的三条实测）。
 
-**CLI 治理链路**：`app/cli.py` 的 `_Runtime.engine()` 是**唯一** `QueryEngine(...)` 构造点（M9-5 收的，原先两处各写一遍），单发与常驻 REPL 都从它拿引擎 —— 两处都已接 `PermissionsEngine`（默认 allow、危险命令 ask→无确认交互→拒绝、路径越界 deny、**第三方/MCP 工具须在 `mcp.json` 的 `allow` 里显式授权否则 ask**）与 hooks（`default_engine()`：block-at-submit + marker 自动维护 + **注入检测**）。入口层共用 `hooks.default_engine()`，避免接线漂移（CLI 曾整体漏接 hooks）。`tests/test_cli.py` 共 38 例（接线相关的多条在里面）。
+**CLI 治理链路**：`app/cli.py` 的 `_Runtime.engine()` 是**唯一** `QueryEngine(...)` 构造点（M9-5 收的，原先两处各写一遍），单发与常驻 REPL 都从它拿引擎 —— 两处都已接 `PermissionsEngine`（默认 allow、危险命令 ask→无确认交互→拒绝、路径越界 deny、**第三方/MCP 工具须在 `mcp.json` 的 `allow` 里显式授权否则 ask**）与 hooks（`default_engine()`：block-at-submit + marker 自动维护 + **注入检测**）。入口层共用 `hooks.default_engine()`，避免接线漂移（CLI 曾整体漏接 hooks）。`tests/test_cli.py` 共 47 例（接线相关的多条在里面；数字按 `pytest --collect-only` 数）。
 **唯一例外是 `--review-edits`（M9-1）**：它给 CLI 装上 `confirm` 回调并把 `edit`/`write` 抬成 ask，于是改动落盘前人能看到 diff。**默认关闭是刻意的** —— 我们的 CLI 本来没有确认回调，把 edit 改成默认 ask 会让每次改动都退化成拒绝、整条 CLI 不可用（那就把安全机制变成了路障；TS 原版靠 TTY 模式兜住，我们没有）。所以它是 opt-in，默认路径与 eval 一字不变。
 
 **M7 安全机制（措辞红线，别写错）**：本项目**没有**做「防止 prompt 注入」。分三层：① `permissions.py` 执行（确定性）② `hooks.py` PreToolUse 阻断（确定性）③ `security.py` 检测（**概率性，只出告警，从不直接决定放行/拒绝**）。检测出 `high` 后收紧能力的是**后置天花板**（`_apply_taint_ceiling`，只把三类不可逆动作 网络外发/读凭据/写记忆文件 从 ALLOW 降为 ASK），位置**必须在 `_always`/`_turn` 之后、`confirm` 之前**。禁用措辞：不说「防御/防止注入」，不说「污点追踪/taint 传播」（实为**会话级粗粒度标记**），不说「纵深防御/零信任」，不说「子代理沙箱」（实为**受限只读工具集**），不给「误报率低」这类无数字形容词。局限逐条写在 README「已知未修复的绕过路径」（S1–S20，其中 S6–S10 配了探针实测、S17–S20 是 M9-6 目标完成检查的代价），改任何一条都要同步改那张表。**bash 的凭据判据是「提到即命中」**（`CREDENTIAL_MENTION`，不锚定末尾，见 permissions.py 的注释）——别「顺手修回去」，那会让天花板重新空转。
@@ -30,7 +30,8 @@
 
 **已做 M9-3 会话分叉 + 命名（`--fork` / `--rename` / `--sessions`）**，机制是：
 - **分叉挂在 step 级检查点上**（与 TS 原版的差别）：它的 `/fork` 是**会话级**的，我们可以 `--fork --step K` **回到任意一步**再开一条路 —— 检查点本来就逐步落，这能力是现成的。
-- **它是对话分叉，不是工作区分叉。** 工作区文件**不会**回滚到第 K 步，分叉后的 agent 看到的是**当前**工作区 —— 我们**没有**工作区快照机制（`grep rewind|snapshot` 在 `agent/ app/` 下零命中）。CLI 分叉后把这句打印出来、`--fork` 的 help 也写明。**别把这条说漏**，否则"回到第 3 步"几乎必然被读成文件也回去了。
+- **单独用时，它是对话分叉，不是工作区分叉。** 工作区文件**不会**回滚到第 K 步，分叉后的 agent 看到的是**当前**工作区。CLI 分叉后把这句打印出来、`--fork` 的 help 也写明。**别把这条说漏**，否则"回到第 3 步"几乎必然被读成文件也回去了。
+  - **M9-8 之后这句话有了正面出口：加 `--rewind` 就让文件也回到第 K 步**（`--fork --step K --rewind`，见下）。**而且那句话本身必须跟着 `--rewind` 分叉写**：M9-8 之前它无条件说"工作区不会回滚"（那时是真的，因为没有回滚机制），现在带着 `--rewind` 时它会**变成假话** —— 而假话比不说更糟。
 - fork 搬三样，都以 fork 点为界：检查点 `step-1..K`、**轨迹里 `step <= K` 的行**（整份复制会让分叉会话"继承"源会话在 K 之后才发生的 `security_finding`）、`forked_from`。**副本里唯一按新会话重写的是 `session_id`**（今天 `load_state` 会 pop 掉所以无害，但谁哪天直接读 `payload["session_id"]` 就会拿到源会话）。
 - **`--sessions` 是这一项的另一半，不是附赠**：没有它，`--rename` 写的名字与 `--fork` 记的血统**没有任何消费者** —— 正是本项目记录在案的头号缺陷类。清单的键集合取「检查点目录 ∪ `data/sessions/*.jsonl`」，所以**跑到一半被 kill、还没到第一个检查点的会话也在里面**。
 - **名字的两条判据合起来才成立**：写入侧 `validate_name` 拒绝「与任何已有 session_id 或会话名相同」，读取侧 `resolve_session` **先当 id、再当名字**。少了写入侧的拒绝，重名会让 `--resume --session-id <名字>` **安静地跑到另一个会话上**（带着另一个任务的上下文）；名字等于某个 id 时那个 id 就永远解析不到自己。所以不去读取侧加优先级"猜"。
@@ -41,7 +42,7 @@
 
 **模块 docstring 要注明机制出处**（先例 `agent/tool_result.py`、`agent/tools/plan.py`），与本项目「参考与来源」的惯例一致。
 
-**M9 向 TS 原版对齐（2026-09-11 完成，排序见 `TASKS.md`）**：核实后 TS 原版 12 项核心能力全部真实现（逐条对照与 file:line 证据在 `docs/reference/minicode-notes.md` §10），本项目按「先小后大」分四批靠。**M9-1 ~ M9-7 全部完成，12 项核心能力清单全部落地**（唯一剩下的 **M9-8 工作区 rewind 快照**是 2026-09-11 新立的条目、尚未开工，不属于这 12 项）。**已做 M9-1 改动前 diff 复核**，机制是：
+**M9 向 TS 原版对齐（2026-09-11 完成，排序见 `TASKS.md`）**：核实后 TS 原版 12 项核心能力全部真实现（逐条对照与 file:line 证据在 `docs/reference/minicode-notes.md` §10），本项目按「先小后大」分四批靠。**M9-1 ~ M9-8 全部完成，12 项核心能力清单全部落地 + 工作区 rewind 快照（M9-8，2026-09-12）**。**已做 M9-1 改动前 diff 复核**，机制是：
 - `Tool.preview(arguments, ctx) -> str | None`（`agent/tools/base.py`）声明**将要做什么**，默认 None；目前只有 `write`/`edit` 实现。
 - **它必须是纯函数**（绝不写盘），且**只能有一份**匹配语义：`EditTool._plan` 同时供 `preview` 与 `execute` 用 —— 各判一遍就会出现「预览说能改、执行说匹配不唯一」，而那时人已经照着预览点过允许了（**两个真相源**）。
 - `_gate_and_run` 里 `details = self._preview(...)` **必须在 `permissions.check()` 之前**取。位置就是这一项的全部意义：人看到 diff 时磁盘上还是旧内容。**挪到 check() 之后不会报任何错**，所以有测试专门钉住确认回调被调用那一刻文件仍是原文。
@@ -82,7 +83,7 @@
 - **`max_steps` 语义变更（行为变更，要主动说）**：从「整个 state 的累计步数上限」改成**「每轮一份预算」**（`_run_loop` 记 `budget_start = state.step`，条件 `state.step - budget_start < max_steps`）。`state.step` **照样累计不重置**（检查点文件名、`--fork --step K`、轨迹 `step` 字段都依赖它单调递增），只改预算的**度量起点**。顺带修掉一个陷阱：会话跑满 25 步后 `--resume` 旧语义下**一次模型调用都不发**、直接又打印「已达到最大步数」。
 - **装配不复制（这一项防漂移的关键）**：`QueryEngine(...)` 原先在 `app/cli.py` 被构造**两遍**（`--resume` 一条路、全新会话一条路，参数逐字相同）。收成 `_Runtime.engine(session)` 一处，单发与常驻从同一处拿。**REPL 若自己装配一遍，迟早漏掉一样** —— CLI 历史上**漏接过 hooks 与 permissions 各一次，两次都是静默的**。
 - **两条硬不变量**：① 不认识的斜杠命令**绝不发给模型**（打错一个字母 = 一次真实调用，而回答看起来还挺像回事 → 这个错误不会被发现）；② 会话切换失败**不能半切换**（`_activate` 三样一起换，**engine 必须跟着换** —— `QueryEngine.session` 构造期绑定；"session 换了、engine/state 没换"是**零报错**的错配：轨迹写进 A、你在看 B）。命令判据用 **`raw.startswith("/")`**（strip **之前**的行），所以行首加空格仍当任务发。
-- **10 个命令的正文由 `_COMMANDS` 表生成**（`/help` 与命令表写两处迟早对不上），有测试断言 `/help` 列出的名字**恰好等于**表的键集合。
+- **11 个命令的正文由 `_COMMANDS` 表生成**（`/help` 与命令表写两处迟早对不上），有测试断言 `/help` 列出的名字**恰好等于**表的键集合。
 - **退出语必须可执行**：`_farewell` 打印「继续: … `--repl --resume --session-id <sid>`」，而检查点是**按节拍**落的、且**只在有工具调用的步上 tick** —— 纯聊天或只走两步就退出会一个检查点都不落，那条命令直接报"读不到检查点"。所以 `_wrap_up` **退出时强制落一次**（理由同 `_awaiting_user` 的 `force=True`：流程即将因非步数原因退出，节流的下一次 tick 永远等不来）。**这条是写测试时逼出来的，不是真跑**，如实记着。
 - **每回合报增量**（`RunResult.steps`/`usage` 是**会话累计**的，五个返回点给的都是 `state.step`）。`Usage` 是**可变 dataclass**、`state.usage += …` 是**原地**累加 → 快照必须 `dataclasses.replace()` 复制，**不复制则相减恒为 0 且不报错**。
 - **`await_user` 在 REPL 里不需要任何特殊代码**（模型提问 → 本轮结束 → 打印问题 → 下一行输入就是回答）。这是 M8「打断是数据标志而不是阻塞控制流」的回报 —— 反过来若 REPL 自己 `input()` 一个"回答"，就是把数据标志退化成阻塞控制流。
@@ -121,6 +122,19 @@
 - **一处对计划的偏离（要主动说）**：**没做 `/agents` 斜杠命令、也没做 `_prompt` 的 `agents:N` 状态位**。理由是它们**结构上恒不触发**：`AgentWorkers` 每回合新建、`settle()` 在 `finally` 里跑，所以**回合之间活跃 worker 恒为 0** —— `/agents` 永远打印"（没有子代理）"，`agents:N` 永远是 `agents:0`，而"恒显一个值会让人不再看它"。两个都正是本项目头号缺陷类的形状（机制在、没人能触达）。替代的可见性出口是 `EventPrinter` 里那条 `subagent_settled`。
 - **真实验证**：① 前置探针 `m9verify/probe_concurrent_llm.py`（真联网）—— 4 条并发 `chat()` 共用同一个 `DeepSeekClient`：**无串台、无异常、usage 各自可信**；**第一版测出"并发比串行慢 3.6 倍"是冷启动假象**（第一条真请求付了 39.92s 的 DNS+TLS+连接池成本，全落在先跑的那批头上），**预热后 1.88x**。这是"先把测量方法里的混淆项排掉再下结论"的实例。② 端到端四条动线（`m9verify/drive_m9_7.py` + `m9verify/ws_m97/`，日志 `m9verify/drive_m9_7_*.log`）：**并发 17.4s vs 串行 29.2s（1.68x）**；**`spawn_agent` 各耗时 0/5/0/0ms 而串行 `subagent` 是 5540/7686/7426ms**（句柄契约的现场）；**`close_agent` 1140ms 返回、状态 `closed`、无结论**（"等它真停"的实测代价）；**`abandon` 动线里 `subagent_settled` 真的到达 `EventPrinter`**（`■ 子代理结算：1 个被叫停、0 个结论没被取走`），且模型自己主动提醒"子代理只活这一个回合"。**变异 29/29**。
 
+**已做 M9-8 工作区回滚快照（`agent/workspace.py` + `session.snapshots` + `--rewind/--snapshots/--drop-snapshots`）**，机制是：
+- **存储布局**：对象库 `data/snapshots/objects/{sha[:2]}/{sha}.bin` **全局共享**；清单 `data/checkpoints/{sid}/ws/step-K.json` **按会话隔离**。**对象全局共享是实测推翻初稿的**：E 动线实测 `--fork` 的**对象增量 0 个 / 0 字节**（只有清单 +599 B）—— 项目初始文件、被改回原样的内容都命中同一份对象；按会话隔离会让同一份内容在每个会话各存一遍。代价：回收不能整目录删 → `drop_snapshots` **现算 live set**（`_live_shas` 扫所有剩余清单）。
+- **三条不变式**（每条有测试钉着）：① `path ∈ manifest[K]` ⟺ `first_touch(path) ≤ K` → 清单是**全量**的，每步可独立还原（"按序重放前像"在中间缺一环时是**静默还原出错**）；② **`base`（我们碰它之前它长什么样）只记在首触那一步的清单里** —— 没有它，"回滚到第一次修改之前"就只能**删掉那个文件**，而它可能是仓库里人写的、我们并不认识的文件；③ **写盘顺序：对象 → 清单 → 检查点**（`capture` 跑完 `Session._write` 才落检查点），被杀只留**孤儿**（不可达字节），不留**说谎的引用**。孤儿**如实报出、不自动删**。
+- **`plan(K)` 的 `K < lo` 那一支必须单独有**（`lo = min(manifests)`）：节拍 5 时第一个清单落在第 5 步，而 `plan(5)` 读的是第 5 步**盘面**（写完之后的），于是"撤销 agent 做过的一切"在最常见的形状下根本表达不出来 —— **没有这一支，`base` 是结构上不可达的**。夹在两快照中间的步（快照在 5 和 10、要回到 7）**仍然报错**：那是"不知道"，不是"没有"。
+- **"不在管辖范围"是独立维度**（决议 6）：`plan` 同时给 `outside`（没被 write/edit 碰过的文件数）、`shell_calls`、`other_calls`，**跟着预览一起印出来**。把"文件系统回滚"与"不可回滚的外部副作用"混为一谈是推卸责任 —— `bash` 的 `rm/mv/重定向`、MCP 写入、目录增删、权限位/mtime、进程外的一切**明说不管**。回滚区间是**左开**的 `(target_step, 最新检查点]`，数据源是最新检查点的 `state.events`。
+- **`--rewind` 默认只预览 + 二次确认（默认 n）**：`plan()` 纯读，输出 git-diff 风格四类（恢复/删除/不变/无法还原）。理由不是保守 —— 回滚是**全项目唯一一个不可逆的写操作**（对象库留了旧字节，但被覆盖的文件本身没有 undo）。`--force` 跳过；没有 changes 时不弹框但仍返回步号（调用方靠它拼"继续"那句 `--resume --step K`）。REPL 里是 `/rewind [step]`，`_confirm_rewind` 用 `input()` 而非 `typer.prompt`（常驻模式里后者会和自己的行读取打架）。
+- **回滚之后必须告诉模型**（`_reinject_rewind`）：历史里写着"我改了 a.txt"而盘上已经没了，它会基于**不存在的现状**推理。触发判据是 `state.step > target`（等于或早于时历史与盘面一致，补投是噪音还会破缓存）。`last_rewind` 落 **meta 而不是只打印** —— 打印的字留在上个进程的屏上，下个进程要读文件。
+- **`--fork --step K --rewind`**（决议 3，"倒带重试"）：fork 搬**对话**、rewind 搬**文件**。`_copy_snapshots` 只复制 `ws/step-n.json`（n ≤ K）、**一个对象都不复制**（库是全局的，sha 仍可读）；分叉点之后的清单**不搬**（那是源会话在分叉点之后的历史，搬过去就是**说谎的记录**）。
+- **不加锁（决议 7，实测支撑）**：对象与清单**只由父线程写**（写工具不是只读工具，走串行分支；worker 的引擎 `session=None`，结构上拿不到本模块 —— 与"worker 写不了检查点"是同一条保证）。全局对象库的并发写实测（8 线程 × 5 轮 × 6 次重跑）：**裸 `os.replace` 冲突 24~30/40（全是 Windows `PermissionError(13)`），经 `_put_object` 未捕获异常 0 次** —— 容错就是"看目标在不在"（内容寻址，同 sha 必同内容），**不是加锁**。如实标注：Linux 上那条容错分支可能是死代码。
+- **登记点挂在 `loop._gate_and_run` 工具成功之后**（`ToolResult.file_changes` 由工具在**写盘之前**读出原样字节报告）：于是"权限拒绝的那次调用压根没执行 / edit 匹配失败 / 工具自己抛了"三种情况是**结构上**走不到登记的，不靠谁记得判断。`base_unknown=True`（存在但读不到）**不纳入管辖** —— 当成"不存在"就会在回滚时**删掉用户的文件**。
+- **决定之前先测（决议 1 的输入）**：基座 = 被 write/edit 碰过的文件原始字节之和，**不是整个工作区** —— 实测 **1949 B / 8892 B = 21.9%**，且只取决于"改了几个文件"。所以**不给基座加开关**（磁盘比用户的时间便宜；没有基座，"回滚到第一次修改之前"就可能删掉未跟踪的用户文件）。清单 599 B vs 对象 4339 B ≈ 13.8%，孤儿 0 个；回收 1 个对象 / 746 B，3 个因别的会话仍引用而保留。
+- 测试 `tests/test_workspace.py` **49 例** + 接线契约 22 例；**变异 35/35 零 SKIP 零 MISS**（`m9verify/mutate_m9_8.py`，其中 5 处是**证明后不设**的候选）；**707 测试全绿**。六条动线 A~F 真跑（`m9verify/drive_m9_8.py`）**数字与 README 的 token/成本/缓存数字没有任何关系，不可混着比**（口径见驱动脚本 docstring）。
+
 ## 硬约束（不可违反）
 
 - LLM 只用 DeepSeek（国内 API）；生产 `deepseek-chat`，测试用 MockLLM
@@ -142,7 +156,8 @@
 | 工具结果 | agent/tool_result.py | 超大工具结果落盘 + 预览替换 + 批预算（M3） |
 | 权限 | agent/permissions.py | once/turn/always 决策粒度 + 黑名单 + 沙箱 + 确认文案带 `details`（M2·M9） |
 | 钩子 | agent/hooks.py | Pre/PostToolUse + block-at-submit（marker 由测试成功自动写）（M2） |
-| 会话 | agent/session.py | JSONL 轨迹 + 检查点 + resume + **step 级分叉 / 会话命名 / 清单**（M3·M9-3）；`_FIELD_DECODERS` 是新增 state 字段的**必改点**（M9-6 的 `goal`） |
+| 会话 | agent/session.py | JSONL 轨迹 + 检查点 + resume + **step 级分叉 / 会话命名 / 清单**（M3·M9-3）；`_FIELD_DECODERS` 是新增 state 字段的**必改点**（M9-6 的 `goal`、M9-8 的 `last_rewind`），`_write` 里 **`snapshots.capture` 必须在落检查点之前**（M9-8 写盘顺序） |
+| 快照 | agent/workspace.py | M9-8 工作区快照 + 回滚：`WorkspaceSnapshots`（登记/按步落清单/`plan`/`restore`）+ 全局内容寻址对象库 + `drop_snapshots` 现算活跃集回收。**登记只由父线程、只在工具成功后**（`loop._gate_and_run`），故不需要锁 |
 | 记忆 | agent/memory.py | 分层指令文件(@include+去重+预算) + 提取 + 简化 consolidation（M4） |
 | 技能 | agent/skills.py | SKILL.md 渐进披露：只把 name+简介进 system prompt，正文由 load_skill 按需取（M8） |
 | 安全 | agent/security.py | 注入文本检测（**概率性，只出告警**）+ 会话级污染标记 + 来源框架（M7） |
@@ -163,13 +178,19 @@ python -m app.cli --goal                     # 只看最近会话的**目标**�
 python -m app.cli --resume "补充的信息"       # 回答 agent 的提问后续跑（配 --session-id 更稳）
 python -m app.cli --sessions                 # 列出会话：名字/步数/分叉来源（无 key）
 python -m app.cli --rename "基线方案"          # 给最近会话起名（只动元数据，无 key）
-python -m app.cli --fork --step 3 "换个思路"   # 从第 3 步分叉出新会话并续跑（对话分叉，见下）
+python -m app.cli --fork --step 3 "换个思路"   # 从第 3 步分叉出新会话并续跑（**对话**分叉，文件不动）
+python -m app.cli --snapshots                # 列出有快照的会话 + 全局对象库占用/孤儿数（无 key）
+python -m app.cli --rewind --step 3          # 回滚**预览**（默认只预览，确认之后才动盘）
+python -m app.cli --rewind --step 3 --force  # 真回滚工作区到第 3 步（覆盖/删除文件，不可逆）
+python -m app.cli --fork --step 3 --rewind --force   # "倒带重试"：对话 + 文件一起回到第 3 步
+python -m app.cli --drop-snapshots --session-id <id> # 删该会话快照并回收无人引用的对象
 python -m app.cli --resume --session-id "基线方案" "接着改"   # 会话 id **或名字**都能用来指会话
 python -m app.cli --repl                     # 常驻交互模式：一行一个回合（M9-5）
 python -m app.cli --repl "先跑一下测试"        # 带任务：它作为**第一个回合**跑掉再进提示符
 python -m app.cli --repl --resume --session-id <sid>   # 恢复后接着聊（退出时会强制落一次检查点）
 python -m app.cli --repl --goal-turns 5      # 目标自动推进一拍最多几个回合（默认 3，M9-6）
 # 提示符内：/goal <目标> --check <命令> 建目标并自动推进；/goal status|pause|resume|clear
+# 提示符内：/rewind [step] 把**工作区文件**回滚到第 N 步（同样默认只预览、要确认；对话另用 /fork）
 python -m app.cli "任务" --review-edits       # 改动前人工确认：edit/write 先显示 diff（M9-1）
 CODEAGENT_SEARCH_BACKEND=bing python -m app.cli "查 X 并写进文件"   # 联网任务（默认后端 ddg 本机连不上，见下）
 python -m app.cli --mcp .codeagent/mcp.json "任务"   # 加载 MCP server（见 mcp.example.json）

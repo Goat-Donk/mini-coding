@@ -761,3 +761,137 @@ def test_ensure_tool_pairing_ignores_a_final_assistant_text_message():
 
     assert _pair(messages) == 0
     assert len(messages) == 2
+
+
+# ---------- M9-8：登记点只认"真的写成了" ----------
+#
+# 快照的全部价值在于那份记录可信，所以**宁可少记也不能多记**：多记一条
+# "这个文件被我改过"，回滚时就会拿一份不着边际的 base 去覆盖用户的东西。
+# 下面三条各自封死一条错误登记的来路。
+
+def _ws_dir(tmp_path: Path, sid: str) -> Path:
+    return tmp_path / "data" / "checkpoints" / sid / "ws"
+
+
+def test_a_denied_write_is_not_registered(tmp_path):
+    """被门禁拦下的写**不算改过**：登记挂在门禁链**之后**，结构上走不到那一行。
+
+    这不是"记得判断"的结果 —— `_gate_and_run` 里权限拒绝是直接 `return` 的，
+    所以哪怕将来有人在上面再加一条提前返回，这一条也不会失效。
+    """
+    from agent.permissions import Decision
+
+    class DenyAll:
+        def check(self, name, arguments, ctx, *, details=None):  # noqa: ANN001 - 引擎接口
+            return Decision.DENY
+
+        def describe(self, name, arguments, *, details=None):  # noqa: ANN001
+            return "全部拒绝（测试替身）"
+
+    (tmp_path / "a.txt").write_text("v0", encoding="utf-8")
+    session = Session(tmp_path, "d1", checkpoint_every=1)
+    engine = make_engine(
+        tmp_path,
+        MockLLM.script(
+            MockLLM.tool("write", {"path": "a.txt", "content": "v1"}).responses[0],
+            LLMResult(content="那就不改了"),
+        ),
+        session=session,
+        permissions=DenyAll(),
+    )
+    engine.run("改文件")
+
+    assert (tmp_path / "a.txt").read_text(encoding="utf-8") == "v0", "前提：真的没写成"
+    assert session.snapshots.steps() == [], "被拒的写不该产生任何快照"
+    assert not _ws_dir(tmp_path, "d1").exists()
+
+
+def test_a_failed_write_is_not_registered(tmp_path):
+    """工具**自己失败**时也不登记（`edit` 匹配不上是最常见的一种）。
+
+    这条和上一条是两条不同的来路：门禁在 `tool.run` **之前**，工具失败在它
+    **之后**。只堵一条，另一条照样能造出"记了却没改"的记录。
+    """
+    (tmp_path / "a.txt").write_text("v0", encoding="utf-8")
+    session = Session(tmp_path, "d2", checkpoint_every=1)
+    engine = make_engine(
+        tmp_path,
+        MockLLM.script(
+            MockLLM.tool(
+                "edit",
+                {"path": "a.txt", "old_string": "根本不存在的一段", "new_string": "x"},
+            ).responses[0],
+            LLMResult(content="改不动"),
+        ),
+        session=session,
+    )
+    result = engine.run("改文件")
+
+    failures = [e for e in result.events if e["type"] == "tool_call" and not e["success"]]
+    assert failures, "前提：这次 edit 真的失败了"
+    assert session.snapshots.steps() == []
+
+
+def test_a_failing_tool_that_reports_changes_is_still_not_registered(tmp_path):
+    """工具**报告了** `file_changes` 但**失败了** → 不登记。
+
+    上面那条走的是"工具压根没报告"的来路，所以它杀不掉把 `result.success` 从
+    登记条件里删掉这个变异（实测：删掉之后 81 条全绿）。这一条用一个人造的
+    失败写工具把那条子句**变成可测的**。
+
+    它值得被钉住，是因为真实世界里会发生：某个写工具先落了盘、再在后续步骤上
+    失败（覆盖了半截、或者写完才发现校验不过）。那时"我改过这个文件"就是真的，
+    但它**不是一次成功的改动** —— 而快照记的是"我把它改成了什么样"，记不下
+    半截的状态。宁可整条不记。
+    """
+    from agent.tools.base import Tool, ToolContext, ToolResult
+    from agent.workspace import FileChange
+
+    class BoomInput(BaseModel):
+        pass
+
+    class FailingWriter(Tool):
+        name = "halfwrite"
+        description = "先报告改动再失败的写工具（测试用）"
+        input_model = BoomInput
+
+        @classmethod
+        def is_read_only(cls) -> bool:
+            return False
+
+        def execute(self, args, ctx: ToolContext) -> ToolResult:
+            change = FileChange(path=tmp_path / "a.txt", before=b"v0")
+            return ToolResult(success=False, output="写了一半就炸了", file_changes=(change,))
+
+    session = Session(tmp_path, "d3", checkpoint_every=1)
+    engine = make_engine(
+        tmp_path,
+        MockLLM.script(MockLLM.tool("halfwrite", {}).responses[0], LLMResult(content="算了")),
+        session=session,
+    )
+    engine.registry.register(FailingWriter())
+    engine.run("跑一个会失败的写")
+
+    assert session.snapshots.steps() == [], "失败的工具不该进快照，哪怕它报告了改动"
+
+
+def test_a_write_without_a_session_registers_nothing(tmp_path):
+    """无 session 的引擎（子代理用的就是这种）连快照对象都拿不到。
+
+    `self.session is not None` 这一句与"worker 的 session=None"是同一条纪律：
+    让"子代理改不了父会话的快照"成为**结构性**事实，而不是靠谁记得配。
+    """
+    (tmp_path / "a.txt").write_text("v0", encoding="utf-8")
+    engine = make_engine(
+        tmp_path,
+        MockLLM.script(
+            MockLLM.tool("write", {"path": "a.txt", "content": "v1"}).responses[0],
+            LLMResult(content="改好了"),
+        ),
+    )
+    result = engine.run("改文件")
+
+    assert result.terminated_reason == "completed"
+    assert (tmp_path / "a.txt").read_text(encoding="utf-8") == "v1", "前提：真写成了"
+    checkpoints = tmp_path / "data" / "checkpoints"
+    assert not checkpoints.exists() or not list(checkpoints.rglob("ws"))

@@ -4,7 +4,7 @@
 **核心循环手写**（不套 LangGraph / Agent SDK），支撑层用成熟库（openai SDK / pydantic v2 / streamlit / typer / pytest）。
 
 > **一句话**：把 Claude Code 的架构用 Python 重写一遍——不是移植代码，是移植设计。
-> 11,207 行源码 / 29 个模块 / 623 个测试。真实跑分见[评估章节](#评估eval)。
+> 12,568 行源码 / 30 个模块 / 707 个测试。真实跑分见[评估章节](#评估eval)。
 📄 文档：[技术方案 `docs/TECH_SPEC.md`](docs/TECH_SPEC.md) · [架构详解 `docs/architecture.md`](docs/architecture.md) · [任务清单 `TASKS.md`](TASKS.md) · [参考笔记 `docs/reference/`](docs/reference/)
 
 ---
@@ -17,8 +17,8 @@
 |---|---|---|
 | **cache-aware 上下文布局** | 稳定前缀（system+task 固定不动）+ 三级 compact，让 DeepSeek 磁盘缓存持续命中；控制台实时画命中率与省钱曲线 | TOKEN_BUDGET / CONTEXT_COLLAPSE |
 | **step 级检查点 / 崩溃恢复** | 每 N 步原子落盘 state，`--resume` 从最近检查点**接着 step 计数**续跑；任务中途 kill 进程不丢进度。**节拍随会话落盘**：`--resume` 不带 `--checkpoint-every` 时沿用会话当初的值，并把生效值打出来 | `/resume` |
-| **step 级分叉 / 会话命名** | `--fork --step K` 从**任意一步**另开一条路（TS 原版的 fork 是**会话级**的，只能从"现在"复制）；`--rename` 给人看得懂的名字，`--sessions` 列出名字 / 步数 / 分叉来源。会话 id **或名字**都能用来 `--resume`。**是对话分叉不是工作区分叉**：文件不回滚到第 K 步，CLI 会明确打出来 | `/fork` · `/rename` · `/resume` |
-| **常驻交互模式（REPL）** | `--repl` 进提示符：**一行输入 = 一个回合**，整个进程共用一份 `messages`，上下文真的接得上（第二回合不重读源码就能接着改）。10 个斜杠命令（`/new` `/resume` `/fork` `/plan` `/goal` `/sessions` `/rename` `/clear-taint` `/help` `/exit`）全部复用已有函数、零新机制。**多回合把四处「单发时看不见」的失效逼了出来**：`terminated_reason` 不复位、`allow_turn` 永不过期、skill 发现每回合重放、中断后 tool 结果配对残缺（详见下表） | `/resume` 后的连续会话 |
+| **step 级分叉 / 会话命名 / 工作区回滚** | `--fork --step K` 从**任意一步**另开一条路（TS 原版的 fork 是**会话级**的，只能从"现在"复制）；`--rename` 给人看得懂的名字，`--sessions` 列出名字 / 步数 / 分叉来源。会话 id **或名字**都能用来 `--resume`。**`--fork` 单独用时只搬对话、文件不动**（CLI 会把这句话打出来）；要连**文件**一起回去就加 `--rewind` —— `--fork --step K --rewind` 就是"倒带重试"，两者共用**同一个 K**（快照挂在同一套 step 级检查点上）。`--rewind` **默认只预览**（git-diff 风格列出恢复/删除/不变三态 + 不在管辖范围的计数），确认了才动盘 | `/fork` · `/rewind` · `/rename` · `/resume` |
+| **常驻交互模式（REPL）** | `--repl` 进提示符：**一行输入 = 一个回合**，整个进程共用一份 `messages`，上下文真的接得上（第二回合不重读源码就能接着改）。11 个斜杠命令（`/new` `/resume` `/fork` `/rewind` `/plan` `/goal` `/sessions` `/rename` `/clear-taint` `/help` `/exit`）全部复用已有函数、零新机制。**多回合把四处「单发时看不见」的失效逼了出来**：`terminated_reason` 不复位、`allow_turn` 永不过期、skill 发现每回合重放、中断后 tool 结果配对残缺（详见下表） | `/resume` 后的连续会话 |
 | **block-at-submit hooks** | `PreToolUse` 包裹 `git commit`，`data/tests_pass.marker` 不存在就**阻断**——逼 agent 进入「测试并修复」循环；marker 只在**测试命令真跑成功**时由 `PostToolUse` 写入，失败即清除 | Hooks（block-at-submit） |
 | **真·轨迹驱动评估** | 从 tinydb 真实 git history 挖 bug 修复提交构造黄金任务，隐藏测试判分，出完成率/成本回归报告 | SWE-bench 思路 |
 | **分层记忆 + 自进化** | `CODEAGENT.md` / `CLAUDE.md` / `.codeagent/rules/*.md` 分层 + `@include` + hash 去重 + 预算；任务后提取约定写回，**下次会话自动生效** | CLAUDE.md 机制 |
@@ -217,7 +217,12 @@ python -m app.cli --plan                 # 只看最近会话的**任务计划�
 python -m app.cli --goal                 # 只看最近会话的**目标**（目标 / 状态 / 完成判据 / 最近判定，不需要 API key）
 python -m app.cli --sessions             # 列出会话：名字 / 步数 / 分叉来源（不需要 API key）
 python -m app.cli --rename "基线方案"      # 给最近会话起名（只动元数据，不需要 API key）
-python -m app.cli --fork --step 3 "换个思路"   # 从第 3 步分叉出新会话并续跑（对话分叉，不动工作区文件）
+python -m app.cli --fork --step 3 "换个思路"   # 从第 3 步分叉出新会话并续跑（**对话**分叉，不动工作区文件）
+python -m app.cli --snapshots            # 列出有工作区快照的会话 + 全局对象库占用 / 孤儿数（不需要 API key）
+python -m app.cli --rewind --step 3      # 回滚**预览**：会覆盖/删除哪些文件，先看再决定（默认不动盘）
+python -m app.cli --rewind --step 3 --force   # 真回滚工作区到第 3 步（覆盖/删除文件，不可逆）
+python -m app.cli --fork --step 3 --rewind --force   # "倒带重试"：对话与文件一起回到第 3 步
+python -m app.cli --drop-snapshots --session-id <id> # 删该会话的快照并回收没人再引用的对象
 python -m app.cli --resume --session-id "基线方案" "接着改"   # 会话 id **或名字**都能指会话
 python -m app.cli --mcp .codeagent/mcp.json "任务"   # 加载 MCP server（第三方工具）
 ```
@@ -241,7 +246,8 @@ python -m app.cli --repl --goal-turns 5     # 目标自动推进一拍最多几�
 /exit          退出（等价于 Ctrl+D，或空行处 Ctrl+C）
 /new           开一个新会话（当前会话留在检查点里，可 /resume 回来）
 /resume        切到某个会话：id 或名字；省略 = 最近一个
-/fork          从当前会话的第 N 步分叉出去并切过去（省略 = 最近检查点）
+/fork          从当前会话的第 N 步分叉出去并切过去（省略 = 最近检查点；只搬**对话**）
+/rewind        把**工作区文件**回滚到第 N 步（省略 = 最近一个有快照的步；默认只预览要确认）
 /plan          打印 agent 自己排的任务计划清单
 /goal          设定并自动推进一个目标；子命令 status / pause [原因] / resume / clear
 /sessions      列出所有会话（名字/步数/检查点数/分叉来源）
@@ -363,7 +369,7 @@ python -m eval.runner --limit 2 --mock           # 无 key 冒烟：只验证管
 **测试**：
 
 ```bash
-python -m pytest tests/                  # 623 passed
+python -m pytest tests/                  # 707 passed（不传第二个 -q，否则那行汇总不打印）
 ```
 
 ---
@@ -430,20 +436,21 @@ $ python -m eval.runner --limit 2
 
 | 层 | 文件 | 行数 |
 |---|---|---|
-| 核心循环 | `agent/loop.py` `llm.py` `state.py` `context.py` `tool_result.py` `session.py` | 2,726 |
+| 核心循环 | `agent/loop.py` `llm.py` `state.py` `context.py` `tool_result.py` `session.py` | 2,835 |
 | 目标 | `agent/goal.py` | 232 |
 | 子代理 | `agent/subagents.py` | 540 |
+| 工作区快照 | `agent/workspace.py` | 814 |
 | 治理 | `agent/permissions.py` `hooks.py` `memory.py` `security.py` | 1,519 |
 | 技能 | `agent/skills.py` | 281 |
-| 工具 | `agent/tools/base.py` `bash.py` `files.py` `web.py` `subagent.py` `ask.py` `plan.py` `goal.py` `skills.py` | 2,280 |
+| 工具 | `agent/tools/base.py` `bash.py` `files.py` `web.py` `subagent.py` `ask.py` `plan.py` `goal.py` `skills.py` | 2,321 |
 | MCP | `agent/mcp.py` | 961 |
-| 入口 | `app/cli.py` `repl.py` `ui_streamlit.py` `replay.py` | 2,178 |
+| 入口 | `app/cli.py` `repl.py` `ui_streamlit.py` `replay.py` | 2,575 |
 | 评估 | `eval/golden_tasks.py` `runner.py` | 490 |
-| **源码合计** | **29 个模块** | **11,207** |
-| 测试 | `tests/` | 11,809（623 个用例） |
+| **源码合计** | **30 个模块** | **12,568** |
+| 测试 | `tests/` | 13,385（707 个用例） |
 
 > 口径：源码 = `agent/` + `app/` + `eval/` 下**非空** `.py` 文件的**全部行数**（含空行；不含 `eval/repos/` 下的克隆仓，它被 gitignore）；模块数 = 其中**非空**的 `.py` 文件数（4 个空 `__init__.py` 不计）。
-> **按文件系统数，不按 git 跟踪数** —— 新文件在提交前也该算进去（M9-5 的 `app/repl.py`(503) 与 `tests/test_repl.py`(785)、M9-6 的 `agent/goal.py`(232) 与 M9-7 的 `agent/subagents.py`(540) 当时都尚未提交）。
+> **按文件系统数，不按 git 跟踪数** —— 新文件在提交前也该算进去（M9-5 的 `app/repl.py`(503) 与 `tests/test_repl.py`(785)、M9-6 的 `agent/goal.py`(232)、M9-7 的 `agent/subagents.py`(540)、M9-8 的 `agent/workspace.py`(814) 与 `tests/test_workspace.py`(785) 当时都尚未提交）。
 
 ---
 
@@ -463,16 +470,16 @@ coding_agent/
 ├── eval/                  # 黄金任务集 + 回归 runner
 ├── tests/                 # pytest（每模块一个文件）
 ├── workspace/             # 演示工作区（.gitignore）
-└── data/                  # 轨迹 / 检查点 / 会话元数据 / 报告（.gitignore）
+└── data/                  # 轨迹 / 检查点 / 会话元数据 / 快照对象库 / 报告（.gitignore）
 ```
 
 ---
 
 ## 设计取舍
 
-**做**：核心循环手写 · 只读工具并发 · diff 语义编辑（唯一匹配 + 失败回喂自修复）· 权限沙箱 · hooks · 三级 compact · 检查点恢复 · 分层记忆 · research 子代理 · 常驻 REPL · 进程内目标 + 显式完成检查 · 轨迹驱动评估。
+**做**：核心循环手写 · 只读工具并发 · diff 语义编辑（唯一匹配 + 失败回喂自修复）· 权限沙箱 · hooks · 三级 compact · 检查点恢复 + **工作区快照回滚（`--rewind`，与 `--fork` 共用同一个 step 坐标系）** · 分层记忆 · 并发子代理 · 常驻 REPL · 进程内目标 + 显式完成检查 · 轨迹驱动评估。
 
-**不做**（范围控制，不是不会）：向量 RAG（CC 自己也是靠 grep/glob/read 检索）· Skills 的安装/市场/权限元数据（只做了 SKILL.md 渐进披露这一层，见能力表）· A2A · 多代理协调器 · 语音 / Vim / 远程 bridge / TUI 组件层——这些是 Claude Code 里「大规模」而非「核心」的部分。
+**不做**（范围控制，不是不会）：向量 RAG（CC 自己也是靠 grep/glob/read 检索）· Skills 的安装/市场/权限元数据（只做了 SKILL.md 渐进披露这一层，见能力表）· A2A · 多代理协调器 · 语音 / Vim / 远程 bridge / TUI 组件层——这些是 Claude Code 里「大规模」而非「核心」的部分。**快照侧明确不做**：自动 GC 与保留策略、快照压缩、增量 diff 链、跨工作区回滚（理由逐条写在 `docs/design/m9-8_rewind.md` §9）。
 
 **硬约束**：LLM 只用 DeepSeek（`deepseek-chat`），测试走 MockLLM · 所有文件操作限制在 `workspace_root` 沙箱内，bash 拦危险命令 · **数据全真实**，agent 操作真实仓库、评估用真实提交，不造假。
 
@@ -532,7 +539,7 @@ coding_agent/
 | S19 | **检查的副作用能替 agent 打开一道治理闸门** | 检查走 `_gate_and_run` → PostToolUse hooks 生效 → 一条成功的 `pytest` 会写 `data/tests_pass.marker`，而 `hooks.default_engine` 正是靠它**解锁 `git commit`**。轨迹上这与模型自己跑同一条命令**不可区分** —— 这是复用同一条门禁链的代价，不是疏漏 |
 | S20 | **「判定无效」比 eval 弱一层** | eval 有 pytest 退出码 2/3/4/5 认得出「压根没跑成」；**shell 没有这个信号** —— `exit 127`（命令不存在）、`No module named pytest` 都会被记成**未通过**而不是无效。只有「被门禁拦下 / 超时 / 工具异常」才算无效 |
 
-另外三条一并写在这里：**①** `/fork` 会连目标一起继承，而检查跑在**当前**工作区上 —— 对话分叉、文件不回滚，所以可能白捡一个通过；**②** 检查通过即结束回合，模型**没有机会**补充「还有一件次要的事没做」（这是把判分权拿走的代价）；**③** 检查超时 120s 是常量、没有旋钮。
+另外三条一并写在这里：**①** `/fork` 会连目标一起继承，而检查跑在**当前**工作区上 —— 单独 `--fork` 时文件不回滚，所以可能白捡一个通过（`--fork --step K --rewind` 时文件也回到第 K 步，这条就不成立了）；**②** 检查通过即结束回合，模型**没有机会**补充「还有一件次要的事没做」（这是把判分权拿走的代价）；**③** 检查超时 120s 是常量、没有旋钮。
 
 ### 三之三、并发子代理（M9-7）
 
@@ -547,7 +554,20 @@ coding_agent/
 | S25 | **worker 的完整轨迹不进父会话 JSONL** | 只留一条摘要事件。理由是父轨迹会进检查点，全量塞进去会让检查点膨胀；代价是**事后无法从父会话回放 worker 的每一步**（要查得靠 worker 自己的落盘目录） |
 | S26 | **用量计入父会话 → 缓存命中率被稀释** | 子代理的 prompt 是独立 system prompt + 独立轨迹，**大多缓存未命中**。所以本 README 的 M9-6 缓存命中率数字只在**没用过子代理的会话**上可比。这是「计入父会话」这个选择的直接后果（另一个选择是单独记账，但那样父会话的成本报告就不完整了） |
 
-**这份清单会过时**：它不是「设计上不允许」，是「截至 `a455dda`（S17–S20 截至 M9-6，S21–S26 截至 M9-7，均尚未提交）还没做」。逐条修掉其中任何一条，都应该同时改这张表。
+### 三之四、工作区回滚（M9-8）
+
+这几条是「只管经 `write`/`edit` 成功写盘的文件、只回到有快照的那几步」这两个选择的**代价**：
+
+| # | 边界 | 说明 |
+|---|---|---|
+| S27 | **管不到 `bash` 与外部工具的一切副作用** | 快照存的是**文件内容**，不是目录树。`rm` / `mv` / 重定向 / `git` 状态 / 测试跑出来的缓存目录、MCP 的写入、**目录**的增删、权限位与 mtime、进程外的任何改动 —— **一条都回不来**。这不是疏漏而是划清责任：`--rewind` 的预览里**永远印着**「回滚区间内有 N 次 bash 调用 + M 次其它可能有副作用的调用」，以及「不在管辖范围内 N 个文件」 |
+| S28 | **只能回到"有快照的那几步"** | 快照与检查点**同一个节拍**（默认每 5 步），所以 `--rewind --step 7` 在只有 5 和 8 两步快照的会话上会**报错**并列出可用步，而不是猜一个盘面出来。夹在两份快照中间的那一步是「不知道」，不是「没有」 |
+| S29 | **读不到原内容的文件干脆不管** | `FileChange.base_unknown`（改动前**存在但读不到**：权限 / 被占用）的路径**不纳入管辖**。把它当成"不存在"，回滚时就会**删掉用户的文件** —— 宁可回滚不到它，也不拿它去赌。代价是这种情况**没有独立出口**：它只是"不在管辖范围"这个计数里的一个，用户看不出"有一个文件本来能管但放弃了" |
+| S30 | **对象库是明文的、全局共享的，而且专门留住了被覆盖的内容** | 这是本项最该知道的一条：为了能还原，`data/snapshots/objects/` 里存着**被 `write`/`edit` 覆盖掉的旧内容**（包括被改掉的密钥类文本），且它**跨会话共享、无加密、无访问控制**。本该"改掉就没了"的东西反而被留了一份。`--drop-snapshots` 是唯一的清理通路，且只回收**没有清单引用**的对象 |
+| S31 | **孤儿对象不自动回收** | 写盘顺序（对象 → 清单 → 检查点）保证被杀只留**孤儿**、不留**说谎的引用**；代价是孤儿会**攒着**，只有人显式 `--drop-snapshots` 才清。对象库全局共享，所以**不能整目录删** —— 回收要把**所有**会话的清单扫一遍现算活跃集 |
+| S32 | **它不回滚对话** | `--rewind` 只动文件；对话由 `--fork --step K`（或 `/fork`）搬。而且模型侧**不是真的"记忆回滚"**：历史里那句"我改了 a.txt"还在，靠 `_reinject_rewind` 补投一句"工作区曾被回滚到第 K 步、你历史里那些改动已经不在盘上了"来纠正 —— 那是**告知**，不是抹掉 |
+
+**这份清单会过时**：它不是「设计上不允许」，是「截至 `3489d83`（S17–S20 截至 M9-6，S21–S26 截至 M9-7，S27–S32 截至 M9-8）还没做」。**M9-1 ~ M9-7 已提交**（`8f766a7` … `3489d83`），而 **M9-8 的代码与本节 S27–S32 这一批改动目前还在工作区里、尚未提交** —— 所以锚点指的是**已提交历史**的末尾，不是磁盘上内容的版本。逐条修掉其中任何一条，都应该同时改这张表。
 
 ### 四、这些是**真跑过真实 LLM** 验出来的（不是单测）
 
@@ -562,6 +582,7 @@ coding_agent/
 | **远程 HTTP MCP**（M9-4） | 真网络 + 真第三方 server：DeepWiki 的 Streamable HTTP 端点，`mcp.json` 里只写 `url` | 握手拿到 `protocolVersion 2025-06-18` / `serverInfo DeepWiki 2.14.3`；DeepSeek 实际调用 `read_wiki_structure(repoName=pallets/flask)` 成功（1 步、2425ms、prompt 6190 token、缓存命中 45%），答案与直连该端点拿到的一致。该 server 是**无状态**的（不回 `Mcp-Session-Id`），客户端照常工作 |
 | **进程内目标**（M9-6） | `--repl` 里用 DeepSeek 官方通路真跑五条动线：① 建目标 → 自动续跑推进 → 声明 → 检查真跑通过 ② 给一条**一开始必然失败**的检查 → 判定未通过 → 回喂 → 继续修 → 再声明 → 通过 ③ `pause` / `resume` ④ 人敲一行字 ⑤ `--resume` 一个有活跃目标的会话 | 五条动线**全部有真实日志**。② 里模型收到 `【完成检查未通过】` + 输出尾部 40 行后真的接着改并再次声明；⑤ 证明检查确实长在 `_run_loop` 里（进程外恢复也照跑） |
 | **并发子代理**（M9-7） | `--repl` 里用 DeepSeek 官方通路真跑四条动线：① `spawn_agent`×3 + 一次 `wait_agent` 收齐 ② 串行 `subagent`×3 作基线 ③ 派一个长任务后**立刻** `close_agent` ④ spawn 后**不等**就回答 | **并发 17.4s vs 串行 29.2s（1.68x）**；`spawn_agent` 各耗时 **0 / 5 / 0 / 0ms**，而串行 `subagent` 是 **5540 / 7686 / 7426ms** —— 这是「句柄立刻返回」在真实会话里的现场，不是单测断言；`close_agent` **1140ms** 返回、状态 `closed`、**无结论**；④ 里 `EventPrinter` 打出 `■ 子代理结算：1 个被叫停、0 个结论没被取走` —— **「结论被丢」这件事真的到达了人眼前**，而且模型自己主动补了一句「子代理只活这一个回合…它的结论会丢失」。两条动线**各自独立**地都找出了 `pkg/beta.py` 里 `except OutOfStock` 不捕获 `ValueError` 的回滚缺口 —— 子代理不是在敷衍 |
+| **工作区回滚 + 倒带重试**（M9-8） | `m9verify/drive_m9_8.py` 六条动线（A 写盘产快照 / B 预览 / C 真回滚 / D `--fork --step K --rewind` / E 磁盘实测 / F `--drop-snapshots`），A~D 用 DeepSeek 官方通路真跑 | B 动线**两次拒绝确认后断言盘面逐字节不变**（预演真的没动盘）；C 动线真回滚：`draft.md: 746 → 378 字节`、`pkg/alpha.py: 2012 → 1949 字节`，预览里三项计数如实印出（`不在管辖范围 3 个文件`、`1 次 bash 调用`）；D 动线一条命令做完两件事：先分叉出 `s20260912-021143`（并打印"这次还带了 `--rewind`"的**分叉后**警告），再回滚 2 个文件，末了给出可直接粘贴的 `--resume --session-id s20260912-021143 --step 5`；**E 动线三条实测数字**：基座 **1949 B / 8892 B = 21.9%**（基座 = 被 `write`/`edit` 碰过的文件的原始字节之和，**不是整个工作区**）、清单 984 B vs 对象 5085 B、**孤儿 0 个**、**fork 增量 0 对象 / 0 字节**（这条直接否掉了"对象库按会话隔离"的初稿）；F 动线删一个会话的 2 份清单 → **回收 1 个对象 / 746 B**，另外 3 个因别的会话仍在引用而保留 |
 
 > **⚠️ 这一条只覆盖到"传输"这一半，如实标注**：`resources` / `prompts` 两个能力面**只对着本地假 server 验证过**。试过的一批公开远端 server 里**没有一个能连上且暴露非空的 resources/prompts**（DNS 不通 / 超时 / 只有 2 个 tools）。两个能力面的**代码路径**是真的（真 socket、真 JSON-RPC、变异测试覆盖），但「接一个真远程 server 读资源」这件事**没跑过**，别讲成跑过。
 > 有意思的是这次真跑给我们的注册条件提供了实证：DeepWiki 在 `initialize` 里**声明了** `resources` 与 `prompts` 两种能力，但两个列表都是空的（原文 `{"resources": []}`）—— 只判能力声明的话，它就会拿到一个**永远调不通**的工具，而「声明了且列表非空」两条都判，它就被正确地跳过了。

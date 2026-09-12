@@ -887,6 +887,9 @@ def test_fork_warns_that_the_workspace_is_not_rolled_back(tmp_path, monkeypatch)
     result = _meta_invoke(tmp_path, monkeypatch, ["--fork", "--step", "2"])
     assert "对话分叉" in result.output
     assert "不会" in result.output and "工作区" in result.output
+    # 而且要说清出口：M9-8 之后"文件也回去"是有命令可用的，只警告不给路等于
+    # 让人以为这是个做不到的事（M7 的教训：走不通的指引比没有指引更糟）。
+    assert "--rewind" in result.output
 
 
 def test_fork_with_a_task_continues_from_the_fork_point(tmp_path, monkeypatch):
@@ -988,6 +991,216 @@ def test_session_name_appears_in_the_plan_banner(tmp_path, monkeypatch):
     assert result.exit_code == 0, result.output
     assert "计划会话" in result.output
 
+
+
+# ---------------------------------------------------------------- M9-8 工作区回滚
+
+
+def _seed_writes_via_cli(tmp_path, monkeypatch, *, cadence: int = 1):
+    """真跑一次 CLI，让 agent **真的写文件** —— 于是会话有工作区快照。
+
+    不能用 `_seed_via_cli`：它喂的是 `read`（只读工具），只落检查点、**一个快照
+    都不落**。拿它来测 `--rewind` 会得到"这一步没有快照"的报错，而那是测试自己
+    的错，不是被测代码的错。
+    """
+    (tmp_path / "a.txt").write_text("v0\n", encoding="utf-8")
+    return _invoke(
+        tmp_path, monkeypatch,
+        MockLLM.script(
+            MockLLM.tool("write", {"path": "a.txt", "content": "v1\n"}).responses[0],
+            LLMResult(content="改完了"),
+        ),
+        extra_args=("--checkpoint-every", str(cadence)),
+        task="把 a.txt 改成 v1",
+    )
+
+
+def test_snapshots_flag_needs_no_key_and_reports_the_object_store(tmp_path, monkeypatch):
+    first = _seed_writes_via_cli(tmp_path, monkeypatch)
+    assert first.exit_code == 0, first.output
+
+    result = _meta_invoke(tmp_path, monkeypatch, ["--snapshots"])
+
+    assert result.exit_code == 0, result.output
+    assert "工作区快照" in result.output
+    assert "全局对象库" in result.output
+    # 孤儿数**必须**报出来：它是写盘顺序的正常残留（对象写完、清单还没写就被杀），
+    # 用户看磁盘时唯一能解释那些"没人引用的字节"的地方。
+    assert "孤儿对象" in result.output
+    assert "s2026" in result.output
+
+
+def test_rewind_without_force_only_previews(tmp_path, monkeypatch):
+    """★ 决议 2：`--rewind` **默认只预览**，文件一个字节都不能变。
+
+    这条是全项里最不能失败的一条 —— 回滚是全项目唯一一个会覆盖和删除用户
+    文件的动作，而"预览"和"执行"之间只差一个 `if`。
+    """
+    _seed_writes_via_cli(tmp_path, monkeypatch)
+    assert (tmp_path / "a.txt").read_text(encoding="utf-8") == "v1\n"
+
+    result = _meta_invoke(tmp_path, monkeypatch, ["--rewind", "--step", "0"])
+
+    assert result.exit_code == 0, result.output
+    assert "回滚预览" in result.output
+    assert "a.txt" in result.output
+    # 盘上必须**原封不动**：预览跑了 restore 的话这里就是 v0
+    assert (tmp_path / "a.txt").read_text(encoding="utf-8") == "v1\n"
+    assert "已取消" in result.output or "继续:" in result.output
+
+
+def test_rewind_with_force_actually_restores(tmp_path, monkeypatch):
+    _seed_writes_via_cli(tmp_path, monkeypatch)
+    assert (tmp_path / "a.txt").read_text(encoding="utf-8") == "v1\n"
+
+    result = _meta_invoke(
+        tmp_path, monkeypatch, ["--rewind", "--step", "0", "--force"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "已回滚" in result.output
+    assert (tmp_path / "a.txt").read_text(encoding="utf-8") == "v0\n"
+
+
+def test_rewind_preview_counts_the_side_effects_it_cannot_undo(tmp_path, monkeypatch):
+    """★ 决议 6：不可回滚的副作用**单独一栏**，不与"不在管辖范围"混为一谈。
+
+    混在一起计数等于替用户把风险抹掉 —— 文件回去了，`git commit` 没有。
+    """
+    (tmp_path / "a.txt").write_text("v0\n", encoding="utf-8")
+    _invoke(
+        tmp_path, monkeypatch,
+        MockLLM.script(
+            MockLLM.tool("write", {"path": "a.txt", "content": "v1\n"}).responses[0],
+            MockLLM.tool("bash", {"command": "echo hi"}).responses[0],
+            LLMResult(content="都做完了"),
+        ),
+        extra_args=("--checkpoint-every", "1"),
+        task="改文件再跑条命令",
+    )
+
+    result = _meta_invoke(tmp_path, monkeypatch, ["--rewind", "--step", "0"])
+
+    assert result.exit_code == 0, result.output
+    assert "不会被回滚的副作用" in result.output
+    assert "bash" in result.output
+
+
+def test_rewind_at_an_unjournaled_step_explains_which_steps_exist(tmp_path, monkeypatch):
+    """夹在两个快照中间、又没有自己快照的步 → 报错并**列出可用步**，不猜。
+
+    （与 `--resume --step K` 的报错同一口径：只报"找不到"等于把用户扔在原地。）
+    """
+    _seed_writes_via_cli(tmp_path, monkeypatch, cadence=1)
+    result = _meta_invoke(tmp_path, monkeypatch, ["--rewind", "--step", "7", "--force"])
+
+    assert result.exit_code == 1, result.output
+    assert "回滚失败" in result.output
+    assert "可用" in result.output
+
+
+def test_rewind_hint_points_forward_to_the_resume_command(tmp_path, monkeypatch):
+    """回滚完打印的下一步必须是**可执行**的，且带上 `--step`。
+
+    不带 `--step` 的那句话会把对话停在最新一步、对着一个回到过去的文件系统干活
+    —— 那正是 `_reinject_rewind` 要兜的错位。M7 的教训：一条走不通的指引比没有
+    指引更糟。
+
+    ★ 这条**刻意不传 `--step`**：传了的话 `--step 0` 会由用户自己的参数出现在
+    输出里，于是"提示里的步号是**解析出来的目标步**"这件事就测不到了（把
+    `hint_step = rewound_step` 改成 `hint_step = step` 照样绿 —— 变异测试实测过）。
+    """
+    _seed_writes_via_cli(tmp_path, monkeypatch)
+    result = _meta_invoke(tmp_path, monkeypatch, ["--rewind", "--force"])
+
+    assert result.exit_code == 0, result.output
+    assert "--resume" in result.output
+    # 不传 --step 时目标是"最近一个有快照的步"= 第 1 步（种子在第 1 步写的文件）
+    assert "--step 1" in result.output
+
+
+def test_fork_plus_rewind_rolls_the_files_back_too(tmp_path, monkeypatch):
+    """★ `--fork --step K --rewind`：**对话与文件一起**回到第 K 步。
+
+    这是"倒带重试"的黄金组合，也是唯一一条会让"分叉不回滚文件"那句话变成假话的
+    动线。回滚那一行如果落在分叉那个 Exit **之后**，分叉会成功、文件却没回去，
+    而命令看上去一切正常（退出码 0、输出齐全、"已分叉"也打出来了）—— 正是本项目
+    的头号缺陷类：机制在、测试绿、没人接线。
+    """
+    _seed_writes_via_cli(tmp_path, monkeypatch)
+    # 分叉点**之后**文件又被改过：不对它做点什么，回滚到第 1 步是个空操作，
+    # 这条测试就会在"回滚压根没跑"的情况下也通过。
+    (tmp_path / "a.txt").write_text("v9\n", encoding="utf-8")
+
+    result = _meta_invoke(
+        tmp_path, monkeypatch, ["--fork", "--step", "1", "--rewind", "--force"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "已分叉" in result.output
+    assert "已回滚" in result.output
+    assert (tmp_path / "a.txt").read_text(encoding="utf-8") == "v1\n"
+    # 分叉那句提示也必须跟着改口径：此时再说"不会回滚"就是假话
+    assert "还带了 --rewind" in result.output
+    assert "--resume" in result.output
+
+
+def test_the_rewind_notice_stays_quiet_when_the_disk_already_matches(tmp_path):
+    """回滚到第 K 步、而恢复到的也正是第 K 步 → **不补投**那条通知。
+
+    `state.step == target` 时第 K 步自己的写入**还在盘上**（`capture(K)` 记的是
+    第 K 步跑完**之后**的盘面），所以"第 K 步之后所有改动都没了"这句话在这里是
+    错的。补投一条错的通知与漏投一条对的通知，是同一类错。
+    """
+    from agent.state import AgentState
+    from app.cli import _reinject_rewind
+
+    state = AgentState(session_id="s", task="任务", system_prompt="sys")
+    state.step = 2
+    state.last_rewind = {"step": 2, "files": 1}
+
+    _reinject_rewind(state)
+
+    assert state.messages == []
+    assert state.events == []
+
+
+def test_resume_tells_the_model_the_workspace_was_rolled_back(tmp_path, monkeypatch):
+    """★ `--rewind` 之后 `--resume`，模型必须**收到一条通知**。
+
+    没有它，模型的历史里写着"我把 a.txt 改成了 v1"、而盘上是 v0 —— 它会照着
+    一份**明确错误**的现状往下推理（比如"上一步已经改好了，跳过"）。这不是记忆
+    模糊，是记忆错了，所以必须有一条消息纠它。
+    """
+    _seed_writes_via_cli(tmp_path, monkeypatch)
+    sid = _latest_sid(tmp_path)
+    _meta_invoke(tmp_path, monkeypatch, ["--rewind", "--step", "0", "--force"])
+
+    captured: list[str] = []
+    _invoke(
+        tmp_path, monkeypatch,
+        MockLLM.script(_capture_tool_messages_responder(captured)),
+        extra_args=("--resume", "--session-id", sid),
+        task="接着干",
+    )
+
+    # 通知走的是 messages 里的 user 消息（模型下一轮就能看见），所以从
+    # system/user 里找 —— tool 消息里不会有它。
+    all_text = "\n".join(captured)
+    assert "回滚" in all_text, captured
+
+
+def _capture_tool_messages_responder(seen: list[str]):
+    """第二次调用响应：把模型收到的**全部**消息抓下来再收尾。"""
+    def responder(messages, tools):  # noqa: ANN001 - MockLLM 回调签名
+        seen.extend(str(m.get("content")) for m in messages)
+        return LLMResult(content="收到")
+    return responder
+
+
+def _latest_sid(tmp_path) -> str:
+    from agent.session import latest_session
+    return latest_session(tmp_path)
 
 
 # ---------------------------------------------------------------- MCP 接线

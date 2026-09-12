@@ -16,7 +16,7 @@
 ```mermaid
 flowchart TB
     subgraph ENTRY["入口层 app/"]
-        CLI["cli.py<br/>typer CLI · --resume · --plan · --goal · --repl"]
+        CLI["cli.py<br/>typer CLI · --resume · --plan · --goal · --repl<br/>--fork · --rewind · --snapshots（M9-8）"]
         REPL["repl.py<br/>常驻交互（M9-5）：一行一个回合<br/>+ 目标自动推进一拍（M9-6）"]
         UI["ui_streamlit.py<br/>实时事件 · 权限按钮 · 指标"]
         RP["replay.py<br/>检查点回放（纯函数）"]
@@ -26,6 +26,7 @@ flowchart TB
         LOOP["loop.py · QueryEngine<br/>+ _verify_goal（M9-6）<br/>+ abort 检查点 ×2 / _settle_workers（M9-7）"]
         GOALN["goal.py<br/>目标状态机 + 三态判定"]
         SUBS["subagents.py<br/>并发子代理管理器（M9-7）"]
+        WS["workspace.py<br/>工作区快照 + 回滚（M9-8）<br/>叶子模块：登记 / 清单 / plan / restore"]
         LLM["llm.py"]
         STATE["state.py"]
         CTX["context.py"]
@@ -68,6 +69,10 @@ flowchart TB
     LOOP --> BASE
     CTX --> TR
     STATE --> LLM
+    LOOP -. 成功后按 file_changes 登记 .-> SESS
+    SESS --> WS
+    CLI --> WS
+    FILES -. FileChange（写盘前的原样字节） .-> WS
     BASE --> BASH
     BASE --> FILES
     BASE --> WEB
@@ -177,7 +182,7 @@ flowchart LR
 `BaseLLM` 两个实现，**接口完全一致**，所以循环、子代理、评估层共用一套代码：
 
 - `DeepSeekClient`：走 openai SDK（DeepSeek 兼容 OpenAI 协议），`chat()` 返回 `LLMResult(content, tool_calls, usage)`，`complete()` 给 compact 摘要用。
-- `MockLLM`：`script(*responses)` 脚本化响应序列 / `text("...")` 固定响应 / `tool_then_text(...)`。**测试与无 key 演示都靠它**——623 个测试全部离线，不打网络。
+- `MockLLM`：`script(*responses)` 脚本化响应序列 / `text("...")` 固定响应 / `tool_then_text(...)`。**测试与无 key 演示都靠它**——707 个测试全部离线，不打网络。
 
 `Usage` 里单独保留 `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`——这是 DeepSeek 磁盘缓存的**实测**字段，整个缓存命中率指标和成本估算都建立在它之上（不是估算出来的）。
 
@@ -289,11 +294,12 @@ sequenceDiagram
 ```bash
 python -m app.cli --sessions                        # 列出会话：名字 / 步数 / 分叉来源
 python -m app.cli --rename "基线方案"                # 给最近会话起名（只动元数据，不需要 key）
-python -m app.cli --fork --step 3 --rename "换个思路"  # 从第 3 步分叉（对话分叉，不动工作区）
+python -m app.cli --fork --step 3 --rename "换个思路"  # 从第 3 步分叉（**对话**分叉，不动工作区）
 python -m app.cli --resume --session-id "换个思路" "接着改"   # 名字和 id 都能用来指会话
 ```
 
-**它是对话分叉，不是工作区分叉。** 工作区文件**不会**回滚到第 K 步的样子，分叉后的 agent 看到的是**当前**的工作区 —— 我们**没有**工作区快照机制（`grep rewind|snapshot` 在 `agent/ app/` 下零命中）。CLI 分叉后把这句打印出来，`--fork` 的 help 也写明。
+**单独用时，它是对话分叉，不是工作区分叉。** 工作区文件**不会**回滚到第 K 步的样子，分叉后的 agent 看到的是**当前**的工作区。CLI 分叉后把这句打印出来，`--fork` 的 help 也写明。
+**M9-8 之后这句话有了正面出口**：加 `--rewind` 就让文件也回到第 K 步（见 §3.10）。**而且这句话本身必须跟着 `--rewind` 分叉写** —— M9-8 之前它无条件说"工作区不会回滚"（那时是真的，没有回滚机制），现在带着 `--rewind` 时它会变成假话，而假话比不说更糟。
 
 | 产物 | 路径 | 内容 |
 |---|---|---|
@@ -513,6 +519,63 @@ finally:
 `concurrent.futures.thread` 装了 `atexit` join 钩子，一个卡在 120s `llm.chat` 里的 worker 会让
 **解释器退出被拖住最多两分钟**（症状是"为什么 CLI 退不出去"）。worker 的输出只经句柄交付，
 所以拆掉它是结构上安全的。
+
+### 3.10 工作区回滚快照（`agent/workspace.py`，M9-8）
+
+§3.6 的分叉是**对话**坐标系上的事，`/rewind` 是**文件**坐标系上的事，两者共用**同一个 step**：
+`--fork --step K --rewind` 一条命令做完"倒带重试"，这不是约定，是"快照挂在同一套 step 级检查点上"的结构性结果。
+
+```mermaid
+flowchart LR
+    W["write / edit<br/>（写盘**之前**读出原样字节）"] -->|ToolResult.file_changes| G["loop._gate_and_run<br/>工具成功后 note_write"]
+    G --> P["_pending：rel → 改动前的字节"]
+    P -->|每 N 步 capture| O["对象库（**全局共享**）<br/>data/snapshots/objects/aa/&lt;sha&gt;.bin"]
+    P --> M["全量清单（按会话隔离）<br/>data/checkpoints/&lt;sid&gt;/ws/step-K.json"]
+    O --> M
+    M -->|"capture 跑完，Session._write 才落检查点"| C["data/checkpoints/&lt;sid&gt;/step-K.json"]
+    M --> PLAN["plan(K)：纯读，产出回滚预览"]
+    PLAN -->|"人确认 / --force"| R["restore：逐文件还原或删除"]
+```
+
+**存储布局与两条分界**：
+
+| 产物 | 路径 | 隔离粒度 | 为什么 |
+|---|---|---|---|
+| 内容寻址对象库 | `data/snapshots/objects/{sha[:2]}/{sha}.bin` | **全局共享**（跨会话） | 同一份内容（项目初始文件、被改回原样的版本）只存一份。实测 **`--fork` 的对象增量为 0 个 / 0 字节**（只有清单 +599 B）—— 这条实测否掉了初稿"按会话隔离"的选择 |
+| 每步全量清单 | `data/checkpoints/{sid}/ws/step-K.json` | 按会话 | "到第 K 步为止我管过哪些路径"是**会话事实**，与检查点同一个坐标系 |
+
+**三条不变式**（每条有测试钉着）：
+
+1. **`path ∈ manifest[K]` ⟺ `first_touch(path) ≤ K`** → 清单是**全量**的，每一步都能**独立还原**。
+   代价是每步多写一份清单（几十行 JSON），换来的是不必"按序重放前像" —— 那种方案在中间缺一环时
+   会**静默还原出错**。
+2. **`base`（我们碰它之前它长什么样）只记在首触那一步的清单里**。没有它，"回滚到第一次修改之前"
+   就只能**删掉那个文件** —— 而它可能是仓库里人写的、我们并不认识的文件。
+3. **写盘顺序：对象 → 清单 → 检查点**。`capture` 整个跑完 `Session._write` 才落检查点，所以任何一步
+   被杀留下的都只能是**孤儿**（不可达的字节），不能是**说谎的引用**（检查点说有快照、快照却不存在）。
+   孤儿**如实报出、不自动删**。
+
+**`plan(K)` 的四支**：`K` 落在快照步上用那份清单；`K = None` 取最近一个**有快照**的步（不是最近检查点：
+M9-8 之前的会话有检查点没有快照）；**`K < lo`（`lo = min(manifests)`，含 `--step 0`）→ 撤销我们做过的一切**
+（所有受管路径回到各自的 `base`）；夹在中间没落快照的步 → **报错**，不猜。
+`K < lo` 那一支**必须单独存在**：节拍是 5 时第一个清单落在第 5 步、而 `plan(5)` 读的是第 5 步**盘面**
+（写完之后的），于是"撤销 agent 做过的一切"在最常见的形状下根本表达不出来 —— **没有这一支 `base` 是结构上不可达的**。
+
+**"不在管辖范围"是独立维度**（分开计数）：`plan` 同时给出 `outside`（没被 write/edit 碰过的文件数）、
+`shell_calls`（回滚区间内 `bash` 调用数）、`other_calls`。把"文件系统回滚"与"不可回滚的外部副作用"
+混为一谈是推卸责任 —— 所以它们**跟着预览一起印出来**，且 `outside` 的口径写死在一处。
+
+**`--rewind` 默认只预览 + 二次确认（默认 n）**：`plan()` 是纯读的。理由不是保守 —— 回滚是**全项目
+唯一一个不可逆的写操作**（对象库留了旧字节，但被覆盖的文件本身没有 undo）。
+
+**回滚之后必须告诉模型**：模型历史里写着"我改了 a.txt"，而盘上那改动已经没了，它会基于**不存在的现状**
+往下推理。触发判据是 `state.step > target`（等于或早于时历史与盘面一致，补投是噪音还会破缓存），
+`last_rewind` 落 **meta 而不是只打印**（打印的字留在上个进程的屏上，下个进程要读文件）。
+
+**不需要锁**：对象与清单**只由父线程写** —— 写工具不是只读工具，走串行分支；worker 的引擎 `session=None`，
+结构上拿不到本模块（与"worker 写不了检查点"是同一条保证，不另加守卫）。全局对象库的并发写实测
+（8 线程 × 5 轮 × 6 次重跑）：**裸 `os.replace` 冲突 24~30/40（Windows `PermissionError(13)`），
+经 `_put_object` 未捕获异常 0 次** —— 容错就是"看目标在不在"（内容寻址，同 sha 必同内容），**不是加锁**。
 
 ## 4. 治理层
 
@@ -798,6 +861,8 @@ flowchart LR
 | `data/sessions/{sid}.jsonl` | `Session.emit` | 每事件一行 | 回放、审计 |
 | `data/checkpoints/{sid}/step-N.json` | `Session._write` | state 快照（原子写） | `--resume`、控制台回放 |
 | `data/tool-results/{sid}/{id}.txt` | `ToolResultStore` | 超大工具结果原文 | 模型按路径读回 |
+| `data/snapshots/objects/{aa}/{sha}.bin` | `workspace._put_object` | 内容寻址的**原样字节**（全局共享；含被覆盖掉的旧内容） | `restore` 还原、`--snapshots` 统计 |
+| `data/checkpoints/{sid}/ws/step-N.json` | `workspace.capture` | 每步**全量**清单（受管路径 → sha / missing / base） | `plan()`、`--rewind`、fork 搬 K 之前的清单 |
 | `data/tests_pass.marker` | `mark_tests_pass()` | 测试通过标记 | block-at-submit hook |
 | `.codeagent/rules/learned.md` | `save_learned` | 任务中提炼的约定 | 下次会话的 `discover` |
 | `data/eval/report-*.json` | `eval.runner` | 回归报告 | 人 / CI |

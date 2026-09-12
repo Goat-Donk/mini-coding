@@ -20,7 +20,9 @@ agent/loop.py  (QueryEngine，唯一编排者)
   ├── context.py    (消息布局/预算/compact —— M3 补)
   ├── permissions.py (allow/deny/ask —— M2 补)
   ├── hooks.py      (Pre/PostToolUse —— M2 补)
-  ├── session.py    (轨迹/检查点/resume —— M3 补)
+  ├── session.py    (轨迹/检查点/resume/fork —— M3 补，M9-3 补元数据)
+  ├── workspace.py  (工作区快照 + 回滚 —— M9-8 补)
+  ├── subagents.py  (并发子代理管理器 —— M9-7 补)
   └── memory.py     (repo 记忆 —— M4 补)
 ```
 
@@ -150,12 +152,23 @@ class ToolResult:
     data: dict | None = None    # 结构化数据
     error: str | None = None
     duration_ms: int = 0
+    await_user: bool = False    # M8：工具声明"本轮到此为止，等人回答"（是数据标志，不是阻塞）
+    file_changes: tuple["FileChange", ...] = ()   # ★M9-8：这次调用**成功写盘**的文件改动
     @staticmethod
-    def ok(output: str, data: dict | None = None) -> "ToolResult"
+    def ok(output, data=None, *, await_user=False, file_changes=()) -> "ToolResult"
     @staticmethod
     def fail(error: str, output: str | None = None) -> "ToolResult"
         # fail 时 output 默认 = f"工具执行失败: {error}"（回喂模型，可自修复）
 ```
+
+**`file_changes`（M9-8）为什么必须由工具报告**：登记发生在工具跑完**之后**，那时旧内容
+已经被覆盖掉了。`EditTool` 的 diff 预览虽然算出了旧内容，但那是对 `errors="replace"`
+解出来的文本重新编码，**未必等于盘上的字节**；`WriteTool` 更是一路都不需要旧内容。
+所以工具在写盘**之前**把 `FileChange{path, before, base_unknown}` 报告出来，`loop._gate_and_run`
+在成功后逐条 `note_write` —— 这是工作区快照的**唯一**登记来源，且"权限拒绝的那次调用压根没
+执行 / edit 匹配失败 / 工具自己抛了"三种情况**结构上**走不到登记那一行，不靠谁记得判断。
+`base_unknown=True`（改动前存在但读不到）的路径**不纳入管辖**：把它当成"不存在"，回滚时就会
+**删掉用户的文件**（`agent/workspace.py` 不变式 2 的同一个理由）。
 
 ### 2.2 ToolContext
 
@@ -168,6 +181,7 @@ class ToolContext:
     permissions: object | None = None              # M2 接入
     hooks: object | None = None                    # M2 接入
     state: "AgentState | None" = None              # M8 接入（update_plan 经它写 state.plan）
+    workers: "AgentWorkers | None" = None          # ★M9-7 接入（5 个子代理工具经它 spawn/wait/close）
 ```
 
 > **`state` 曾经是"声明了但没人填"的缺口**（`emitter` 也一样：两个槽位都声明了，而
@@ -175,6 +189,8 @@ class ToolContext:
 > **而且不报错** —— 直到 M8 的 `update_plan` 成了第一个真读者，这个缺口才暴露。
 > 原 `settings: dict` 字段已删除：全项目没有任何读者，是同一个缺口的另一半。
 > 现在 `tests/test_plan.py::test_context_state_is_filled_by_the_real_loop` 钉住它。
+> **`workers`（M9-7）是第三个同类槽位**，所以它一并带上了守卫：`ctx.workers is None`
+> 时 5 个子代理工具返回 `ToolResult.fail` 并**说明这是接线缺口**，而不是静默降级或抛异常。
 
 ### 2.3 Tool 基类
 
@@ -822,20 +838,21 @@ BURST_STOP_REASONS = {"await_user", REASON_GOAL_CHECK_INVALID, REASON_GOAL_DONE,
 | **S19** | **检查的副作用能替 agent 打开一道治理闸门**：检查走 `_gate_and_run` → PostToolUse hooks 生效 → 一条成功的 `pytest` 会写 `data/tests_pass.marker`，而它正是解锁 `git commit` 的那道门。轨迹上与模型自己跑同一条命令**不可区分** —— 复用同一条链的代价，不是疏漏 |
 | **S20** | **「判定无效」比 eval 弱一层**：eval 有 pytest 的退出码 2/3/4/5 认得出"压根没跑成"，**shell 没有这个信号** —— `exit 127`、`No module named pytest` 都会被记成**未通过**。只有门禁拦下 / 超时 / 工具异常才算无效 |
 
-另记：`/fork` 会连目标一起继承而检查跑在**当前**工作区上（对话分叉、文件不回滚 → 可能白捡一个通过）；
+另记：`/fork` 会连目标一起继承而检查跑在**当前**工作区上（单独 `--fork` 时文件不回滚 →
+可能白捡一个通过；`--fork --step K --rewind` 时文件也回到第 K 步，这条就不成立了 —— 见 §9.13）；
 通过即结束回合，模型没有机会补充「还有一件次要的事没做」（这是把判分权拿走的**代价**）；检查超时
 120s 是常量、没有旋钮；`state.task` 会被续跑文本覆写（目标本身才是权威）。
 
 ### 4e.12 测试与真实验证
 
-- `tests/test_goal.py` **38 例** + `tests/test_repl.py` / `tests/test_session.py` 补契约；全量 **597 全绿**（M9-6 当时的数字；M9-7 之后为 623）。
+- `tests/test_goal.py` **38 例** + `tests/test_repl.py` / `tests/test_session.py` 补契约；全量 **597 全绿**（M9-6 当时的数字；M9-7 之后为 623、M9-8 之后为 **707**）。
   重点用例：创建时 `objective`/`check_command` **逐字落库**、`pause` 存原因 / `resume` **必须清
   `pause_reason`**、`clear` → `None`（杀"实现成置 done"）、已有活跃目标时拒绝第二个、检查跑的是
   `check_command` 原文、exit≠0 **保持 active 且本轮继续**、失败判定以 `user` 消息回喂、**门禁拦下 →
   `invalid` 而非 `failed`**（且不记 `goal_completed`）、一次声明**恰好**跑一次检查、输出截到最后 40 行、
   schema 扁平无 `$defs`、一拍自动跑多个回合、**`dump_state` → `load_state` 回来是 `Goal` 实例不是 `dict`**、
   暂停跨进程往返后仍门住一拍、`--goal` 不碰 LLM（`_build_llm` 换成 boom）、`/help` 键集合恰好等于
-  `_COMMANDS`（计数 10）、真 `BashTool` + 真 permissions 下检查**真的**过门禁链（`gate_block` 带
+  `_COMMANDS`（M9-6 时计数 10，M9-8 加 `/rewind` 后为 11）、真 `BashTool` + 真 permissions 下检查**真的**过门禁链（`gate_block` 带
   `source`/`reason`）。
 - 变异测试 **20/20 被抓住**（`m9verify/mutate_m9_6.py`）。**一个如实标注的 MISS**：「人工回合不暂停」
   实证 MISS，原因是**结构性的** —— `loop()` 进提示符前必先跑一拍 + `_run_goal_burst` 结尾必暂停 →
@@ -1432,7 +1449,7 @@ class Repl:
 也照样不看；★M9-6 的 `goal:<status>` 同理，**只在有目标时显示**，因为 `active` 与 `paused`
 下面会发生完全不一样的事）。
 
-**10 个斜杠命令**（每个都复用已有函数、零新机制）：
+**11 个斜杠命令**（每个都复用已有函数、零新机制）：
 
 | 命令 | 复用 |
 |---|---|
@@ -1440,12 +1457,17 @@ class Repl:
 | `/exit` | **标志位**而不是 `typer.Exit`（后者会被 `_dispatch` 的 except 吞掉） |
 | `/new` | `Session` + `engine.new_state("")` → `_activate` |
 | `/resume [id\|名字]` | `_resolve_session_ref` + `Session.from_checkpoint` |
-| `/fork [步]` | `cli._do_fork` |
+| `/fork [步]` | `cli._do_fork`（**只搬对话**） |
+| `/rewind [步]` | ★M9-8：`cli._do_rewind`（**只搬文件**，默认预览 + `_confirm_rewind`） |
 | `/plan` | `render_plan`（空清单不复用"已清空"文案 —— 那是 `update_plan` 清空动作的说法） |
 | `/goal …` | ★M9-6：`render_goal` + `Goal` 状态机 + `_run_goal_burst`（完整规格见 §4e.8） |
 | `/sessions` | `cli._print_sessions` |
 | `/rename <名>` | `set_session_name` |
 | `/clear-taint` | `state.clear_taint(reason="repl:/clear-taint")` —— **人的动作** |
+
+> ★M9-8 的 `/rewind` 与 `/fork` 是**两个方向上的同一件事**（一个动对话、一个动文件），
+> 拼起来才是 CLI 里的 `--fork --step K --rewind`。REPL 里的 `_confirm_rewind` 用 `input()`
+> **而不是** `typer.prompt`：常驻模式里后者会和 REPL 自己的行读取打架。
 
 > ★M9-6 的 `/goal` 是**唯一一个有自己的状态机**的命令（其余九个都是"转发给已有函数"），
 > 但它同样没往 REPL 里引新机制：自动推进就是**连着调 `run_turn`**，暂停就是**改一个数据字段**。
@@ -1489,8 +1511,31 @@ class Repl:
 没有历史滚动。多行输入缓冲 / 历史文件 `readline` / 自动补全也都不做 —— 那是纯终端
 体验的体力活，对这份作品集要回答的问题（循环、上下文、权限、可恢复性）不加分。
 
-**测试**：`tests/test_repl.py`（34 例）。本仓第一条 `CliRunner(input=...)` 的 stdin
+**测试**：`tests/test_repl.py`（34 例，M9-8 后为 40 例）。本仓第一条 `CliRunner(input=...)` 的 stdin
 端到端也在其中（7 例）—— 在这之前 `tests/test_cli.py` 没有任何 stdin 测试。
+
+### 8.4 `--snapshots` / `--drop-snapshots` / `--rewind`（★M9-8）
+
+```python
+def _render_rewind_preview(plan: RestorePlan) -> str          # git-diff 风格，四类 + 三个计数字段
+def _do_rewind(workspace_root, sid, step, *, force, confirm=None) -> int | None
+    # 返回**已经落在那一步的目标步号**，没执行则 None（调用方拿它拼 --resume --step K）
+def _reinject_rewind(state) -> None                           # 恢复会话时补投"工作区被回滚过"
+def _print_snapshots(workspace_root) -> None                  # --snapshots：会话清单 + 对象库占用
+def _do_drop_snapshots(workspace_root, ref) -> None           # --drop-snapshots：删清单 + 回收
+```
+
+- **`_do_rewind` 返回步号而不是 bool**：调用方要拿它拼"继续"那句 `--resume --step K`，
+  而目标步号在 `plan()` 里才定下来（`step=None` 时取最近一个有快照的步）—— 调用方自己算
+  会算错，而算错的那句话会把人引到一个**错位的对话**上。
+- **没有 changes 时不弹确认框，但仍返回步号**：`plan.changes` 为空说明工作区已经是那一步的
+  样子，可"对话该回到哪一步"这个信息仍然要给。
+- **部分失败不退非零退出码**：回滚本身做完了，失败的是其中几个文件；项目里的退出码语义是
+  "命令有没有做成"，混起来会让脚本判错 —— 所以逐条红字报出 `(文件, 原因)` 就够。
+- **`--snapshots` 与 `--sessions` 是两张表，不能合并**：一个列**对话**、一个列**文件**；
+  一个会话完全可能有检查点却一个快照都没有（从没改过文件，或 M9-8 之前建的）。
+- **`--drop-snapshots` 不动检查点**（输出里明说"该会话的检查点未动，仍可 `--resume`；
+  仅 `--rewind` 对这几步失效"）—— 删的只是快照，`--resume` 与 `--fork` 照常。
 
 ---
 
@@ -1653,10 +1698,13 @@ def default_fork_name(workspace_root, source_id, fork_step) -> str  # "{源名} 
 - **分叉挂在 step 级检查点上**（与 TS 原版的差别）：它的 `/fork` 是**会话级**的
   （整段复制、从"现在"接着走）；我们逐 step 落检查点，于是 `--fork --step K`
   可以**回到任意一步**再开一条路，这个能力是现成的。
-- **它是对话分叉，不是工作区分叉** —— 必须说清楚，否则极容易被读成"时光倒流"：
+- **单独用时，它是对话分叉，不是工作区分叉** —— 必须说清楚，否则极容易被读成"时光倒流"：
   工作区（文件）**不会**回滚到第 K 步的样子，分叉后的 agent 看到的是**当前**工作区。
-  我们**没有**工作区快照机制（`grep rewind|snapshot` 在 `agent/ app/` 下零命中，2026-09-11
-  核实）。CLI 分叉后把这句**打印出来**，help 里也写明。
+  （**M9-8 之后**这句话有了正面出口：加 `--rewind` 就让文件也回到第 K 步 —— 见 §9.13。
+  `--fork` 单独用时仍然只搬对话，这是刻意的：动文件要人显式说。）CLI 分叉后把这句
+  **打印出来**，help 里也写明。**这句话必须跟着 `--rewind` 分叉写** —— M9-8 之前它无条件
+  说"工作区不会回滚"，那时它是真的（没有回滚机制）；现在带着 `--rewind` 时它会变成假话，
+  而假话比不说更糟（本项目记录在案的头号缺陷类）。
 - fork 搬三样，都以 `fork_step` 为界：
   1. **检查点 `step-1..fork_step`** → 新会话因此能 `--resume --step K` 回到其中任意一步；
   2. **轨迹里 `step <= fork_step` 的行**。**不能整份复制**：轨迹是追加的，源会话在
@@ -2232,6 +2280,145 @@ def build_web_tools() -> list[Tool]
 - 测试：`tests/test_tools.py`（+73 例）+ `tests/test_permissions.py`（+6 例，含「三类不可逆动作各有一个触发工具真的在 `default()` 里」这条不变量）。变异测试 31/31（`m9verify/mutate_m9_2.py`）。
 - **如实标注**：默认后端 `ddg` 在本机连不通（直连超时 / 代理 SSL 中断），其解析正则**未经真实响应校准**；真跑走 `bing`。**只读并发批内，外发与产生污染的读同时执行**，该次外发按批前级别判定 —— 物理顺序，不是漏洞，见 `docs/architecture.md` §4。
 
+### 9.13 agent/workspace.py（★M9-8：工作区快照 + 回滚）
+
+**文件**：`agent/workspace.py`（814 行）；设计文档 `docs/design/m9-8_rewind.md`（含六条决议）。
+
+它把一条**已经写进五处文档**的如实标注（"`--fork` 只分叉对话、工作区文件不回滚"）
+变成"已修"，且回滚挂在**已有的 step 级检查点**上 —— `--rewind --step K` 与
+`--fork --step K` 指的是**同一个 K**，这一点是结构性的，不靠约定。
+
+```python
+MANIFEST_DIRNAME = "ws";  SCHEMA = 1
+_EXCLUDED_TOP = ("data", ".git")              # 不纳入管辖的顶层目录
+_NO_SIDE_EFFECT_TOOLS = frozenset({...})      # 判据方向：默认"算有副作用"（多报，不漏报）
+
+@dataclass(frozen=True)
+class FileChange:        # 由工具报告（见 §2.1）；before=None 表示"改动前不存在"
+    path: Path; before: bytes | None; base_unknown: bool = False
+@dataclass(frozen=True)
+class RestoreAction:     # kind ∈ {restore, delete, same, unresolvable}
+    kind: str; rel: str; sha256: str | None; target_size: int; current_size: int | None
+@dataclass(frozen=True)
+class RestorePlan:       # 预览：改什么 + 不在管辖范围内的计数
+    session_id: str; target_step: int; actions: tuple[RestoreAction, ...]
+    outside: int; shell_calls: int; other_calls: int
+    @property changes / unchanged        # changes = 真正会动盘的（排除 same）
+@dataclass(frozen=True)
+class RestoreReport:     # 执行结果：**逐文件**记录成败
+    plan: RestorePlan; done: tuple[...]; failures: tuple[tuple[str, str], ...]
+@dataclass(frozen=True)  class SnapshotUsage:  session_id / steps / manifest_bytes
+@dataclass(frozen=True)  class ObjectStoreStats: objects / total_bytes / orphans / orphan_bytes / live
+@dataclass(frozen=True)  class DropResult:  manifests_removed / objects_removed / bytes_freed / kept_shared
+class SnapshotError(Exception): ...          # 消息要能直接给人看
+
+def objects_root(workspace_root) -> Path                     # data/snapshots/objects/（全局）
+def object_store_stats(workspace_root) -> ObjectStoreStats    # 含孤儿统计
+def list_snapshot_sessions(workspace_root) -> list[SnapshotUsage]   # 新→旧
+def drop_snapshots(workspace_root, session_id) -> DropResult  # 删清单 + 现算活跃集回收对象
+
+class WorkspaceSnapshots:
+    def __init__(self, workspace_root, session_id)
+    def note_write(self, change: FileChange) -> bool          # 登记（只在工具成功后调用）
+    def capture(self, step: int) -> Path | None               # 落清单+对象；没管过文件 → None
+    def steps() / latest_step() / usage()
+    def read_manifest(self, step) / import_manifest(self, step, payload)   # fork 搬清单用
+    def plan(self, step: int | None = None) -> RestorePlan     # 纯读，不动盘
+    def restore(self, plan: RestorePlan) -> RestoreReport
+```
+
+**存储布局**（决议 5：对象库**全局共享**、清单**按会话隔离**）：
+
+```
+data/snapshots/objects/{sha[:2]}/{sha}.bin     ← 全局共享的内容寻址对象库
+data/checkpoints/{sid}/ws/step-{K}.json        ← 每步一份的**全量清单**
+```
+
+**为什么对象全局共享**（这条是实测推翻初稿的）：E 动线实测 `--fork` 的**对象增量为
+0 个 / 0 字节**（只有清单 +599 B）—— 项目初始文件、被改回原样的内容全都命中同一份
+对象。按会话隔离会让同一份内容在每个会话里各存一遍。代价有两条且都认了：
+① 回收不能整目录删 → `drop_snapshots` **现算 live set**；② 并发写同一目标 →
+见下面"不需要锁"。
+
+**三条不变式**（每条都有测试钉着）：
+
+1. **`path ∈ manifest[K]` ⟺ `first_touch(path) ≤ K`**。于是清单是**全量**的：只要
+   `K >= first_touch`，还原所需信息全在 `manifest[K]` 里，不用往前翻。代价是每步多写
+   一份清单（几十行 JSON），换来的是**每一步都能独立还原** —— "按序重放前像"的方案
+   在中间缺一环时会**静默还原出错**。
+2. **`base`（"我们碰它之前它长什么样"）只记在它首次出现那一步的清单里**。没有它，
+   "回滚到第一次修改之前"就只能**删掉那个文件** —— 而它可能是仓库里人写的、我们并不
+   认识的文件。那是一次静默的数据破坏。
+3. **写盘顺序：对象 → 清单 → 检查点**。`capture` 整个跑完 `Session._write` 才落检查点。
+   任何一步被杀，留下的都只能是**孤儿**（不可达的字节），不能是**说谎的引用**
+   （检查点说有快照、快照却不存在）。孤儿**如实报出、不自动删**。
+
+**`plan(K)` 的四支，`K < lo` 那支是必须单独有的**：
+
+| K | 语义 |
+|---|---|
+| `K` 落在已有快照步上 | 用 `manifest[K]` 的盘面（不变式 1） |
+| `K = None` | 最近一个**有快照**的步（**不是**最近检查点：M9-8 之前的会话有检查点没有快照） |
+| `K < lo`（`lo = min(manifests)`，含 `--step 0`） | **撤销我们做过的一切**：所有受管路径回到各自的 `base` |
+| `lo <= K` 但该步没落快照 | **报错**（`第 K 步没有工作区快照。可用: [...]`），不猜 |
+
+**`K < lo` 不是"顺手兼容"**：节拍是 5 时第一个清单落在第 5 步，而 `plan(5)` 读的是第 5
+步**盘面**（写完之后的），于是"撤销 agent 做的一切"这件事在最常见的形状下**根本表达
+不出来** —— 记了 `base` 却没人能用它。**没有这一支，`base` 是结构上不可达的。**
+夹在两快照中间的步（快照在 5 和 10、要回到 7）**仍然报错**：那是"不知道"，不是"没有"。
+
+**"不在管辖范围"是独立维度，分开计数**（决议 6）：`RestorePlan` 同时带 `outside`
+（没被 `write`/`edit` 碰过的文件数）、`shell_calls`（回滚区间内 `bash` 调用数）、
+`other_calls`。**把"文件系统回滚"与"不可回滚的外部副作用"混为一谈是推卸责任** ——
+所以 `bash` 的 `rm`/`mv`/重定向、MCP 的写入、目录增删、元数据（权限位/mtime）、
+进程外的一切都**明说不管**，且这三个数**跟着预览一起印出来**。`outside` 的口径写死
+在一处（递归跳过 `GrepTool.SKIP_DIRS` 与点开头目录再减受管集合）：**口径含糊的计数
+比不报还糟**。区间是**左开**的 `(target_step, 最新检查点]`，数据源是最新检查点的
+`state.events`（`dump_state` 落全字段、事件不截断）。
+
+**不需要锁（决议 7，实测支撑）**：对象与清单只由**父线程**写 —— 写工具不是只读工具，
+走 `_execute_tool_calls` 的串行分支；子代理（worker）的引擎 `session=None`，结构上
+拿不到本模块（与"worker 写不了检查点"是同一条保证，不另加守卫）。全局共享对象库理论上
+有并发写同一 `{sha}.bin` 的可能，实测（`m9verify/drive_m9_8.py` E 动线，8 线程 × 5 轮，
+六次独立重跑）**裸 `os.replace` 冲突 24~30/40 次（全是 Windows `PermissionError(13)`），
+而经 `_put_object` 未捕获异常 0 次** —— 容错就是"看目标在不在"（内容寻址，同 sha 必然
+同内容），**不是加锁**。如实标注：Linux 上 `os.replace` 到同一目标不抛，那条容错分支
+可能是死代码。
+
+**`--rewind` 默认只预览、二次确认**（决议 2）：`plan()` 是纯读的，输出 git-diff 风格的
+预览（`恢复/删除/不变/无法还原` 四类 + 三个"不在管辖范围"的数），确认框**默认 n**。
+理由不是保守：回滚是**全项目唯一一个不可逆的写操作**（对象库留了旧字节，但被覆盖的
+文件本身没有 undo）。`--force` 跳过此问；没有 changes 时不弹框但仍返回步号（调用方靠它
+拼"继续"那句 `--resume --step K`）。REPL 里是 `/rewind [step]`，`_confirm_rewind` 用
+`input()` 而**不是** `typer.prompt`（常驻模式里后者会和自己的行读取打架）。
+
+**回滚之后必须告诉模型**（`app/cli.py::_reinject_rewind`）：模型历史里写着"我改了 a.txt"，
+而盘上那改动已经没了，它会基于**不存在的现状**往下推理。触发判据是 `state.step > target`
+（等于或早于时历史与盘面一致，补投反而是噪音，还会平白改一次消息前缀、破缓存）。
+`last_rewind` 落 meta 而**不是**只打印 —— 打印的字留在上一个进程的屏上，而下个进程要读文件；
+`Session._load_payload` 把它取回 `state.last_rewind`，与 `_reinject_plan`/`_reinject_goal`
+同一条纪律。**同理，`--fork` 那句"工作区文件不会回滚"必须跟着 `--rewind` 分叉写** ——
+M9-8 之前它无条件说是真的，现在带着 `--rewind` 时它会变成假话。
+
+**`--fork --step K --rewind`**（决议 3，P1 的"倒带重试"黄金组合）：fork 搬**对话**
+（检查点 1..K + 轨迹里 `step <= K` 的行 + `forked_from`），rewind 搬**文件**。
+`Session._copy_snapshots` 只复制 `ws/step-n.json`（n ≤ K）、**一个对象都不复制** ——
+对象库全局共享，分叉带过来的清单里的 sha 在原库仍可读。这也是"删掉源会话会不会弄坏
+分叉"的答案：不会，`drop_snapshots` 的活跃集按**所有**清单算，分叉的清单算在内。
+分叉点之后的清单**不搬**是对的：那是源会话在分叉点之后的历史，搬过去就是**说谎的记录**。
+
+- 测试：`tests/test_workspace.py` **49 例** + 接线契约 22 例（cli 8 / repl 6 / session 8）；全量 **707 全绿**。变异测试
+  **35/35 零 SKIP 零 MISS**（`m9verify/mutate_m9_8.py`），其中五处是**证明后不设**的候选。
+  边界测试逐条点名见 `docs/design/m9-8_rewind.md` §7。
+- **真实动线 A~F 全部有日志**（`m9verify/drive_m9_8.py`，真工作区 `m9verify/ws_m98/`）：
+  A 写盘产生快照 → B 预览不动盘（拒绝两次后断言盘面逐字节不变）→ C 真回滚 → D fork+rewind
+  → E 磁盘实测 → F `--drop-snapshots` 回收。**实测数字**：基座 1949 B / 8892 B = **21.9%**
+  （基座 = 被 `write`/`edit` 碰过的文件原始字节之和，**不是整个工作区**，只取决于"改了几个
+  文件"，这就否掉了"给基座加速开关"的必要性）；清单 599 B vs 对象 4339 B ≈ 13.8%，孤儿
+  0 个；fork 增量 0 对象 / 0 字节；回收 1 个对象 / 746 B，3 个因别的会话仍引用而保留。
+- **这些数字与 README 的 token/成本/缓存数字没有任何关系，不可混着比**（口径见驱动脚本
+  docstring：本机 Windows 10 + NTFS，夹具从 `ws_m97` 拷来）。
+
 ---
 
 ## 10. 验收总命令
@@ -2246,6 +2433,11 @@ python -m eval.runner --limit 2 --mock           # M5-2 无 key 冒烟（judge �
 python -m app.cli --mcp .codeagent/mcp.json "任务"  # M6-3/M9-4 加载 MCP server（stdio 或 HTTP）后执行任务
 python -m app.cli --sessions                    # M9-3 会话清单：名字 / 步数 / 分叉来源（无 key）
 python -m app.cli --rename "基线方案"             # M9-3 起名（只动元数据，无 key）
-python -m app.cli --fork --step 3 "换个思路"      # M9-3 从第 3 步分叉并续跑（对话分叉）
+python -m app.cli --fork --step 3 "换个思路"      # M9-3 从第 3 步分叉并续跑（**对话**分叉，文件不动）
+python -m app.cli --snapshots                   # M9-8 会话快照清单 + 全局对象库占用 / 孤儿数（无 key）
+python -m app.cli --rewind --step 3             # M9-8 回滚预览（默认**只预览**，不确认不动盘）
+python -m app.cli --rewind --step 3 --force     # M9-8 真回滚工作区到第 3 步（不可逆）
+python -m app.cli --fork --step 3 --rewind --force   # M9-8 "倒带重试"：对话 + 文件一起回到第 3 步
+python -m app.cli --drop-snapshots --session-id <id> # M9-8 删该会话快照 + 回收无人引用的对象
 streamlit run app/ui_streamlit.py               # M2-3 控制台（含 M5-3 检查点回放）
 ```

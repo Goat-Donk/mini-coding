@@ -18,6 +18,7 @@ from pydantic import BaseModel, ValidationError
 if TYPE_CHECKING:
     from agent.state import AgentState
     from agent.subagents import AgentWorkers
+    from agent.workspace import FileChange
 
 
 @dataclass
@@ -33,13 +34,26 @@ class ToolResult:
     # 阻塞**：工具自己不等人，由 QueryEngine 决定回合语义 —— 于是 headless 通路
     # 只要不注册这个工具，就完全不受影响，不需要在循环里写任何 if headless。
     await_user: bool = False
+    # 这次调用**成功写盘**的文件改动（M9-8）。由工具在写盘**之前**读出**原样字节**
+    # 后报告 —— 登记发生在工具返回之后，那时旧内容已经被覆盖掉了。目前只有
+    # write/edit 会填；它是工作区快照的**唯一**登记来源（`loop._gate_and_run`
+    # 在工具成功后逐条 `note_write`）。空元组 = 这次调用没改文件。
+    file_changes: tuple["FileChange", ...] = ()
 
     @staticmethod
     def ok(
-        output: str, data: dict | None = None, *, await_user: bool = False
+        output: str,
+        data: dict | None = None,
+        *,
+        await_user: bool = False,
+        file_changes: tuple["FileChange", ...] = (),
     ) -> "ToolResult":
         return ToolResult(
-            success=True, output=output, data=data, await_user=await_user
+            success=True,
+            output=output,
+            data=data,
+            await_user=await_user,
+            file_changes=file_changes,
         )
 
     @staticmethod

@@ -14,6 +14,7 @@ from pathlib import Path
 from pydantic import BaseModel, ValidationError
 
 from agent.tools.base import Tool, ToolContext, ToolResult
+from agent.workspace import FileChange
 
 MAX_CHARS = 500_000  # 兜底安全上限；超大输出走 tool_result 落盘（M3-2）
 #: 给人看的 diff 预览上限（M9-1）。比 `MAX_CHARS` 小两个数量级是**故意的**：
@@ -66,6 +67,27 @@ def _resolve(ctx: ToolContext, raw: str, *, default_root: bool = False) -> Path 
 
 def _read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="replace")
+
+
+def _snapshot_before(resolved: Path) -> FileChange:
+    """写盘**之前**读出原样字节，作为 M9-8 快照的 `base`（"我们碰它之前长什么样"）。
+
+    必须在 `write_text` 之前调用 —— 登记发生在工具返回之后，那时旧内容已经没了。
+
+    为什么是**字节**而不是复用 `_read_text` 的文本：那是 `errors="replace"` 解出来
+    的，重新编码**未必等于盘上的字节**（BOM、非 UTF-8、替换字符）。拿它当 base，
+    还原出来的文件会与原始字节不一致，而错误要到回滚时校验哈希才暴露 —— 太晚。
+
+    读不到（权限 / 被占用）时**不是**返回 `before=None`：那个值的含义是"改动前
+    不存在"，回滚时会把文件**删掉**。所以显式标 `base_unknown=True`，让快照拒绝
+    把这个路径纳入管辖（宁可回滚不到它，也不能拿它去赌）。
+    """
+    try:
+        if not resolved.is_file():
+            return FileChange(path=resolved, before=None)
+        return FileChange(path=resolved, before=resolved.read_bytes())
+    except OSError:
+        return FileChange(path=resolved, before=None, base_unknown=True)
 
 
 def _truncate(text: str, limit: int = MAX_CHARS) -> tuple[str, bool]:
@@ -145,14 +167,17 @@ class WriteTool(Tool):
         resolved = _resolve(ctx, args.path)
         if isinstance(resolved, ToolResult):
             return resolved
+        change = _snapshot_before(resolved)      # ★ 必须在 write_text 之前
         try:
             resolved.parent.mkdir(parents=True, exist_ok=True)
             resolved.write_text(args.content, encoding="utf-8")
         except OSError as exc:
+            # 写盘失败 → 不报告改动：盘上没变，登记它会让快照以为这个文件被改过。
             return ToolResult.fail(f"写入失败: {exc}")
         return ToolResult.ok(
             f"已写入 {len(args.content)} 字符到 {args.path}（覆盖）",
             data={"path": str(resolved), "chars": len(args.content)},
+            file_changes=(change,),
         )
 
     def preview(self, arguments: dict, ctx: ToolContext) -> str | None:
@@ -258,6 +283,7 @@ class EditTool(Tool):
         if error is not None:
             return ToolResult.fail(error)
 
+        change = _snapshot_before(resolved)      # ★ 必须在 write_text 之前
         try:
             resolved.write_text(new_content, encoding="utf-8")
         except OSError as exc:
@@ -272,6 +298,7 @@ class EditTool(Tool):
                     old_content.count(args.old_string) if args.replace_all else 1
                 ),
             },
+            file_changes=(change,),
         )
 
 

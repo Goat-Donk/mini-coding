@@ -995,6 +995,20 @@ class QueryEngine:
         # 3) 执行
         result = tool.run(call.arguments, ctx)
 
+        # 3.5) M9-8 工作区快照登记：**成功写盘**的 write/edit 在这里被记下来。
+        #
+        # 位置就是这一项的全部意义：登记挂在门禁链**之后**、`tool.run` **成功之后**。
+        # 于是"权限拒绝的那次（在上面就 return 了）""edit 匹配失败（result.success
+        # 为 False）""工具自己抛了（被 run 兜住）"三种情况**结构上**走不到这一行 ——
+        # 不靠谁记得判断，也就不会因为将来加一条 return 就悄悄漏掉。
+        #
+        # `self.session is not None` 是同一条纪律的延续：子代理的引擎 session=None
+        # （它连检查点都写不了），所以 worker 结构上拿不到快照对象 —— 与"worker
+        # 写不了文件"是同一个保证，不另加守卫。
+        if result.success and result.file_changes and self.session is not None:
+            for change in result.file_changes:
+                self.session.snapshots.note_write(change)
+
         # 4) PostToolUse hooks（观察/提示，非阻断）
         #    返回值必须拼进 output：这里原先丢弃了 hints，导致 PostToolUse 这一层
         #    治理**从未到达模型**（hook 跑了，但它的观察结论没人看）。hints 是回喂给
