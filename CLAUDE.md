@@ -4,7 +4,7 @@
 
 ## 项目定位
 
-求职作品集：**CodeAgent** —— 参考 [pengchengneo/Claude-Code](https://github.com/pengchengneo/Claude-Code) 源码架构，用 Python 从零实现的小型 AI Coding Agent（14,425 行 / 31 模块 / 847 测试）。核心循环手写（不套 Agent SDK），支撑层用成熟库（openai / pydantic / streamlit / typer / pytest）。差异化：cache-aware 上下文 + 缓存省钱指标、step 级检查点恢复 + **step 级分叉/会话命名 + 工作区回滚快照（`--rewind` 与 `--fork` 共用同一个 K）**、**常驻交互模式（REPL，一行一个回合）**、**进程内目标 + 显式完成检查（判分权在人手里）**、**并发子代理（句柄式 spawn/wait/close + 回合边界结算）**、block-at-submit hooks、**轨迹驱动评估（真实 tinydb 提交 + 物理剥离工作区 + 有效性闸门 + 三条对照臂 + 定价快照 + 评测器分离与离线重算）**、记忆自进化、MCP 工具接入（**stdio + Streamable HTTP 两种传输**）、注入文本检测 + 会话污染天花板、联网工具 + SSRF 拦截、skills 渐进披露、计划清单跨回合、提问暂停/续答、改动前 diff 复核。
+求职作品集：**CodeAgent** —— 参考 [pengchengneo/Claude-Code](https://github.com/pengchengneo/Claude-Code) 源码架构，用 Python 从零实现的小型 AI Coding Agent（14,437 行 / 31 模块 / 847 测试）。核心循环手写（不套 Agent SDK），支撑层用成熟库（openai / pydantic / streamlit / typer / pytest）。差异化：cache-aware 上下文 + 缓存省钱指标、step 级检查点恢复 + **step 级分叉/会话命名 + 工作区回滚快照（`--rewind` 与 `--fork` 共用同一个 K）**、**常驻交互模式（REPL，一行一个回合）**、**进程内目标 + 显式完成检查（判分权在人手里）**、**并发子代理（句柄式 spawn/wait/close + 回合边界结算）**、block-at-submit hooks、**轨迹驱动评估（真实 tinydb 提交 + 物理剥离工作区 + 有效性闸门 + 三条对照臂 + 定价快照 + 评测器分离与离线重算）**、记忆自进化、MCP 工具接入（**stdio + Streamable HTTP 两种传输**）、注入文本检测 + 会话污染天花板、联网工具 + SSRF 拦截、skills 渐进披露、计划清单跨回合、提问暂停/续答、改动前 diff 复核。
 
 > 数字口径（改数字时请沿用）：**源码 = `agent/` + `app/` + `eval/` 下非空 `.py` 文件的全部行数**（含空行；不含 `eval/repos/` 的克隆仓，它被 gitignore）；**模块数 = 其中非空的 `.py` 文件数**（4 个空 `__init__.py` 不计）；**测试 = `tests/` 行数 / pytest 用例数**。**按文件系统数，不按 git 跟踪数** —— 新文件在提交前也该算进去（M9-8 的 `agent/workspace.py`(814) 与 `tests/test_workspace.py`(785) 目前尚未提交）。
 

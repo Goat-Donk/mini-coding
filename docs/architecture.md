@@ -881,7 +881,10 @@ agent 异常或 judge 异常**如实写进报告的 `error` 字段**——一个
 | `data/eval/report-*.json` | `eval.runner` | 回归报告（**跑分依据**：带 `arm` / `gate` / `pricing_snapshot_id` / `repo_head`） | 人 / CI |
 | `data/eval/ws/{task_id}/` | `golden_tasks.materialize` | 物理剥离出来的评测工作区（**自带一个 `git init` 出来的仓库，无原仓库历史**） | 只有本次 run；默认跑完即删，`--keep` 保留 |
 
-`data/` 与 `workspace/` 全部 gitignore——**产物是运行出来的，不进仓库**。
+`data/` 与 `workspace/` **默认全部 gitignore**——**产物是运行出来的，不进仓库**。
+唯一例外（`git add -f`）：被已提交文档当**数据源**引用的那些归档报告（`data/eval/report-*.json`
+7 份）与 `evalverify/` 里被引用的 11 个文件（9 个脚本 + 1 份日志 + 1 份重算报告）
+—— 否则文档里的结论在别的机器上无从复核。
 
 **M9-6 新增的事件**（都进 `data/sessions/{sid}.jsonl`，回放与审计共用）：`goal_created` / `goal_paused` / `goal_resumed` / `goal_cleared` / `goal_check`（带 `verdict` / `exit_code` / `output_tail` / `output_chars`）/ `goal_completed`。
 **权威记录在事件里**，`Goal.last_check` 只是给 `/goal status` 用的一份缓存 —— 它没有第二个判据依赖它，

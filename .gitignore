@@ -23,6 +23,9 @@ venv/
 # --- runtime data (trajectory/checkpoint/memory) ---
 data/*
 !data/.gitkeep
+# 例外：被已提交文档当**数据源**引用的评估归档报告（`data/eval/report-*.json`）
+# 已用 `git add -f` 进仓库 —— 否则文档引用的路径在别的机器上不存在，
+# 「已归档的数字可复核」这句话就落不了地。命令行仍被本规则忽略（见 README 目录树）。
 # 运行期记忆（rules/learned.md）与本地 MCP 配置，不进仓库
 .codeagent/
 
@@ -61,6 +64,9 @@ m9verify/
 # --- M5 评估层可信化的验证工作区 ---
 # evalverify/：有效性闸门跑全量候选的日志（零 LLM 成本）、三臂真跑的驱动脚本与
 # 报告副本、变异测试脚本。与 m7verify/ 同理不进仓库（真实轨迹 + 本地报告）。
+# 例外：被已提交文档**当证据或数据源引用**的那些文件已 `git add -f` 进仓库
+# （9 个脚本 + 1 份变异日志 + 1 份离线重算报告）；
+# 未被引用的运行日志仍只在本机。清单见 docs/eval_cross_repo_comparison.md 文首。
 evalverify/
 
 # --- M5-6 S16 路径沙箱的验证工作区 ---

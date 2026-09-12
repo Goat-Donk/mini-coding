@@ -598,8 +598,9 @@ def test_extract_diff_a_mere_mention_is_taken_as_a_patch_pre_existing():
 
     判据是"块里含 `diff --git` 这个串"（`_is_diff_block`），B1 让它与**算出了归档
     84.2% 那个反事实修正值**的离线重算实现保持逐字一致。理由：改判据就等于换尺子，
-    新报告与那个数字立刻不可比。（那份离线重算脚本在 `evalverify/` —— 该目录被
-    gitignore，是本地留档，**不在仓库里**，所以这里不能把它当成可核对的路径。）
+    新报告与那个数字立刻不可比。（那份离线重算脚本 `evalverify/rescore_single_shot.py`
+    与其产物 `report_single_shot_rescored.json` **已随文档引用一并进版本库**；但这里仍
+    内联原文而不读归档 —— 1.5 MB 的归档不该成为一个单测的依赖。）
 
     方向是安全的：这种"块"喂给 `git apply` 只会失败 → 记 `patch_failed`
     （如实记失败），不会把散文当成一次成功的修复。

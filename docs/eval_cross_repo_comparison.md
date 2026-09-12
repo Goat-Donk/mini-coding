@@ -15,8 +15,12 @@
 > | `sqlparse` | `one-step` | `data/eval/report-20260912-235024.json` | 09-12 23:50 |
 > | `sqlparse` | `single-shot` | `data/eval/report-20260913-004054.json` | 09-13 00:40 |
 >
-> 复跑用 `evalverify/drive_three_arms.py --repo <仓>`（`evalverify/` 与 `data/*` 均被
-> `.gitignore` 排除，与 `m7verify/` 同理：验证器具不进仓库，**数字与结论进这里**）。
+> 复跑用 `evalverify/drive_three_arms.py --repo <仓>`。**上表这些路径都在版本库里** ——
+> `evalverify/` 与 `data/*` 默认被 `.gitignore` 排除（同 `m7verify/` 惯例：验证器具不进仓库），
+> 但**被本文当证据或数据源引用的这 18 个文件**（`evalverify/` 9 个脚本 + 1 份变异日志
+> + 1 份离线重算报告，`data/eval/` 7 份归档报告）已 `git add -f`
+> 进仓库 —— 否则文档引用的路径在别的机器上不存在，「已归档的数字可复核」这句话就落不了地。
+> 未被引用的运行日志仍只在本机。
 
 ---
 
@@ -28,8 +32,11 @@
 
 | 仓 | `agent` | `one-step` | `single-shot` |
 |---|---|---|---|
-| `tinydb` | **`null`（未记录）** | `False` | `False` |
+| `tinydb` | **字段不存在**（`null`） | `False` | `False` |
 | `sqlparse` | `True` | `True` | `True` |
+
+> ⚠️ 逐字核实过：`tinydb` 的 `agent` 报告里 **`judge_guard` 这个键压根不在**（不是「值是 `null`」），
+> 另两臂是显式的 `False`。这与本项目一贯的三态纪律是同一件事 —— **「没记录」不等于「记录成空」**。
 
 `guard` 决定两件事：**P4**（`rc=0` 但零个用例通过 ⇒ 不算通过）与 **P1**（判定前把判定相关文件恢复到 agent 动手之前）。
 `guard=False` 的一轮，`judge_tampering` / `judge_restored` 一律是 `null` —— 那是「**没检查**」，不是「查过且干净」。两者不许混读。
@@ -76,7 +83,7 @@
 |---|---|---|---|
 | `repo_head` | `4aa53111d72c` | `60cdc649726b` | — |
 | 候选 → 闸门有效 | 39 → 21 | 20 → 19 | ✗ 难度分布不同 |
-| `judge_guard` | `null` / `False` / `False` | `True` × 3 | ✗ |
+| `judge_guard` | 无字段 / `False` / `False` | `True` × 3 | ✗ |
 | `runner_sha256` | `e40d57b7d039`（仅 1 臂） | `a3e7c441aee2`（3 臂） | ✗ |
 | `golden_tasks_sha256` | `01df49233318` | `4b226f39befd` | ✗ |
 | 模型 / 定价快照 | `deepseek-chat` / `deepseek-chat@2025` | 同 | ✓ |
